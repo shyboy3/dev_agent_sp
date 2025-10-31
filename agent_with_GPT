@@ -1,23 +1,12 @@
 # app_spectrum_agent_starter.py
 # -----------------------------------------------------------------------------
-# Spectrum Agent Starter (Single-file)
-# - Text-only Ollama server
-# - Preview (first file), multi-file analyze
-# - Denoise (Hampel, Savitzky-Golay), Baseline (AsLS), Onset/Peaks
-# - Manual mode & Agent mode (plan → execute → evaluate → revise)
-# - PDF report (Korean font fallback)
-# - Simple chatbot (/chat)
-# -----------------------------------------------------------------------------
-# Requirements:
-#   pip install fastapi uvicorn[standard] python-multipart matplotlib pillow requests
-#   pip install pandas openpyxl scipy pyyaml
+# Text-only single host (Ollama) Spectrum Agent Starter — Preview, Multi-file,
+# Denoise(Hampel/SG), Baseline(AsLS), Onset/Peaks, Manual/Agent, PDF, Chatbot
 # -----------------------------------------------------------------------------
 
 import os, io, re, json, base64, textwrap
 from io import BytesIO
 from typing import Optional, List, Tuple, Dict, Callable
-from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
 import requests
@@ -27,23 +16,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.font_manager import fontManager, findSystemFonts
-
 from PIL import Image
 from scipy.signal import find_peaks, savgol_filter
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 
-# ===================== Config =====================
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST_TEXT", "http://localhost:11435")
-TEXT_MODEL  = os.environ.get("TEXT_MODEL", "gpt-oss")  # e.g., "gpt-oss" or "gpt-oss:latest"
+# ===================== Config (Text-only single host) =====================
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST_TEXT", "http://localhost:11434")
+TEXT_MODEL  = os.environ.get("TEXT_MODEL", "gpt-oss")
 AUTH_TOKEN  = os.environ.get("LOCAL_AGENT_TOKEN")
-
 MAX_AGENT_ITERS = int(os.environ.get("MAX_AGENT_ITERS", "3"))
 
-app = FastAPI(title="Spectrum Agent Starter (Single-file)")
+app = FastAPI(title="Spectrum Agent Starter (Text-only Single Host)")
 
 # ===================== Auth =====================
 def require_auth(x_auth_token: Optional[str] = Header(None)):
@@ -67,10 +54,6 @@ def list_model_names(base: str) -> List[str]:
         return []
 
 def ensure_model_installed(model: str, base: str) -> str:
-    """
-    Return the concrete tag installed.
-    If 'model' has no tag, match by prefix (e.g., 'gpt-oss' -> 'gpt-oss:latest').
-    """
     names = list_model_names(base)
     if model in names:
         return model
@@ -92,7 +75,7 @@ def ollama_generate_once(model: str, prompt: str, base: str, num_predict=512) ->
     r.raise_for_status()
     return r.json().get("response","").strip()
 
-# ===================== CSV/Excel parsing =====================
+# ===================== Robust CSV/Excel parsing =====================
 def smart_decode_csv(csv_bytes: bytes) -> str:
     if csv_bytes.startswith(b"\xff\xfe"): return csv_bytes.decode("utf-16le", errors="ignore")
     if csv_bytes.startswith(b"\xfe\xff"): return csv_bytes.decode("utf-16be", errors="ignore")
@@ -105,46 +88,71 @@ def smart_decode_csv(csv_bytes: bytes) -> str:
     except: return csv_bytes.decode("latin-1", errors="ignore")
 
 def parse_spectrum_csv(csv_bytes: bytes):
+    """
+    Robust CSV parser:
+    - sep/decimal 자동 추정 → 판다스 우선
+    - 숫자열 자동 선택(첫 두 개)
+    - 실패 시 라인 파서 백업
+    """
     text = smart_decode_csv(csv_bytes)
+    import pandas as _pd
+    import io as _io
+    tried = []
+    for sep in [None, ",", ";", "\t", r"\s+"]:
+        for dec in [".", ","]:
+            try:
+                df = _pd.read_csv(_io.StringIO(text), sep=sep, engine="python", decimal=dec)
+                if df.shape[1] >= 2:
+                    num_df = df.apply(_pd.to_numeric, errors="coerce")
+                    numeric_cols = [c for c in num_df.columns if num_df[c].notna().sum() >= 2]
+                    if len(numeric_cols) >= 2:
+                        c1, c2 = numeric_cols[:2]
+                        x_series = num_df[c1].dropna()
+                        y_series = num_df[c2].dropna()
+                        idx = x_series.index.intersection(y_series.index)
+                        if len(idx) >= 2:
+                            x = x_series.loc[idx].astype(float).tolist()
+                            y = y_series.loc[idx].astype(float).tolist()
+                            xlabel = str(c1); ylabel = str(c2)
+                            return x, y, xlabel, ylabel
+                tried.append(f"sep={sep},dec={dec},cols={getattr(df,'shape',('NA','NA'))[1] if isinstance(getattr(df,'shape',None),tuple) else 'NA'}")
+            except Exception as e:
+                tried.append(f"sep={sep},dec={dec},err={type(e).__name__}")
+                continue
+
+    # 백업 라인 파서
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    cand_delims = [",", ";", "\t", r"\s+"]
-    xlabel = "X"; ylabel = "Y"
     x_vals, y_vals = [], []
+    xlabel = "X"; ylabel = "Y"
 
     def to_float(tok: str):
-        t = re.sub(r"(?<=\d),(?=\d)", ".", tok.strip())
+        t = tok.strip()
+        t = re.sub(r"(?<=\d)[,\s](?=\d{3}(?:\D|$))", "", t)  # 천단위 제거
+        if t.count(",") == 1 and t.count(".") == 0 and re.search(r",\d+$", t):
+            t = t.replace(",", ".")
         return float(t)
 
     for ln in lines:
         low = ln.lower()
-        if low.startswith("#") or low.startswith("//"): continue
-        if any(low.startswith(k) for k in ["xlabel","ylabel","x_label","y_label","x:","y:"]):
-            parts = re.split(r"[:,]", ln, maxsplit=1)
-            if len(parts)==2:
-                key,val = parts[0].strip().lower(), parts[1].strip()
-                if "x" in key: xlabel = val or xlabel
-                elif "y" in key: ylabel = val or ylabel
+        if low.startswith("#") or low.startswith(("xlabel","ylabel","x_label","y_label","x:","y:")):
             continue
-        row=None
-        for d in cand_delims:
-            toks = re.split(r"\s+", ln) if d==r"\s+" else ln.split(d)
-            if len(toks)>=2: row=toks; break
-        if not row: continue
-        nums=[]
-        for tok in row:
-            try: nums.append(to_float(tok))
-            except: nums.append(None)
-        found=False
-        for i in range(len(nums)):
-            if nums[i] is None: continue
-            for j in range(i+1,len(nums)):
-                if nums[j] is None: continue
-                x_vals.append(nums[i]); y_vals.append(nums[j]); found=True
+        for d in [",", ";", "\t", " "]:
+            toks = [t for t in re.split(r"\s+" if d==" " else re.escape(d), ln) if t]
+            nums = []
+            for tok in toks:
+                try: nums.append(to_float(tok))
+                except: nums.append(None)
+            nz = [v for v in nums if v is not None]
+            if len(nz) >= 2:
+                x_vals.append(nz[0]); y_vals.append(nz[1])
                 break
-            if found: break
-    if not x_vals or not y_vals or len(x_vals)!=len(y_vals):
-        raise ValueError("No numeric X,Y pairs found in CSV.")
-    return x_vals, y_vals, xlabel, ylabel
+        if len(x_vals) >= 10 and len(y_vals) >= 10:
+            break
+
+    if x_vals and y_vals and len(x_vals) == len(y_vals) and len(x_vals) >= 2:
+        return x_vals, y_vals, xlabel, ylabel
+
+    raise ValueError(f"No numeric X,Y pairs found in CSV. Tried combos: {', '.join(tried[:6])} ...")
 
 def parse_excel(file_bytes: bytes):
     df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
@@ -158,8 +166,7 @@ def parse_excel(file_bytes: bytes):
     xlabel = str(df.columns[0]); ylabel = str(df.columns[1])
     return x, y, xlabel, ylabel
 
-# ===================== Operators (registry) =====================
-# Each op: (x:List[float], y:List[float], kw:dict) -> (x,y,meta)
+# ===================== Operators & Detect =====================
 OpFn = Callable[[List[float], List[float], Dict], Tuple[List[float], List[float], Dict]]
 OP_REGISTRY: Dict[str, OpFn] = {}
 def register(name: str):
@@ -174,7 +181,6 @@ def op_hampel(x, y, kw):
     arr = np.asarray(y, float)
     k = max(1, window//2)
     y_med = np.copy(arr)
-    # rolling median
     for i in range(len(arr)):
         s = max(0, i-k); e = min(len(arr), i+k+1)
         y_med[i] = np.median(arr[s:e])
@@ -236,7 +242,6 @@ def op_resample(x, y, kw):
     yp = np.interp(xp, np.asarray(x, float), np.asarray(y, float))
     return xp.tolist(), yp.tolist(), {"op":"resample", "n":n}
 
-# "peaks"와 "onset"은 보통 검출만 하므로 여기선 meta만 남기고 원본 y 유지
 def detect_onset(x: List[float], y_corr: List[float], win: int = 11, poly: int = 2, z_thresh: float = 3.0) -> Optional[int]:
     x = np.asarray(x, dtype=float); y = np.asarray(y_corr, dtype=float)
     if len(y) < 7: return None
@@ -265,6 +270,7 @@ def detect_peaks_list(x: List[float], y: List[float], prominence_frac: float = 0
     peaks.sort(key=lambda d:d["x"])
     return peaks
 
+# ===================== Pipeline / Planner / Evaluator =====================
 ALIASES = {
     "스무딩":"sg","savitzky":"sg","savitzky-golay":"sg","sgfilter":"sg",
     "해밀":"hampel","hampel-filter":"hampel",
@@ -274,7 +280,6 @@ ALIASES = {
     "피크":"peaks","peak":"peaks",
     "온셋":"onset","threshold-onset":"onset",
 }
-
 def normalize_op_name(op:str) -> str:
     o = (op or "").strip().lower()
     return ALIASES.get(o, o)
@@ -302,7 +307,6 @@ def execute_steps(x: List[float], y: List[float], steps: List[dict]):
         metas.append({"op":op, **(meta or {})})
     return x, y, metas
 
-# ===================== Planner / Evaluator =====================
 PLAN_SYS_PROMPT = """당신은 스펙트럼 분석 오케스트레이터입니다.
 다음 DSL YAML만 출력하세요. 설명/코드블록 금지.
 pipeline:
@@ -347,27 +351,27 @@ def evaluate_result(x, y_corr, onset_idx, peaks: List[dict]):
             ok=False; fb["snr_status"]="low"
     return ok, fb
 
+def default_agent_steps():
+    return [
+        {"op":"sg", "window":11, "poly":3},
+        {"op":"baseline", "lam":1e5, "p":0.01, "iter":10},
+        {"op":"peaks", "prominence_frac":0.02, "distance_pts":5}
+    ]
+
 # ===================== Plot / PDF =====================
 def set_korean_font():
-    # Try common Korean fonts
     candidates = [
-        "Malgun Gothic",               # Windows
-        "Apple SD Gothic Neo",         # macOS
+        "Malgun Gothic", "Apple SD Gothic Neo",
         "Noto Sans CJK KR", "Noto Serif CJK KR",
-        "NanumGothic", "NanumGothicCoding", "NanumMyeongjo",
+        "NanumGothic", "NanumMyeongjo",
     ]
-    # Scan system fonts for candidates
-    avail = {os.path.basename(p): p for p in findSystemFonts()}
-    # Use family name
     fams = [f.name for f in fontManager.ttflist]
     for f in candidates:
         if f in fams:
             matplotlib.rcParams["font.family"] = [f]
             matplotlib.rcParams["axes.unicode_minus"] = False
             return
-    # fallback: default (may not render Korean perfectly)
     matplotlib.rcParams["axes.unicode_minus"] = False
-
 set_korean_font()
 
 def plot_layers_png(x: List[float], y: List[float],
@@ -418,44 +422,70 @@ def plot_layers_dual_png(
     buf = BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png", bbox_inches="tight", dpi=150); plt.close(fig)
     return buf.getvalue()
 
-def save_pdf_report(filename: str, pages: List[Dict]):
-    """
-    pages: list of dict:
-      {
-        "title": str,
-        "images": [png_bytes,...],
-        "text_blocks": [str,...],
-      }
-    """
-    with PdfPages(filename) as pdf:
+def save_pdf_report(filename_or_buf, pages: List[Dict]):
+    """A4 portrait, images(≤2) + wrapped text, multi-page split."""
+    A4_W, A4_H = (8.27, 11.69)
+    with PdfPages(filename_or_buf) as pdf:
+        page_no = 0
         for page in pages:
-            fig = plt.figure(figsize=(11.69, 8.27))  # A4 landscape (inches)
-            y_cursor = 0.95
             title = page.get("title","")
-            if title:
-                plt.text(0.02, y_cursor, title, fontsize=14, weight="bold", transform=plt.gca().transAxes)
-                y_cursor -= 0.05
-            imgs = page.get("images",[]) or []
-            # place up to two images side-by-side
-            if imgs:
-                cols = 2 if len(imgs)>=2 else 1
-                for i,imgb in enumerate(imgs[:2]):
-                    ax = plt.axes([0.05 + i*(0.45), 0.45, 0.42, 0.42]) if cols==2 else plt.axes([0.05, 0.45, 0.9, 0.42])
-                    im = Image.open(BytesIO(imgb))
-                    ax.imshow(im); ax.axis("off")
-                y_cursor = 0.42
+            images = page.get("images",[]) or []
             blocks = page.get("text_blocks",[]) or []
-            # print text blocks stacked
-            for blk in blocks:
-                txt = textwrap.fill(str(blk), width=110)
-                plt.text(0.03, y_cursor, txt, fontsize=10, transform=plt.gca().transAxes, va='top')
-                y_cursor -= 0.08 + 0.015*(len(txt)//80)
-            plt.axis("off"); pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+            i_idx = 0
+            b_idx = 0
+            while True:
+                fig = plt.figure(figsize=(A4_W, A4_H))
+                ax_page = plt.gca(); ax_page.axis("off")
+                y_cur = 0.96
+                if title and (i_idx==0 and b_idx==0):
+                    plt.text(0.03, y_cur, title, fontsize=14, weight="bold", transform=ax_page.transAxes)
+                    y_cur -= 0.05
+
+                # images (max 2 per page)
+                if i_idx < len(images):
+                    if i_idx+1 < len(images):
+                        for col in range(2):
+                            if i_idx >= len(images): break
+                            ax = plt.axes([0.05 + col*0.47, 0.58, 0.43, 0.32])
+                            ax.axis("off")
+                            ax.imshow(Image.open(BytesIO(images[i_idx])))
+                            i_idx += 1
+                        y_cur = 0.54
+                    else:
+                        ax = plt.axes([0.05, 0.58, 0.9, 0.32])
+                        ax.axis("off")
+                        ax.imshow(Image.open(BytesIO(images[i_idx])))
+                        i_idx += 1
+                        y_cur = 0.54
+
+                # text blocks (wrapped, split)
+                max_blocks_this_page = 10
+                while b_idx < len(blocks) and max_blocks_this_page>0:
+                    blk = str(blocks[b_idx]).replace("\r\n","\n")
+                    wrapped = textwrap.wrap(blk, width=100)
+                    need = 0.02 + 0.018*max(1, len(wrapped))
+                    if y_cur - need < 0.06:
+                        break
+                    plt.text(0.04, y_cur, "\n".join(wrapped), fontsize=10,
+                             transform=ax_page.transAxes, va='top')
+                    y_cur -= need
+                    b_idx += 1
+                    max_blocks_this_page -= 1
+
+                page_no += 1
+                plt.text(0.95, 0.02, f"{page_no}", fontsize=9, transform=ax_page.transAxes, ha='right', color='#666')
+                pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+                if (i_idx >= len(images)) and (b_idx >= len(blocks)):
+                    break
 
 # ===================== HTML =====================
 def html_form():
     host_info = f"Ollama host: <code>{OLLAMA_HOST}</code> · TEXT_MODEL: <code>{TEXT_MODEL}</code>"
-    token_hint = f"(Auth ON)" if AUTH_TOKEN else "(Auth OFF)"
+    token_hint = "(Auth ON)" if AUTH_TOKEN else "(Auth OFF)"
+    auth_on_js = "true" if AUTH_TOKEN else "false"
+    auth_val_js = (AUTH_TOKEN or "").replace("\\", "\\\\").replace('"', '\\"')
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Spectrum Agent Starter</title>
 <style>
@@ -468,7 +498,7 @@ body{{max-width:1100px;margin:20px auto;font-family:system-ui,-apple-system,Sego
 .tabpanel{{display:none;padding:8px;border:1px solid #ddd;margin-top:4px}}
 .tabpanel.active{{display:block}}
 </style></head><body>
-<h1>📈 Spectrum Agent Starter</h1>
+<h1>📈 Spectrum Agent Starter (Text-only)</h1>
 <div class="small">{host_info} · {token_hint}</div>
 
 <form action="/analyze" method="post" enctype="multipart/form-data">
@@ -536,56 +566,58 @@ body{{max-width:1100px;margin:20px auto;font-family:system-ui,-apple-system,Sego
 <pre id="chatLog" class="result" style="margin-top:8px;min-height:140px;"></pre>
 
 <script>
-const AUTH_TOKEN = {"on": %s, "val": "%s"};
+const AUTH_TOKEN = {{"on": {auth_on_js}, "val": "{auth_val_js}"}};
 
-async function doPreview(){
+async function doPreview(){{
   const fi = document.getElementById('fileInput');
   const preview = document.getElementById('preview');
   const stats = document.getElementById('previewStats');
   preview.innerHTML = ''; stats.textContent='';
-  if(!fi.files || !fi.files.length){ alert('파일을 선택하세요'); return; }
-  const fd = new FormData(); fd.append('csv', fi.files[0]);
-  try{
-    const res = await fetch('/preview', {
-      method: 'POST',
-      headers: AUTH_TOKEN.on ? {'X-Auth-Token': AUTH_TOKEN.val} : {},
-      body: fd
-    });
-    if(!res.ok){ throw new Error(await res.text()); }
-    const data = await res.json();
-    preview.innerHTML = '<img src="'+data.png+'">';
-    const s = data.stats || {};
-    stats.textContent = `points=${s.n_points} | ${s.xlabel}: ${s.x_min}~${s.x_max} | ${s.ylabel}: ${s.y_min}~${s.y_max}`;
-  }catch(e){
-    preview.innerHTML = '<div class="small" style="color:#b00;">미리보기 실패</div>';
-    console.error(e);
-  }
-}
+  if(!fi.files || !fi.files.length){{ alert('파일을 선택하세요'); return; }}
 
-async function sendChat(){
+  const fd = new FormData();
+  fd.append('csv', fi.files[0]); // 필드명 'csv' 고정
+
+  try{{
+    const res = await fetch('/preview', {{
+      method: 'POST',
+      headers: AUTH_TOKEN.on ? {{'X-Auth-Token': AUTH_TOKEN.val}} : {{}},
+      body: fd
+    }});
+    if(!res.ok){{ throw new Error(await res.text()); }}
+    const data = await res.json();
+    preview.innerHTML = '<img alt="preview" src="'+data.png+'">';
+    const s = data.stats || {{}};
+    stats.textContent = `points=${{s.n_points}} | ${{s.xlabel}}: ${{s.x_min}}~${{s.x_max}} | ${{s.ylabel}}: ${{s.y_min}}~${{s.y_max}}`;
+  }}catch(e){{
+    preview.innerHTML = '<div class="small" style="color:#b00;">미리보기 실패</div>';
+    console.error('preview error:', e);
+  }}
+}}
+
+async function sendChat(){{
   const input = document.getElementById('chatInput');
   const log = document.getElementById('chatLog');
   const text = input.value.trim(); if(!text) return;
   log.textContent += "\\n[You] "+text+"\\n";
-  input.value='';
-  try{
-    const res = await fetch('/chat', {
+  input.value = '';
+  try{{
+    const res = await fetch('/chat', {{
       method:'POST',
-      headers: Object.assign({'Content-Type':'application/json'}, AUTH_TOKEN.on ? {'X-Auth-Token': AUTH_TOKEN.val} : {}),
-      body: JSON.stringify({message: text})
-    });
-    if(!res.ok){ throw new Error(await res.text()); }
+      headers: Object.assign({{'Content-Type':'application/json'}}, AUTH_TOKEN.on ? {{'X-Auth-Token': AUTH_TOKEN.val}} : {{}}),
+      body: JSON.stringify({{message: text}})
+    }});
+    if(!res.ok){{ throw new Error(await res.text()); }}
     const data = await res.json();
     log.textContent += "[Model] "+data.reply+"\\n";
-  }catch(e){
+  }}catch(e){{
     log.textContent += "[Error] "+e.message+"\\n";
-  }
-}
+  }}
+}}
 </script>
 
 </body></html>
-""" % ("true" if AUTH_TOKEN else "false", (AUTH_TOKEN or ""))
-# end html_form()
+"""
 
 # ===================== Routes =====================
 @app.get("/", response_class=HTMLResponse)
@@ -602,14 +634,17 @@ def debug_models(_: bool = Depends(require_auth)):
 
 @app.post("/preview")
 def preview(csv: UploadFile = File(...), _ok: bool = Depends(require_auth)):
-    b = csv.file.read()
-    csv.file.close()
-    low = (csv.filename or "").lower()
-    if low.endswith((".xlsx",".xls")):
-        x, y, xlabel, ylabel = parse_excel(b)
-    else:
-        x, y, xlabel, ylabel = parse_spectrum_csv(b)
-    # simple plot
+    try:
+        b = csv.file.read()
+        csv.file.close()
+        low = (csv.filename or "").lower()
+        if low.endswith((".xlsx",".xls")):
+            x, y, xlabel, ylabel = parse_excel(b)
+        else:
+            x, y, xlabel, ylabel = parse_spectrum_csv(b)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"preview parse error: {e}")
+
     fig = plt.figure()
     plt.plot(x, y); plt.xlabel(xlabel); plt.ylabel(ylabel)
     buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", dpi=150); plt.close(fig)
@@ -623,9 +658,9 @@ def preview(csv: UploadFile = File(...), _ok: bool = Depends(require_auth)):
     return JSONResponse({"png": "data:image/png;base64,"+img64, "stats": stats})
 
 @app.post("/chat")
-def chat(message: Dict[str,str], _ok: bool = Depends(require_auth)):
+def chat(payload: dict = Body(...), _ok: bool = Depends(require_auth)):
     model_chosen = ensure_model_installed(TEXT_MODEL, OLLAMA_HOST)
-    user_text = (message.get("message") or "").strip()
+    user_text = (payload.get("message") or "").strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="empty message")
     reply = ollama_generate_once(model_chosen, user_text, OLLAMA_HOST, num_predict=600)
@@ -710,30 +745,41 @@ def analyze(
 
     for fp in file_payloads:
         name = fp["name"]; b = fp["bytes"]
-        low = name.lower()
-        if low.endswith((".xlsx",".xls")):
-            x, y, xlabel, ylabel = parse_excel(b)
-        else:
-            x, y, xlabel, ylabel = parse_spectrum_csv(b)
+        try:
+            low = name.lower()
+            if low.endswith((".xlsx",".xls")):
+                x, y, xlabel, ylabel = parse_excel(b)
+            else:
+                x, y, xlabel, ylabel = parse_spectrum_csv(b)
+        except Exception as e:
+            tabs_labels.append(f"<span class='tablabel'>{name}</span>")
+            tabs_panes.append(f"<div class='tabpanel'><h3>{name}</h3><div class='result' style='color:#b00;'>파싱 실패: {e}</div></div>")
+            pdf_pages.append({"title": f"{name} — 오류 보고", "images": [], "text_blocks": [f"오류: {repr(e)}"]})
+            continue
 
         # ---------- AGENT MODE ----------
         if run_mode == "agent":
-            steps, warns, meta0 = plan_from_goal(prompt, model_chosen, OLLAMA_HOST)
+            steps, warns, _ = plan_from_goal(prompt, model_chosen, OLLAMA_HOST)
+            steps, _ = validate_and_normalize_steps(steps)
+            if not steps or all(s.get("__unknown__") for s in steps):
+                steps = default_agent_steps()
+
             history=[]
-            x2, y2 = x, y
             for it in range(1, MAX_AGENT_ITERS+1):
-                x2, y2, metas = execute_steps(x2, y2, steps)
+                # 매회 원본에서 실행 (계획이 바뀔 수 있으니)
+                x2, y2, metas = execute_steps(x, y, steps)
                 y_work = np.asarray(y2, float)
-                baseline = None
-                # Onset/Peaks for evaluation
                 onset_idx = detect_onset(x2, y_work.tolist(), win=on_win_v, poly=on_poly_v, z_thresh=on_z_v)
                 peaks = detect_peaks_list(x2, y_work.tolist(), prominence_frac=prom_frac_v, distance_pts=dist_pts_v, width=width_v)
                 ok, fb = evaluate_result(x2, y_work, onset_idx, peaks)
                 history.append({"iter":it, "steps":steps, "feedback":fb})
-                if ok: break
-                steps, warns2, meta1 = revise_plan(steps, fb, model_chosen, OLLAMA_HOST)
+                if ok:
+                    break
+                steps, _, _ = revise_plan(steps, fb, model_chosen, OLLAMA_HOST)
+                steps, _ = validate_and_normalize_steps(steps)
+                if not steps or all(s.get("__unknown__") for s in steps):
+                    steps = default_agent_steps()
 
-            # plots
             overlay_png = plot_layers_dual_png(
                 x2, y,
                 show_baseline=False, baseline=None,
@@ -744,7 +790,6 @@ def analyze(
             )
             img64 = base64.b64encode(overlay_png).decode()
 
-            # llm interpretation on final
             base_prompt = (
                 (prompt or "응답은 반드시 한국어로. 스펙트럼만 해석하라.").strip()
                 + "\n\n[Agent 최종 단계]\n"
@@ -752,12 +797,11 @@ def analyze(
                 + "\n[검출]\n"
                 + (f"onset @ {x2[onset_idx]:.6g}" if onset_idx is not None else "(no onset)")
                 + "\npeaks:\n"
-                + "\n".join([f"- peak @ {p['x']:.6g} (y={p['y']:.6g}, prom={p['prom']:.6g})" for p in peaks]) or "(no peaks)"
+                + ("\n".join([f"- peak @ {p['x']:.6g} (y={p['y']:.6g}, prom={p['prom']:.6g})" for p in peaks]) or "(no peaks)")
                 + "\n이미지/형태 언급 금지."
             )
             out_text = ollama_generate_once(model_chosen, base_prompt, OLLAMA_HOST, num_predict=800)
 
-            # tab pane
             pane_inner = (
                 f"<h3>{name} — Agent</h3>"
                 f"<div class='preview'><img src='data:image/png;base64,{img64}'></div>"
@@ -770,27 +814,25 @@ def analyze(
             tabs_labels.append(f"<span class='tablabel'>{name}</span>")
             tabs_panes.append(f"<div class='tabpanel'>{pane_inner}</div>")
 
-            # pdf
             pdf_pages.append({
                 "title": f"{name} — Agent 결과",
                 "images": [overlay_png],
                 "text_blocks": [
                     "최종 Steps:\n" + json.dumps(steps, ensure_ascii=False),
-                    "History 요약:\n" + json.dumps(history[-1] if history else {}, ensure_ascii=False),
+                    "마지막 Feedback:\n" + json.dumps(history[-1]["feedback"] if history else {}, ensure_ascii=False),
                     "LLM 해석:\n" + out_text
                 ]
             })
-
             continue
 
         # ---------- MANUAL MODE ----------
         y_work = np.asarray(y, float)
         if use_hampel:
-            x_, y_work, _ = op_hampel(x, y_work.tolist(), {"window":hampel_win_v,"sigma":hampel_sigma_v})
-            y_work = np.asarray(y_work, float)
+            _, y_work_list, _ = op_hampel(x, y_work.tolist(), {"window":hampel_win_v,"sigma":hampel_sigma_v})
+            y_work = np.asarray(y_work_list, float)
         if use_sg:
-            x_, y_work, _ = op_sg(x, y_work.tolist(), {"window":sg_win_v,"poly":sg_poly_v})
-            y_work = np.asarray(y_work, float)
+            _, y_work_list, _ = op_sg(x, y_work.tolist(), {"window":sg_win_v,"poly":sg_poly_v})
+            y_work = np.asarray(y_work_list, float)
 
         baseline = None
         y_corr = y_work.copy()
@@ -857,7 +899,6 @@ def analyze(
         tabs_labels.append(f"<span class='tablabel'>{name}</span>")
         tabs_panes.append(f"<div class='tabpanel'>{pane_inner}</div>")
 
-        # PDF pages
         pdf_pages.append({
             "title": f"{name} — Manual 결과",
             "images": [overlay_png],
@@ -867,14 +908,14 @@ def analyze(
             ]
         })
 
-    # Build tabs HTML
+    # Tabs HTML
     tabs_html = (
         "<div id='tablabels'>" + "".join(tabs_labels) + "</div>"
         + "<div id='tabpanes'>" + "".join(tabs_panes) + "</div>"
-        + "<script>(function(){const ls=[...document.querySelectorAll('.tablabel')];const ps=[...document.querySelectorAll('.tabpanel')];function act(i){ls.forEach((el,k)=>el.style.fontWeight=k===i?'bold':'normal');ps.forEach((el,k)=>el.className='tabpanel'+(k===i?' active':''));}ls.forEach((el,i)=>el.addEventListener('click',()=>act(i)));if(ls.length)act(0);})();</script>"
+        + "<script>(function(){{const ls=[...document.querySelectorAll('.tablabel')];const ps=[...document.querySelectorAll('.tabpanel')];function act(i){{ls.forEach((el,k)=>el.style.fontWeight=k===i?'bold':'normal');ps.forEach((el,k)=>el.className='tabpanel'+(k===i?' active':''));}}ls.forEach((el,i)=>el.addEventListener('click',()=>act(i)));if(ls.length)act(0);}})();</script>"
     )
 
-    # Save PDF to memory and offer a download link
+    # PDF build
     pdf_buf = BytesIO()
     save_pdf_report(pdf_buf, pdf_pages)
     pdf_bytes = pdf_buf.getvalue()
@@ -892,7 +933,7 @@ def analyze(
 <h2>Results ({ensure_model_installed(TEXT_MODEL, OLLAMA_HOST)} @ {OLLAMA_HOST})</h2>
 <p><a download="spectrum_report.pdf" href="data:application/pdf;base64,{pdf_b64}">📄 PDF 다운로드</a></p>
 {tabs_html}
-<p class="small">* Analyze (동기) · 스트리밍 미사용 · Agent/Manual 지원</p>
+<p class="small">* Text-only single host · Manual/Agent 지원</p>
 <p><a href="/">← Back</a></p>
 </body></html>"""
     return HTMLResponse(html)
