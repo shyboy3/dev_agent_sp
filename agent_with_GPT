@@ -387,8 +387,8 @@ PREPROC_OPS = {"hampel", "sg", "baseline", "normalize", "resample"}
 
 def interpret_constraints(goal: str, model: str, host: str, available_ops: List[str]) -> dict:
     """
-    LLM에게 제약 조건 추출을 맡기는 방식.
-    너무 복잡해지면 여기서 기본값으로 폴백.
+    1단계: 명확한 한글/영문 패턴은 로컬에서 바로 해석 (강한 시그널).
+    2단계: 애매하면 LLM에게 JSON 제약 추출 요청.
     """
     base = {
         "allow_preprocessing": True,
@@ -396,14 +396,50 @@ def interpret_constraints(goal: str, model: str, host: str, available_ops: List[
         "allowed_ops": [],
         "disallowed_ops": []
     }
-    if not goal.strip():
+
+    if not goal or not goal.strip():
         return base
+
+    text_raw = goal
+    text = goal.lower()
+    avail = set(available_ops)
+    disallow = set()
+
+    # ===== 1) 강한 로컬 규칙 (KOR/ENG) =====
+
+    # 전처리 전체 건드리지 말라 (한글)
+    if re.search(r"전처리[^\n]*(하지\s*마|하지 말|금지|꺼|끄|하지 않)", text_raw):
+        disallow |= (PREPROC_OPS & avail)
+
+    # 전처리 전체 금지 (영문)
+    if re.search(r"(do not|don't|no)\s+(pre[-\s]?processing|change\s+preprocessing|modify\s+preprocessing)", text):
+        disallow |= (PREPROC_OPS & avail)
+    if "do not preprocessing" in text or "do not correct preprocessing" in text:
+        disallow |= (PREPROC_OPS & avail)
+
+    # 베이스라인 금지 (한글/영문)
+    if re.search(r"(베이스라인|baseline|asls)[^\n]*(하지\s*마|하지 말|금지|끄|off|disable|no|don't|do not)", text_raw, re.IGNORECASE):
+        if "baseline" in avail:
+            disallow.add("baseline")
+
+    # 로컬 규칙에 뭔가라도 걸렸으면: 이걸 '진짜 제약'으로 사용하고 LLM은 참고하지 않음
+    if disallow:
+        allow_pre = not any(op in PREPROC_OPS for op in disallow)
+        allow_base = "baseline" not in disallow
+        return {
+            "allow_preprocessing": allow_pre,
+            "allow_baseline": allow_base,
+            "allowed_ops": [],
+            "disallowed_ops": sorted(disallow),
+        }
+
+    # ===== 2) 애매한 경우에만 LLM에게 JSON 추출 요청 =====
 
     prompt = f"""
 You extract HARD constraints for a spectroscopy processing pipeline.
 
 Available ops:
-{available_ops}
+{sorted(list(avail))}
 
 User goal:
 \"\"\"{goal}\"\"\"
@@ -414,13 +450,18 @@ Return ONLY one JSON object with keys:
 - allowed_ops: list of op names
 - disallowed_ops: list of op names
 
-If user says like "do not modify preprocessing", "do not change anything", 
-"do not touch baseline", "no baseline correction", etc, 
-obey strictly and put into disallowed_ops.
+If the user says things like:
+- "do not change preprocessing"
+- "do not modify baseline"
+- "no baseline correction"
+then reflect that strictly in disallowed_ops.
+
+No markdown, no comments, JSON only.
 """
 
     raw = ollama_generate_once(model, prompt, host, num_predict=400).strip()
 
+    # 코드블럭 제거 방어
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
@@ -429,29 +470,30 @@ obey strictly and put into disallowed_ops.
     try:
         data = json.loads(raw)
     except Exception:
-        data = {}
+        # LLM이 이상한 답을 하면 제약 없음으로 간주
+        return base
 
     allow_pre = bool(data.get("allow_preprocessing", True))
     allow_base = bool(data.get("allow_baseline", True))
 
-    allowed_ops = [op for op in data.get("allowed_ops", []) if op in available_ops]
-    disallowed_ops = [op for op in data.get("disallowed_ops", []) if op in available_ops]
+    allowed_ops = [op for op in data.get("allowed_ops", []) if op in avail]
+    disallowed_ops = [op for op in data.get("disallowed_ops", []) if op in avail]
 
-    # 전처리 전체 금지
+    # allow_preprocessing=False면 전처리 관련 전부 disallow
     if not allow_pre:
-        disallowed_ops = list(set(disallowed_ops) | (PREPROC_OPS & set(available_ops)))
-    # 베이스라인 금지
-    if not allow_base and "baseline" in available_ops:
+        disallowed_ops = list(set(disallowed_ops) | (PREPROC_OPS & avail))
+    # allow_baseline=False면 baseline disallow
+    if not allow_base and "baseline" in avail:
         disallowed_ops = list(set(disallowed_ops) | {"baseline"})
 
-    # allowed_ops에 있어도 disallowed_ops가 우선
+    # disallowed가 우선
     allowed_ops = [op for op in allowed_ops if op not in disallowed_ops]
 
     return {
         "allow_preprocessing": allow_pre,
         "allow_baseline": allow_base,
-        "allowed_ops": allowed_ops,
-        "disallowed_ops": disallowed_ops
+        "allowed_ops": sorted(allowed_ops),
+        "disallowed_ops": sorted(set(disallowed_ops)),
     }
 
 def plan_from_goal(goal: str, model: str, host: str,
