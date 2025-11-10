@@ -1,12 +1,11 @@
-# app_spectrum_agent_starter.py
-# -----------------------------------------------------------------------------
-# Text-only single host (Ollama) Spectrum Agent Starter — Preview, Multi-file,
-# Denoise(Hampel/SG), Baseline(AsLS), Onset/Peaks, Manual/Agent, PDF, Chatbot
-# -----------------------------------------------------------------------------
+# app_spectrum_agent_constraints.py
+# 단일 텍스트 Ollama 호스트 + 스펙트럼 분석 + Agent 파이프라인 + 제약(Constraints) 반영
+# pip install fastapi uvicorn[standard] python-multipart matplotlib pillow requests pandas openpyxl scipy pyyaml
 
 import os, io, re, json, base64, textwrap
 from io import BytesIO
-from typing import Optional, List, Tuple, Dict, Callable
+from typing import Optional, List, Dict, Tuple, Callable
+
 import numpy as np
 import pandas as pd
 import requests
@@ -15,7 +14,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.font_manager import fontManager, findSystemFonts
+from matplotlib.font_manager import fontManager
 from PIL import Image
 from scipy.signal import find_peaks, savgol_filter
 from scipy import sparse
@@ -24,13 +23,13 @@ from scipy.sparse.linalg import spsolve
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 
-# ===================== Config (Text-only single host) =====================
+# ===================== 기본 설정 =====================
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST_TEXT", "http://localhost:11434")
 TEXT_MODEL  = os.environ.get("TEXT_MODEL", "gpt-oss")
 AUTH_TOKEN  = os.environ.get("LOCAL_AGENT_TOKEN")
 MAX_AGENT_ITERS = int(os.environ.get("MAX_AGENT_ITERS", "3"))
 
-app = FastAPI(title="Spectrum Agent Starter (Text-only Single Host)")
+app = FastAPI(title="Spectrum Agent (Constraint-aware, Text-only Single Host)")
 
 # ===================== Auth =====================
 def require_auth(x_auth_token: Optional[str] = Header(None)):
@@ -38,17 +37,18 @@ def require_auth(x_auth_token: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
 
-# ===================== Ollama helpers =====================
+# ===================== Ollama Helpers =====================
 def list_model_names(base: str) -> List[str]:
     try:
         r = requests.get(f"{base}/api/tags", timeout=10)
         r.raise_for_status()
         models = r.json().get("models", [])
-        out=[]
+        out = []
         for m in models:
             if isinstance(m, dict):
                 name = m.get("name") or m.get("model") or m.get("tag") or m.get("id")
-                if name: out.append(name)
+                if name:
+                    out.append(name)
         return out
     except Exception:
         return []
@@ -59,7 +59,7 @@ def ensure_model_installed(model: str, base: str) -> str:
         return model
     want = model.split(":", 1)[0]
     for n in names:
-        if n.split(":",1)[0] == want:
+        if n.split(":", 1)[0] == want:
             return n
     raise HTTPException(status_code=400, detail=f"Model '{model}' not found at {base}. Found: {names}")
 
@@ -68,36 +68,49 @@ def ollama_generate_once(model: str, prompt: str, base: str, num_predict=512) ->
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "top_p": 0.8, "num_predict": num_predict},
+        "options": {
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "num_predict": num_predict
+        },
         "keep_alive": "20m",
     }
     r = requests.post(f"{base}/api/generate", json=req, timeout=120)
     r.raise_for_status()
-    return r.json().get("response","").strip()
+    data = r.json()
+    return (data.get("response") or "").strip()
 
-# ===================== Robust CSV/Excel parsing =====================
+# ===================== CSV / Excel 파싱 =====================
 def smart_decode_csv(csv_bytes: bytes) -> str:
-    if csv_bytes.startswith(b"\xff\xfe"): return csv_bytes.decode("utf-16le", errors="ignore")
-    if csv_bytes.startswith(b"\xfe\xff"): return csv_bytes.decode("utf-16be", errors="ignore")
-    if csv_bytes.startswith(b"\xef\xbb\xbf"): return csv_bytes.decode("utf-8-sig", errors="ignore")
+    if csv_bytes.startswith(b"\xff\xfe"):
+        return csv_bytes.decode("utf-16le", errors="ignore")
+    if csv_bytes.startswith(b"\xfe\xff"):
+        return csv_bytes.decode("utf-16be", errors="ignore")
+    if csv_bytes.startswith(b"\xef\xbb\xbf"):
+        return csv_bytes.decode("utf-8-sig", errors="ignore")
     if b"\x00" in csv_bytes:
-        for enc in ("utf-16le","utf-16be"):
-            try: return csv_bytes.decode(enc, errors="ignore")
-            except: pass
-    try: return csv_bytes.decode("utf-8", errors="ignore")
-    except: return csv_bytes.decode("latin-1", errors="ignore")
+        for enc in ("utf-16le", "utf-16be"):
+            try:
+                return csv_bytes.decode(enc, errors="ignore")
+            except:
+                pass
+    try:
+        return csv_bytes.decode("utf-8", errors="ignore")
+    except:
+        return csv_bytes.decode("latin-1", errors="ignore")
 
 def parse_spectrum_csv(csv_bytes: bytes):
     """
-    Robust CSV parser:
-    - sep/decimal 자동 추정 → 판다스 우선
-    - 숫자열 자동 선택(첫 두 개)
-    - 실패 시 라인 파서 백업
+    꽤 튼튼한 CSV 파서:
+    - sep/decimal 자동 시도
+    - 숫자열 2개 선택
+    - 실패 시 라인 파싱 백업
     """
     text = smart_decode_csv(csv_bytes)
     import pandas as _pd
     import io as _io
     tried = []
+
     for sep in [None, ",", ";", "\t", r"\s+"]:
         for dec in [".", ","]:
             try:
@@ -113,65 +126,70 @@ def parse_spectrum_csv(csv_bytes: bytes):
                         if len(idx) >= 2:
                             x = x_series.loc[idx].astype(float).tolist()
                             y = y_series.loc[idx].astype(float).tolist()
-                            xlabel = str(c1); ylabel = str(c2)
-                            return x, y, xlabel, ylabel
-                tried.append(f"sep={sep},dec={dec},cols={getattr(df,'shape',('NA','NA'))[1] if isinstance(getattr(df,'shape',None),tuple) else 'NA'}")
+                            return x, y, str(c1), str(c2)
+                tried.append(f"sep={sep},dec={dec},cols={getattr(df, 'shape', ['NA','NA'])[1]}")
             except Exception as e:
                 tried.append(f"sep={sep},dec={dec},err={type(e).__name__}")
                 continue
 
-    # 백업 라인 파서
+    # 백업 라인 파싱
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     x_vals, y_vals = [], []
-    xlabel = "X"; ylabel = "Y"
+    xlabel, ylabel = "X", "Y"
 
     def to_float(tok: str):
         t = tok.strip()
-        t = re.sub(r"(?<=\d)[,\s](?=\d{3}(?:\D|$))", "", t)  # 천단위 제거
+        # 천단위 제거
+        t = re.sub(r"(?<=\d)[,\s](?=\d{3}(?:\D|$))", "", t)
+        # 소수점 콤마 변환
         if t.count(",") == 1 and t.count(".") == 0 and re.search(r",\d+$", t):
             t = t.replace(",", ".")
         return float(t)
 
     for ln in lines:
         low = ln.lower()
-        if low.startswith("#") or low.startswith(("xlabel","ylabel","x_label","y_label","x:","y:")):
+        if low.startswith("#") or low.startswith(("xlabel", "ylabel", "x_label", "y_label", "x:", "y:")):
             continue
         for d in [",", ";", "\t", " "]:
-            toks = [t for t in re.split(r"\s+" if d==" " else re.escape(d), ln) if t]
+            toks = [t for t in re.split(r"\s+" if d == " " else re.escape(d), ln) if t]
             nums = []
             for tok in toks:
-                try: nums.append(to_float(tok))
-                except: nums.append(None)
+                try:
+                    nums.append(to_float(tok))
+                except:
+                    nums.append(None)
             nz = [v for v in nums if v is not None]
             if len(nz) >= 2:
-                x_vals.append(nz[0]); y_vals.append(nz[1])
+                x_vals.append(nz[0])
+                y_vals.append(nz[1])
                 break
-        if len(x_vals) >= 10 and len(y_vals) >= 10:
+        if len(x_vals) >= 10:
             break
 
     if x_vals and y_vals and len(x_vals) == len(y_vals) and len(x_vals) >= 2:
         return x_vals, y_vals, xlabel, ylabel
 
-    raise ValueError(f"No numeric X,Y pairs found in CSV. Tried combos: {', '.join(tried[:6])} ...")
+    raise ValueError(f"No numeric X,Y pairs found in CSV. Tried: {', '.join(tried[:6])} ...")
 
 def parse_excel(file_bytes: bytes):
     df = pd.read_excel(BytesIO(file_bytes), engine="openpyxl")
     if df.shape[1] < 2:
         raise ValueError("Excel 파일에서 최소 두 개의 열(X,Y)이 필요합니다.")
-    x_series = pd.to_numeric(df.iloc[:,0], errors="coerce").dropna()
-    y_series = pd.to_numeric(df.iloc[:,1], errors="coerce").dropna()
+    x_series = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+    y_series = pd.to_numeric(df.iloc[:, 1], errors="coerce").dropna()
     idx = x_series.index.intersection(y_series.index)
     x = x_series.loc[idx].astype(float).tolist()
     y = y_series.loc[idx].astype(float).tolist()
-    xlabel = str(df.columns[0]); ylabel = str(df.columns[1])
-    return x, y, xlabel, ylabel
+    return x, y, str(df.columns[0]), str(df.columns[1])
 
-# ===================== Operators & Detect =====================
+# ===================== 연산자 레지스트리 =====================
 OpFn = Callable[[List[float], List[float], Dict], Tuple[List[float], List[float], Dict]]
 OP_REGISTRY: Dict[str, OpFn] = {}
+
 def register(name: str):
     def deco(fn: OpFn):
-        OP_REGISTRY[name] = fn; return fn
+        OP_REGISTRY[name] = fn
+        return fn
     return deco
 
 @register("hampel")
@@ -179,30 +197,31 @@ def op_hampel(x, y, kw):
     window = int(float(kw.get("window", 7)))
     sigma  = float(kw.get("sigma", 3.0))
     arr = np.asarray(y, float)
-    k = max(1, window//2)
+    k = max(1, window // 2)
     y_med = np.copy(arr)
     for i in range(len(arr)):
-        s = max(0, i-k); e = min(len(arr), i+k+1)
+        s = max(0, i - k); e = min(len(arr), i + k + 1)
         y_med[i] = np.median(arr[s:e])
     diff = np.abs(arr - y_med)
     med_abs_dev = np.median(diff) + 1e-12
     thr = sigma * 1.4826 * med_abs_dev
     out = np.where(diff > thr, y_med, arr)
-    return x, out.tolist(), {"op":"hampel", "window":window, "sigma":sigma}
+    return x, out.tolist(), {"op": "hampel", "window": window, "sigma": sigma}
 
 @register("sg")
 def op_sg(x, y, kw):
     win = int(float(kw.get("window", 11)))
     poly= int(float(kw.get("poly", 3)))
-    if win % 2 == 0: win += 1
+    if win % 2 == 0:
+        win += 1
     win = max(win, poly + 3 if (poly + 3) % 2 == 1 else poly + 4)
     win = min(win, len(y) - 1 - (len(y) % 2 == 0))
     arr = np.asarray(y, float)
     out = savgol_filter(arr, window_length=max(5, win), polyorder=max(2, poly))
-    return x, out.tolist(), {"op":"sg", "window":win, "poly":poly}
+    return x, out.tolist(), {"op": "sg", "window": win, "poly": poly}
 
 def baseline_asls(y: np.ndarray, lam: float = 1e5, p: float = 0.01, niter: int = 10) -> np.ndarray:
-    y = np.asarray(y, dtype=float)
+    y = np.asarray(y, float)
     L = len(y)
     D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L-2))
     DTD = (lam * D @ D.T).tocsc()
@@ -221,149 +240,332 @@ def op_baseline(x, y, kw):
     nite = int(float(kw.get("iter", 10)))
     arr = np.asarray(y, float)
     base = baseline_asls(arr, lam=lam, p=p, niter=nite)
-    return x, (arr - base).tolist(), {"op":"baseline", "lam":lam, "p":p, "iter":nite}
+    return x, (arr - base).tolist(), {"op": "baseline", "lam": lam, "p": p, "iter": nite}
 
 @register("normalize")
 def op_normalize(x, y, kw):
-    kind = str(kw.get("kind","minmax")).lower()
+    kind = str(kw.get("kind", "minmax")).lower()
     arr = np.asarray(y, float)
     if kind == "z":
-        m, s = float(np.mean(arr)), float(np.std(arr)+1e-12)
+        m, s = float(np.mean(arr)), float(np.std(arr) + 1e-12)
         out = (arr - m) / s
-        return x, out.tolist(), {"op":"normalize","kind":"z","mean":m,"std":s}
+        return x, out.tolist(), {"op": "normalize", "kind": "z", "mean": m, "std": s}
     lo, hi = float(np.min(arr)), float(np.max(arr))
     out = (arr - lo) / (hi - lo + 1e-12)
-    return x, out.tolist(), {"op":"normalize","kind":"minmax","min":lo,"max":hi}
+    return x, out.tolist(), {"op": "normalize", "kind": "minmax", "min": lo, "max": hi}
 
 @register("resample")
 def op_resample(x, y, kw):
     n = int(float(kw.get("n", 1024)))
     xp = np.linspace(float(np.min(x)), float(np.max(x)), n)
     yp = np.interp(xp, np.asarray(x, float), np.asarray(y, float))
-    return xp.tolist(), yp.tolist(), {"op":"resample", "n":n}
+    return xp.tolist(), yp.tolist(), {"op": "resample", "n": n}
 
-def detect_onset(x: List[float], y_corr: List[float], win: int = 11, poly: int = 2, z_thresh: float = 3.0) -> Optional[int]:
-    x = np.asarray(x, dtype=float); y = np.asarray(y_corr, dtype=float)
-    if len(y) < 7: return None
-    if win % 2 == 0: win += 1
+# Agent용 no-op 검출 스텝(실제 검출은 메인 루프에서 수행)
+@register("peaks")
+def op_peaks(x, y, kw):
+    return x, y, {
+        "op": "peaks",
+        "prominence_frac": float(kw.get("prominence_frac", 0.02)),
+        "distance_pts": int(float(kw.get("distance_pts", 5))),
+        "width": float(kw["width"]) if kw.get("width") not in (None, "") else None
+    }
+
+@register("onset")
+def op_onset(x, y, kw):
+    return x, y, {
+        "op": "onset",
+        "win": int(float(kw.get("win", 11))),
+        "poly": int(float(kw.get("poly", 2))),
+        "z": float(kw.get("z", 3.0))
+    }
+
+# ===================== 검출 함수 =====================
+def detect_onset(x, y_corr, win=11, poly=2, z_thresh=3.0) -> Optional[int]:
+    x = np.asarray(x, float); y = np.asarray(y_corr, float)
+    if len(y) < 7:
+        return None
+    if win % 2 == 0:
+        win += 1
     win = max(win, poly + 3 if (poly + 3) % 2 == 1 else poly + 4)
     win = min(win, len(y) - 1 - (len(y) % 2 == 0))
-    if win < 5: return None
+    if win < 5:
+        return None
     dy = savgol_filter(y, window_length=win, polyorder=poly, deriv=1)
     low_mask = y < np.quantile(y, 0.3)
     sigma = np.std(dy[low_mask]) if np.any(low_mask) else np.std(dy)
-    if sigma <= 0: return None
+    if sigma <= 0:
+        return None
     thr = z_thresh * sigma
     cand = np.where((dy > thr) & (y > 0))[0]
     return int(cand[0]) if cand.size else None
 
-def detect_peaks_list(x: List[float], y: List[float], prominence_frac: float = 0.02, distance_pts: int = 5, width: Optional[float] = None) -> List[dict]:
-    y_arr = np.asarray(y, dtype=float)
-    y_min, y_max = float(np.nanmin(y_arr)), float(np.nanmax(y_arr))
+def detect_peaks_list(x, y, prominence_frac=0.02, distance_pts=5, width=None):
+    arr = np.asarray(y, float)
+    y_min, y_max = float(np.nanmin(arr)), float(np.nanmax(arr))
     prom = max(prominence_frac * (y_max - y_min), 1e-12)
-    kwargs = {"prominence": prom, "distance": max(distance_pts, 1)}
-    if width is not None: kwargs["width"] = width
-    idx, props = find_peaks(y_arr, **kwargs)
-    peaks=[]
-    for k,i in enumerate(idx):
-        peaks.append({"i": int(i), "x": float(x[i]), "y": float(y[i]), "prom": float(props["prominences"][k])})
-    peaks.sort(key=lambda d:d["x"])
+    kwargs = {"prominence": prom, "distance": max(1, int(distance_pts))}
+    if width is not None:
+        kwargs["width"] = width
+    idx, props = find_peaks(arr, **kwargs)
+    peaks = []
+    for k, i in enumerate(idx):
+        peaks.append({
+            "i": int(i),
+            "x": float(x[i]),
+            "y": float(y[i]),
+            "prom": float(props["prominences"][k])
+        })
+    peaks.sort(key=lambda d: d["x"])
     return peaks
 
-# ===================== Pipeline / Planner / Evaluator =====================
+# ===================== Pipeline / Agent Core =====================
 ALIASES = {
-    "스무딩":"sg","savitzky":"sg","savitzky-golay":"sg","sgfilter":"sg",
-    "해밀":"hampel","hampel-filter":"hampel",
-    "베이스라인":"baseline","bg":"baseline","asls":"baseline",
-    "정규화":"normalize","zscore":"normalize","minmax":"normalize",
-    "리샘플":"resample","resampling":"resample",
-    "피크":"peaks","peak":"peaks",
-    "온셋":"onset","threshold-onset":"onset",
+    "스무딩": "sg",
+    "savitzky": "sg",
+    "savitzky-golay": "sg",
+    "sgfilter": "sg",
+    "해밀": "hampel",
+    "hampel-filter": "hampel",
+    "베이스라인": "baseline",
+    "bg": "baseline",
+    "asls": "baseline",
+    "정규화": "normalize",
+    "zscore": "normalize",
+    "minmax": "normalize",
+    "리샘플": "resample",
+    "resampling": "resample",
 }
-def normalize_op_name(op:str) -> str:
+
+def normalize_op_name(op: str) -> str:
     o = (op or "").strip().lower()
     return ALIASES.get(o, o)
 
 def validate_and_normalize_steps(steps: List[dict]):
-    warns=[]; norm=[]
-    for i,s in enumerate(steps or []):
-        if not isinstance(s, dict): warns.append(f"[step {i+1}] invalid"); continue
-        op_raw = s.get("op","")
+    warns = []
+    norm = []
+    for i, s in enumerate(steps or []):
+        if not isinstance(s, dict):
+            warns.append(f"[step {i+1}] invalid")
+            continue
+        op_raw = s.get("op", "")
         op = normalize_op_name(op_raw)
         s = {**s, "op": op}
-        if op not in OP_REGISTRY and not op.startswith("custom:"):
+        if op not in OP_REGISTRY:
             warns.append(f"[step {i+1}] unknown op '{op_raw}'")
-            s["__unknown__"]=True
+            s["__unknown__"] = True
         norm.append(s)
     return norm, warns
 
-def execute_steps(x: List[float], y: List[float], steps: List[dict]):
-    metas=[]
+def execute_steps(x: List[float], y: List[float], steps: List[dict], constraints: dict):
+    """constraints.disallowed_ops에 있는 op는 실행하지 않는다."""
+    disallowed = set(constraints.get("disallowed_ops", [])) if constraints else set()
+    metas = []
     for s in steps or []:
-        if s.get("__unknown__"): continue
-        op = s["op"]; kw = {k:v for k,v in s.items() if k!="op"}
-        fn = OP_REGISTRY[op]
+        if s.get("__unknown__"):
+            continue
+        op = (s.get("op") or "").lower()
+        if op in disallowed:
+            continue
+        fn = OP_REGISTRY.get(op)
+        if not fn:
+            continue
+        kw = {k: v for k, v in s.items() if k != "op"}
         x, y, meta = fn(x, y, kw)
-        metas.append({"op":op, **(meta or {})})
+        metas.append({"op": op, **(meta or {})})
     return x, y, metas
 
-PLAN_SYS_PROMPT = """당신은 스펙트럼 분석 오케스트레이터입니다.
-다음 DSL YAML만 출력하세요. 설명/코드블록 금지.
+PLAN_SYS_PROMPT = """You are a spectroscopy pipeline planner.
+Return ONLY YAML with:
 pipeline:
-  - op: hampel|sg|normalize|resample|baseline|peaks|onset
+  - op: <one of [hampel, sg, normalize, resample, baseline, peaks, onset]>
+    # optional parameters
+No explanations, no markdown fences.
 """
 
-def plan_from_goal(goal: str, model: str, host: str):
-    yml = ollama_generate_once(model, PLAN_SYS_PROMPT + "\n목표:\n" + goal + "\n출력:\n", host, num_predict=400)
+PREPROC_OPS = {"hampel", "sg", "baseline", "normalize", "resample"}
+
+def interpret_constraints(goal: str, model: str, host: str, available_ops: List[str]) -> dict:
+    """
+    LLM에게 제약 조건 추출을 맡기는 방식.
+    너무 복잡해지면 여기서 기본값으로 폴백.
+    """
+    base = {
+        "allow_preprocessing": True,
+        "allow_baseline": True,
+        "allowed_ops": [],
+        "disallowed_ops": []
+    }
+    if not goal.strip():
+        return base
+
+    prompt = f"""
+You extract HARD constraints for a spectroscopy processing pipeline.
+
+Available ops:
+{available_ops}
+
+User goal:
+\"\"\"{goal}\"\"\"
+
+Return ONLY one JSON object with keys:
+- allow_preprocessing: true/false
+- allow_baseline: true/false
+- allowed_ops: list of op names
+- disallowed_ops: list of op names
+
+If user says like "do not modify preprocessing", "do not change anything", 
+"do not touch baseline", "no baseline correction", etc, 
+obey strictly and put into disallowed_ops.
+"""
+
+    raw = ollama_generate_once(model, prompt, host, num_predict=400).strip()
+
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
     try:
-        import yaml
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+
+    allow_pre = bool(data.get("allow_preprocessing", True))
+    allow_base = bool(data.get("allow_baseline", True))
+
+    allowed_ops = [op for op in data.get("allowed_ops", []) if op in available_ops]
+    disallowed_ops = [op for op in data.get("disallowed_ops", []) if op in available_ops]
+
+    # 전처리 전체 금지
+    if not allow_pre:
+        disallowed_ops = list(set(disallowed_ops) | (PREPROC_OPS & set(available_ops)))
+    # 베이스라인 금지
+    if not allow_base and "baseline" in available_ops:
+        disallowed_ops = list(set(disallowed_ops) | {"baseline"})
+
+    # allowed_ops에 있어도 disallowed_ops가 우선
+    allowed_ops = [op for op in allowed_ops if op not in disallowed_ops]
+
+    return {
+        "allow_preprocessing": allow_pre,
+        "allow_baseline": allow_base,
+        "allowed_ops": allowed_ops,
+        "disallowed_ops": disallowed_ops
+    }
+
+def plan_from_goal(goal: str, model: str, host: str,
+                   constraints: dict, available_ops: List[str]):
+    disallowed = set(constraints.get("disallowed_ops", []))
+    allowed    = set(constraints.get("allowed_ops", []))
+
+    sys_prompt = PLAN_SYS_PROMPT + f"""
+HARD RULES:
+- NEVER use ops in this disallowed list: {list(disallowed)}
+- Prefer ops in this allowed list when reasonable: {list(allowed)}
+"""
+    yml = ollama_generate_once(model, sys_prompt + "\n목표:\n" + goal + "\n출력:\n", host, num_predict=400)
+
+    import yaml
+    try:
         doc = yaml.safe_load(yml) or {}
         steps = doc.get("pipeline") or []
     except Exception:
         steps = []
-    steps, warns = validate_and_normalize_steps(steps)
-    return steps, warns, {"raw_yaml": yml}
 
-def revise_plan(prev_steps: List[dict], feedback: dict, model: str, host: str):
-    payload = json.dumps({"prev": prev_steps, "feedback": feedback}, ensure_ascii=False)
-    yml = ollama_generate_once(model, PLAN_SYS_PROMPT + "\n수정:\n" + payload + "\n출력:\n", host, num_predict=400)
+    steps, warns = validate_and_normalize_steps(steps)
+
+    # 하드 필터
+    filtered = []
+    dropped = []
+    for s in steps:
+        op = (s.get("op") or "").lower()
+        if op in disallowed:
+            dropped.append(op)
+            continue
+        filtered.append(s)
+    if dropped:
+        warns.append(f"removed disallowed ops: {sorted(set(dropped))}")
+    return filtered, warns, {"raw_yaml": yml, "constraints": constraints}
+
+def revise_plan(prev_steps: List[dict], feedback: dict,
+                model: str, host: str,
+                constraints: dict, available_ops: List[str]):
+    disallowed = set(constraints.get("disallowed_ops", []))
+    allowed    = set(constraints.get("allowed_ops", []))
+
+    payload = json.dumps({
+        "prev": prev_steps,
+        "feedback": feedback,
+        "constraints": constraints
+    }, ensure_ascii=False)
+
+    sys_prompt = PLAN_SYS_PROMPT + f"""
+HARD RULES:
+- NEVER use ops in this disallowed list: {list(disallowed)}
+- Prefer ops in this allowed list when reasonable: {list(allowed)}
+"""
+    yml = ollama_generate_once(model, sys_prompt + "\n수정:\n" + payload + "\n출력:\n", host, num_predict=400)
+
+    import yaml
     try:
-        import yaml
         doc = yaml.safe_load(yml) or {}
-        steps = doc.get("pipeline") or []
+        steps = doc.get("pipeline") or prev_steps
     except Exception:
         steps = prev_steps
+
     steps, warns = validate_and_normalize_steps(steps)
-    return steps, warns, {"raw_yaml": yml}
+
+    filtered = []
+    dropped = []
+    for s in steps:
+        op = (s.get("op") or "").lower()
+        if op in disallowed:
+            dropped.append(op)
+            continue
+        filtered.append(s)
+    if dropped:
+        warns.append(f"removed disallowed ops: {sorted(set(dropped))}")
+    return filtered, warns, {"raw_yaml": yml, "constraints": constraints}
+
+def default_agent_steps(constraints: dict):
+    disallowed = set(constraints.get("disallowed_ops", [])) if constraints else set()
+    steps = []
+    if "sg" not in disallowed:
+        steps.append({"op": "sg", "window": 11, "poly": 3})
+    if "baseline" not in disallowed:
+        steps.append({"op": "baseline", "lam": 1e5, "p": 0.01, "iter": 10})
+    steps.append({"op": "peaks", "prominence_frac": 0.02, "distance_pts": 5})
+    return steps
 
 def evaluate_result(x, y_corr, onset_idx, peaks: List[dict]):
-    ok=True; fb={}
+    ok = True
+    fb = {}
     if onset_idx is None:
-        ok=False; fb["onset"]="not_found"
-    n=len(peaks or []); fb["peaks_count"]=n
-    if n==0: ok=False; fb["peaks"]="none"
-    if n>50: ok=False; fb["peaks"]="too_many"
-    arr=np.asarray(y_corr,float)
-    if arr.size>16:
-        snr=(arr.max()-arr.min())/(arr[:max(8,arr.size//20)].std()+1e-12)
-        fb["snr"]=float(snr)
-        if snr<2.0:
-            ok=False; fb["snr_status"]="low"
+        fb["onset"] = "not_found"
+    n = len(peaks or [])
+    fb["peaks_count"] = n
+    if n == 0:
+        ok = False
+        fb["peaks"] = "none"
+    if n > 80:
+        ok = False
+        fb["peaks"] = "too_many"
+    arr = np.asarray(y_corr, float)
+    if arr.size > 16:
+        snr = (arr.max() - arr.min()) / (arr[: max(8, arr.size // 20)].std() + 1e-12)
+        fb["snr"] = float(snr)
+        if snr < 1.5:
+            ok = False
+            fb["snr_status"] = "low"
     return ok, fb
-
-def default_agent_steps():
-    return [
-        {"op":"sg", "window":11, "poly":3},
-        {"op":"baseline", "lam":1e5, "p":0.01, "iter":10},
-        {"op":"peaks", "prominence_frac":0.02, "distance_pts":5}
-    ]
 
 # ===================== Plot / PDF =====================
 def set_korean_font():
     candidates = [
         "Malgun Gothic", "Apple SD Gothic Neo",
         "Noto Sans CJK KR", "Noto Serif CJK KR",
-        "NanumGothic", "NanumMyeongjo",
+        "NanumGothic", "NanumMyeongjo"
     ]
     fams = [f.name for f in fontManager.ttflist]
     for f in candidates:
@@ -372,15 +574,16 @@ def set_korean_font():
             matplotlib.rcParams["axes.unicode_minus"] = False
             return
     matplotlib.rcParams["axes.unicode_minus"] = False
+
 set_korean_font()
 
-def plot_layers_png(x: List[float], y: List[float],
-                    show_baseline: bool, baseline: Optional[np.ndarray],
-                    show_onset: bool, onset_idx: Optional[int],
-                    show_peaks: bool, peaks: Optional[List[dict]],
-                    xlabel: str, ylabel: str,
-                    show_corrected: bool = False, y_corr: Optional[np.ndarray] = None) -> bytes:
-    x = np.asarray(x, dtype=float); y=np.asarray(y, dtype=float)
+def plot_layers_png(x, y,
+                    show_baseline, baseline,
+                    show_onset, onset_idx,
+                    show_peaks, peaks,
+                    xlabel, ylabel,
+                    show_corrected=False, y_corr=None) -> bytes:
+    x = np.asarray(x, float); y = np.asarray(y, float)
     fig = plt.figure()
     plt.plot(x, y, label="raw")
     if show_baseline and baseline is not None:
@@ -388,96 +591,107 @@ def plot_layers_png(x: List[float], y: List[float],
     if show_corrected and (y_corr is not None):
         plt.plot(x, y_corr, linestyle="-.", label="corrected")
     if show_peaks and peaks:
-        for p in peaks: plt.axvline(float(p["x"]), linestyle=":", linewidth=1)
+        for p in peaks:
+            plt.axvline(float(p["x"]), linestyle=":", linewidth=1)
     if show_onset and onset_idx is not None and 0 <= onset_idx < len(x):
         plt.axvline(float(x[onset_idx]), linestyle="-.", linewidth=1.2)
     plt.xlabel(xlabel); plt.ylabel(ylabel); plt.legend(loc="best")
-    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", dpi=150); plt.close(fig)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
     return buf.getvalue()
 
-def plot_layers_dual_png(
-    x: List[float], y: List[float],
-    show_baseline: bool, baseline: Optional[np.ndarray],
-    show_onset: bool, onset_idx: Optional[int],
-    show_peaks: bool, peaks: Optional[List[dict]],
-    xlabel: str, ylabel: str,
-    y_corr: Optional[np.ndarray]
-) -> bytes:
-    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+def plot_layers_dual_png(x, y,
+                         show_baseline, baseline,
+                         show_onset, onset_idx,
+                         show_peaks, peaks,
+                         xlabel, ylabel,
+                         y_corr) -> bytes:
+    x = np.asarray(x, float); y = np.asarray(y, float)
     if y_corr is None:
         y_corr = y if baseline is None else (y - baseline)
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     ax = axes[0]
     ax.plot(x, y, label="raw")
-    if show_baseline and (baseline is not None):
+    if show_baseline and baseline is not None:
         ax.plot(x, baseline, linestyle="--", label="baseline")
     ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.legend(loc="best"); ax.set_title("Raw + Baseline")
+
     ax = axes[1]
     ax.plot(x, y_corr, label="corrected", linestyle="-.")
     if show_peaks and peaks:
-        for p in peaks: ax.axvline(float(p["x"]), linestyle=":", linewidth=1)
+        for p in peaks:
+            ax.axvline(float(p["x"]), linestyle=":", linewidth=1)
     if show_onset and onset_idx is not None and 0 <= onset_idx < len(x):
         ax.axvline(float(x[onset_idx]), linestyle="-.", linewidth=1.2)
     ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.legend(loc="best"); ax.set_title("Corrected + Peaks/Onset")
-    buf = BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png", bbox_inches="tight", dpi=150); plt.close(fig)
+
+    buf = BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
     return buf.getvalue()
 
-def save_pdf_report(filename_or_buf, pages: List[Dict]):
-    """A4 portrait, images(≤2) + wrapped text, multi-page split."""
+def save_pdf_report(buf_or_path, pages: List[Dict]):
     A4_W, A4_H = (8.27, 11.69)
-    with PdfPages(filename_or_buf) as pdf:
+    with PdfPages(buf_or_path) as pdf:
         page_no = 0
         for page in pages:
-            title = page.get("title","")
-            images = page.get("images",[]) or []
-            blocks = page.get("text_blocks",[]) or []
+            title = page.get("title", "")
+            images = page.get("images", []) or []
+            blocks = page.get("text_blocks", []) or []
 
             i_idx = 0
             b_idx = 0
             while True:
                 fig = plt.figure(figsize=(A4_W, A4_H))
-                ax_page = plt.gca(); ax_page.axis("off")
-                y_cur = 0.96
-                if title and (i_idx==0 and b_idx==0):
-                    plt.text(0.03, y_cur, title, fontsize=14, weight="bold", transform=ax_page.transAxes)
-                    y_cur -= 0.05
+                axp = plt.gca()
+                axp.axis("off")
+                y = 0.96
 
-                # images (max 2 per page)
+                if title and (i_idx == 0 and b_idx == 0):
+                    plt.text(0.03, y, title, fontsize=14, weight="bold", transform=axp.transAxes)
+                    y -= 0.05
+
+                # images (up to 2 per page)
                 if i_idx < len(images):
-                    if i_idx+1 < len(images):
+                    if i_idx + 1 < len(images):
                         for col in range(2):
-                            if i_idx >= len(images): break
-                            ax = plt.axes([0.05 + col*0.47, 0.58, 0.43, 0.32])
+                            if i_idx >= len(images):
+                                break
+                            ax = plt.axes([0.05 + col * 0.47, 0.58, 0.43, 0.32])
                             ax.axis("off")
                             ax.imshow(Image.open(BytesIO(images[i_idx])))
                             i_idx += 1
-                        y_cur = 0.54
+                        y = 0.54
                     else:
                         ax = plt.axes([0.05, 0.58, 0.9, 0.32])
                         ax.axis("off")
                         ax.imshow(Image.open(BytesIO(images[i_idx])))
                         i_idx += 1
-                        y_cur = 0.54
+                        y = 0.54
 
-                # text blocks (wrapped, split)
-                max_blocks_this_page = 10
-                while b_idx < len(blocks) and max_blocks_this_page>0:
-                    blk = str(blocks[b_idx]).replace("\r\n","\n")
+                # text blocks
+                max_blocks = 10
+                while b_idx < len(blocks) and max_blocks > 0:
+                    blk = str(blocks[b_idx]).replace("\r\n", "\n")
                     wrapped = textwrap.wrap(blk, width=100)
-                    need = 0.02 + 0.018*max(1, len(wrapped))
-                    if y_cur - need < 0.06:
+                    need = 0.02 + 0.018 * max(1, len(wrapped))
+                    if y - need < 0.06:
                         break
-                    plt.text(0.04, y_cur, "\n".join(wrapped), fontsize=10,
-                             transform=ax_page.transAxes, va='top')
-                    y_cur -= need
+                    plt.text(0.04, y, "\n".join(wrapped), fontsize=10,
+                             transform=axp.transAxes, va="top")
+                    y -= need
                     b_idx += 1
-                    max_blocks_this_page -= 1
+                    max_blocks -= 1
 
                 page_no += 1
-                plt.text(0.95, 0.02, f"{page_no}", fontsize=9, transform=ax_page.transAxes, ha='right', color='#666')
-                pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+                plt.text(0.95, 0.02, f"{page_no}", fontsize=9,
+                         transform=axp.transAxes, ha="right", color="#666")
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
 
-                if (i_idx >= len(images)) and (b_idx >= len(blocks)):
+                if i_idx >= len(images) and b_idx >= len(blocks):
                     break
 
 # ===================== HTML =====================
@@ -486,8 +700,10 @@ def html_form():
     token_hint = "(Auth ON)" if AUTH_TOKEN else "(Auth OFF)"
     auth_on_js = "true" if AUTH_TOKEN else "false"
     auth_val_js = (AUTH_TOKEN or "").replace("\\", "\\\\").replace('"', '\\"')
+
+    # f-string 안 JS/CSS 중괄호는 모두 {{ }} 처리
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Spectrum Agent Starter</title>
+<html><head><meta charset="utf-8"><title>Spectrum Agent (Constraints)</title>
 <style>
 body{{max-width:1100px;margin:20px auto;font-family:system-ui,-apple-system,Segoe UI,Roboto}}
 .flex{{display:flex;gap:12px;flex-wrap:wrap}}
@@ -498,7 +714,7 @@ body{{max-width:1100px;margin:20px auto;font-family:system-ui,-apple-system,Sego
 .tabpanel{{display:none;padding:8px;border:1px solid #ddd;margin-top:4px}}
 .tabpanel.active{{display:block}}
 </style></head><body>
-<h1>📈 Spectrum Agent Starter (Text-only)</h1>
+<h1>📈 Spectrum Agent (Constraint-aware, Text-only)</h1>
 <div class="small">{host_info} · {token_hint}</div>
 
 <form action="/analyze" method="post" enctype="multipart/form-data">
@@ -508,14 +724,14 @@ body{{max-width:1100px;margin:20px auto;font-family:system-ui,-apple-system,Sego
   <fieldset style="margin-top:10px;">
     <legend>실행 모드</legend>
     <label><input type="radio" name="run_mode" value="manual" checked> 수동(체크박스)</label>
-    <label><input type="radio" name="run_mode" value="agent"> 목표 기반(Agent)</label>
+    <label><input type="radio" name="run_mode" value="agent"> 목표 기반(Agent, 제약 해석)</label>
   </fieldset>
 
   <label>Prompt / Goal</label>
   <textarea name="prompt" rows="5" style="width:100%;">응답은 반드시 한국어로. 주요 피크와 물리적 의미를 요약하라.</textarea>
 
   <fieldset style="margin-top:10px;">
-    <legend>전처리 옵션 (수동 모드)</legend>
+    <legend>전처리 옵션 (수동 모드에만 적용)</legend>
     <div class="flex">
       <label><input type="checkbox" name="do_hampel" value="1"> Hampel</label>
       <label><input type="checkbox" name="do_sg" value="1" checked> Savitzky–Golay</label>
@@ -560,36 +776,40 @@ body{{max-width:1100px;margin:20px auto;font-family:system-ui,-apple-system,Sego
 <hr>
 <h2>Chatbot</h2>
 <div class="flex">
-  <input id="chatInput" style="flex:1" placeholder="모델에게 질문하세요…">
-  <button onclick="sendChat()">Send</button>
+  <textarea id="chatInput" rows="3" style="flex:1; resize:vertical;" placeholder="모델에게 질문하세요… (Enter=전송, Shift+Enter=줄바꿈)"></textarea>
+  <button type="button" onclick="sendChat()">Send</button>
 </div>
 <pre id="chatLog" class="result" style="margin-top:8px;min-height:140px;"></pre>
 
 <script>
-const AUTH_TOKEN = {{"on": {auth_on_js}, "val": "{auth_val_js}"}};
+const AUTH_TOKEN = {{ "on": {auth_on_js}, "val": "{auth_val_js}" }};
 
 async function doPreview(){{
   const fi = document.getElementById('fileInput');
   const preview = document.getElementById('preview');
   const stats = document.getElementById('previewStats');
-  preview.innerHTML = ''; stats.textContent='';
-  if(!fi.files || !fi.files.length){{ alert('파일을 선택하세요'); return; }}
-
+  preview.innerHTML = '';
+  stats.textContent = '';
+  if (!fi.files || !fi.files.length) {{
+    alert('파일을 선택하세요');
+    return;
+  }}
   const fd = new FormData();
-  fd.append('csv', fi.files[0]); // 필드명 'csv' 고정
-
-  try{{
+  fd.append('csv', fi.files[0]);
+  try {{
     const res = await fetch('/preview', {{
       method: 'POST',
-      headers: AUTH_TOKEN.on ? {{'X-Auth-Token': AUTH_TOKEN.val}} : {{}},
+      headers: AUTH_TOKEN.on ? {{ 'X-Auth-Token': AUTH_TOKEN.val }} : {{}},
       body: fd
     }});
-    if(!res.ok){{ throw new Error(await res.text()); }}
+    if (!res.ok) {{
+      throw new Error(await res.text());
+    }}
     const data = await res.json();
-    preview.innerHTML = '<img alt="preview" src="'+data.png+'">';
+    preview.innerHTML = '<img alt="preview" src="' + data.png + '">';
     const s = data.stats || {{}};
     stats.textContent = `points=${{s.n_points}} | ${{s.xlabel}}: ${{s.x_min}}~${{s.x_max}} | ${{s.ylabel}}: ${{s.y_min}}~${{s.y_max}}`;
-  }}catch(e){{
+  }} catch (e) {{
     preview.innerHTML = '<div class="small" style="color:#b00;">미리보기 실패</div>';
     console.error('preview error:', e);
   }}
@@ -598,22 +818,37 @@ async function doPreview(){{
 async function sendChat(){{
   const input = document.getElementById('chatInput');
   const log = document.getElementById('chatLog');
-  const text = input.value.trim(); if(!text) return;
-  log.textContent += "\\n[You] "+text+"\\n";
+  const text = (input.value || '').trim();
+  if (!text) return;
+  log.textContent += "\\n[You] " + text + "\\n";
   input.value = '';
-  try{{
+  try {{
     const res = await fetch('/chat', {{
-      method:'POST',
+      method: 'POST',
       headers: Object.assign({{'Content-Type':'application/json'}}, AUTH_TOKEN.on ? {{'X-Auth-Token': AUTH_TOKEN.val}} : {{}}),
-      body: JSON.stringify({{message: text}})
+      body: JSON.stringify({{ message: text }})
     }});
-    if(!res.ok){{ throw new Error(await res.text()); }}
+    if (!res.ok) {{
+      throw new Error(await res.text());
+    }}
     const data = await res.json();
-    log.textContent += "[Model] "+data.reply+"\\n";
-  }}catch(e){{
-    log.textContent += "[Error] "+e.message+"\\n";
+    log.textContent += "[Model] " + (data.reply || '') + "\\n";
+  }} catch (e) {{
+    log.textContent += "[Error] " + e.message + "\\n";
   }}
 }}
+
+// Enter = 전송, Shift+Enter = 줄바꿈
+window.addEventListener('DOMContentLoaded', () => {{
+  const input = document.getElementById('chatInput');
+  if (!input) return;
+  input.addEventListener('keydown', (e) => {{
+    if (e.key === 'Enter' && !e.shiftKey) {{
+      e.preventDefault();
+      sendChat();
+    }}
+  }});
+}});
 </script>
 
 </body></html>
@@ -638,7 +873,7 @@ def preview(csv: UploadFile = File(...), _ok: bool = Depends(require_auth)):
         b = csv.file.read()
         csv.file.close()
         low = (csv.filename or "").lower()
-        if low.endswith((".xlsx",".xls")):
+        if low.endswith((".xlsx", ".xls")):
             x, y, xlabel, ylabel = parse_excel(b)
         else:
             x, y, xlabel, ylabel = parse_spectrum_csv(b)
@@ -646,16 +881,22 @@ def preview(csv: UploadFile = File(...), _ok: bool = Depends(require_auth)):
         raise HTTPException(status_code=400, detail=f"preview parse error: {e}")
 
     fig = plt.figure()
-    plt.plot(x, y); plt.xlabel(xlabel); plt.ylabel(ylabel)
-    buf = BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight", dpi=150); plt.close(fig)
+    plt.plot(x, y)
+    plt.xlabel(xlabel); plt.ylabel(ylabel)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
     img64 = base64.b64encode(buf.getvalue()).decode()
     stats = {
         "n_points": len(x),
-        "xlabel": xlabel, "ylabel": ylabel,
-        "x_min": float(np.min(x)), "x_max": float(np.max(x)),
-        "y_min": float(np.min(y)), "y_max": float(np.max(y)),
+        "xlabel": xlabel,
+        "ylabel": ylabel,
+        "x_min": float(np.min(x)),
+        "x_max": float(np.max(x)),
+        "y_min": float(np.min(y)),
+        "y_max": float(np.max(y)),
     }
-    return JSONResponse({"png": "data:image/png;base64,"+img64, "stats": stats})
+    return JSONResponse({"png": "data:image/png;base64," + img64, "stats": stats})
 
 @app.post("/chat")
 def chat(payload: dict = Body(...), _ok: bool = Depends(require_auth)):
@@ -672,7 +913,6 @@ def analyze(
     prompt: str = Form(""),
     run_mode: str = Form("manual"),
 
-    # manual options
     do_hampel: Optional[str] = Form(None),
     do_sg: Optional[str] = Form(None),
     do_bg: Optional[str] = Form(None),
@@ -699,139 +939,173 @@ def analyze(
 
     _ok: bool = Depends(require_auth)
 ):
-    def f2(v,d):
-        try: return float(v)
-        except: return d
-    def i2(v,d):
-        try: return int(float(v))
-        except: return d
+    def f2(v, d):
+        try:
+            return float(v)
+        except:
+            return d
 
-    use_hampel = (do_hampel=="1")
-    use_sg     = (do_sg=="1")
-    use_bg     = (do_bg=="1")
-    use_onset  = (do_onset=="1")
-    use_peaks  = (do_peaks=="1")
-    show_corr  = (show_corrected=="1")
+    def i2(v, d):
+        try:
+            return int(float(v))
+        except:
+            return d
 
-    hampel_win_v   = max(i2(hampel_win,7),3)
-    hampel_sigma_v = max(f2(hampel_sigma,3.0),0.1)
-    sg_win_v       = max(i2(sg_win,11),5)
-    sg_poly_v      = max(i2(sg_poly,3),2)
+    use_hampel = (do_hampel == "1")
+    use_sg     = (do_sg == "1")
+    use_bg     = (do_bg == "1")
+    use_onset  = (do_onset == "1")
+    use_peaks  = (do_peaks == "1")
+    show_corr  = (show_corrected == "1")
 
-    bg_lam_v  = max(f2(bg_lam,1e5),1.0)
-    bg_p_v    = min(max(f2(bg_p,0.01),1e-5),0.5)
-    bg_iter_v = max(i2(bg_iter,10),1)
+    hampel_win_v   = max(i2(hampel_win, 7), 3)
+    hampel_sigma_v = max(f2(hampel_sigma, 3.0), 0.1)
+    sg_win_v       = max(i2(sg_win, 11), 5)
+    sg_poly_v      = max(i2(sg_poly, 3), 2)
 
-    on_win_v  = max(i2(on_win,11),5)
-    on_poly_v = max(i2(on_poly,2),1)
-    on_z_v    = max(f2(on_z,3.0),0.1)
+    bg_lam_v  = max(f2(bg_lam, 1e5), 1.0)
+    bg_p_v    = min(max(f2(bg_p, 0.01), 1e-5), 0.5)
+    bg_iter_v = max(i2(bg_iter, 10), 1)
 
-    prom_frac_v = f2(prom_frac,0.02)
-    dist_pts_v  = max(i2(dist_pts,5),1)
-    width_v     = f2(width,None) if (width or "").strip() else None
+    on_win_v  = max(i2(on_win, 11), 5)
+    on_poly_v = max(i2(on_poly, 2), 1)
+    on_z_v    = max(f2(on_z, 3.0), 0.1)
+
+    prom_frac_v = f2(prom_frac, 0.02)
+    dist_pts_v  = max(i2(dist_pts, 5), 1)
+    width_v     = f2(width, None) if (width or "").strip() else None
 
     model_chosen = ensure_model_installed(TEXT_MODEL, OLLAMA_HOST)
 
-    # read all uploaded files (sync)
-    file_payloads=[]
-    for k, uf in enumerate(csv,1):
-        name = uf.filename or f"file_{k}"
+    file_payloads = []
+    for idx, uf in enumerate(csv, 1):
+        name = uf.filename or f"file_{idx}"
         b = uf.file.read()
         uf.file.close()
-        file_payloads.append({"name":name,"bytes":b})
+        file_payloads.append({"name": name, "bytes": b})
 
-    tabs_labels=[]; tabs_panes=[]
-    pdf_pages=[]
+    tabs_labels = []
+    tabs_panes  = []
+    pdf_pages   = []
+
+    available_ops = list(OP_REGISTRY.keys())
 
     for fp in file_payloads:
-        name = fp["name"]; b = fp["bytes"]
+        name = fp["name"]
+        b    = fp["bytes"]
+
+        # 파싱
         try:
             low = name.lower()
-            if low.endswith((".xlsx",".xls")):
+            if low.endswith((".xlsx", ".xls")):
                 x, y, xlabel, ylabel = parse_excel(b)
             else:
                 x, y, xlabel, ylabel = parse_spectrum_csv(b)
         except Exception as e:
             tabs_labels.append(f"<span class='tablabel'>{name}</span>")
-            tabs_panes.append(f"<div class='tabpanel'><h3>{name}</h3><div class='result' style='color:#b00;'>파싱 실패: {e}</div></div>")
-            pdf_pages.append({"title": f"{name} — 오류 보고", "images": [], "text_blocks": [f"오류: {repr(e)}"]})
+            tabs_panes.append(
+                f"<div class='tabpanel'><h3>{name}</h3>"
+                f"<div class='result' style='color:#b00;'>파싱 실패: {e}</div></div>"
+            )
+            pdf_pages.append({
+                "title": f"{name} — 오류 보고",
+                "images": [],
+                "text_blocks": [f"오류: {repr(e)}"]
+            })
             continue
 
-        # ---------- AGENT MODE ----------
+        # ---------- Agent 모드 ----------
         if run_mode == "agent":
-            steps, warns, _ = plan_from_goal(prompt, model_chosen, OLLAMA_HOST)
-            steps, _ = validate_and_normalize_steps(steps)
-            if not steps or all(s.get("__unknown__") for s in steps):
-                steps = default_agent_steps()
+            constraints = interpret_constraints(prompt, model_chosen, OLLAMA_HOST, available_ops)
+            steps, warns, meta0 = plan_from_goal(prompt, model_chosen, OLLAMA_HOST, constraints, available_ops)
+            if not steps:
+                steps = default_agent_steps(constraints)
 
-            history=[]
-            for it in range(1, MAX_AGENT_ITERS+1):
-                # 매회 원본에서 실행 (계획이 바뀔 수 있으니)
-                x2, y2, metas = execute_steps(x, y, steps)
-                y_work = np.asarray(y2, float)
-                onset_idx = detect_onset(x2, y_work.tolist(), win=on_win_v, poly=on_poly_v, z_thresh=on_z_v)
-                peaks = detect_peaks_list(x2, y_work.tolist(), prominence_frac=prom_frac_v, distance_pts=dist_pts_v, width=width_v)
-                ok, fb = evaluate_result(x2, y_work, onset_idx, peaks)
-                history.append({"iter":it, "steps":steps, "feedback":fb})
+            history = []
+            final_x = x
+            final_y = y
+            final_onset = None
+            final_peaks = []
+
+            for it in range(1, MAX_AGENT_ITERS + 1):
+                x2, y2, metas = execute_steps(x, y, steps, constraints)
+                y_arr = np.asarray(y2, float)
+                onset_idx = detect_onset(x2, y_arr.tolist(), win=on_win_v, poly=on_poly_v, z_thresh=on_z_v)
+                peaks = detect_peaks_list(x2, y_arr.tolist(),
+                                          prominence_frac=prom_frac_v,
+                                          distance_pts=dist_pts_v,
+                                          width=width_v)
+                ok, fb = evaluate_result(x2, y_arr, onset_idx, peaks)
+                history.append({"iter": it, "steps": steps, "feedback": fb, "constraints": constraints})
+                final_x, final_y = x2, y2
+                final_onset, final_peaks = onset_idx, peaks
                 if ok:
                     break
-                steps, _, _ = revise_plan(steps, fb, model_chosen, OLLAMA_HOST)
-                steps, _ = validate_and_normalize_steps(steps)
-                if not steps or all(s.get("__unknown__") for s in steps):
-                    steps = default_agent_steps()
+                steps, _, _ = revise_plan(steps, fb, model_chosen, OLLAMA_HOST, constraints, available_ops)
+                if not steps:
+                    steps = default_agent_steps(constraints)
 
             overlay_png = plot_layers_dual_png(
-                x2, y,
+                final_x, y,
                 show_baseline=False, baseline=None,
-                show_onset=True, onset_idx=onset_idx,
-                show_peaks=True, peaks=peaks,
+                show_onset=True, onset_idx=final_onset,
+                show_peaks=True, peaks=final_peaks,
                 xlabel=xlabel, ylabel=ylabel,
-                y_corr=np.asarray(y2,float)
+                y_corr=np.asarray(final_y, float)
             )
             img64 = base64.b64encode(overlay_png).decode()
 
+            peak_lines = "\n".join(
+                [f"- peak @ {p['x']:.6g} (y={p['y']:.6g}, prom={p['prom']:.6g})" for p in final_peaks]
+            ) or "(no peaks)"
+            onset_line = f"onset @ {final_x[final_onset]:.6g}" if final_onset is not None else "(no onset)"
+
             base_prompt = (
                 (prompt or "응답은 반드시 한국어로. 스펙트럼만 해석하라.").strip()
-                + "\n\n[Agent 최종 단계]\n"
+                + "\n\n[Agent Pipeline]\n"
                 + json.dumps(steps, ensure_ascii=False)
+                + "\n[Constraints]\n"
+                + json.dumps(constraints, ensure_ascii=False)
                 + "\n[검출]\n"
-                + (f"onset @ {x2[onset_idx]:.6g}" if onset_idx is not None else "(no onset)")
-                + "\npeaks:\n"
-                + ("\n".join([f"- peak @ {p['x']:.6g} (y={p['y']:.6g}, prom={p['prom']:.6g})" for p in peaks]) or "(no peaks)")
-                + "\n이미지/형태 언급 금지."
+                + onset_line + "\n" + peak_lines
+                + "\n이미지/형태(그래프 외) 언급 금지."
             )
             out_text = ollama_generate_once(model_chosen, base_prompt, OLLAMA_HOST, num_predict=800)
 
-            pane_inner = (
+            pane = (
                 f"<h3>{name} — Agent</h3>"
                 f"<div class='preview'><img src='data:image/png;base64,{img64}'></div>"
-                "<details class='small'><summary>Agent steps</summary><pre>"
+                "<details class='small'><summary>Pipeline</summary><pre>"
                 + json.dumps(steps, indent=2, ensure_ascii=False) + "</pre></details>"
-                "<details class='small'><summary>History</summary><pre>"
+                "<details class='small'><summary>Constraints / History</summary><pre>"
                 + json.dumps(history, indent=2, ensure_ascii=False) + "</pre></details>"
-                "<h3>LLM 해석</h3><div class='result'>"+ out_text + "</div>"
+                "<h3>LLM 해석</h3><div class='result'>" + out_text + "</div>"
             )
+
             tabs_labels.append(f"<span class='tablabel'>{name}</span>")
-            tabs_panes.append(f"<div class='tabpanel'>{pane_inner}</div>")
+            tabs_panes.append(f"<div class='tabpanel'>{pane}</div>")
 
             pdf_pages.append({
                 "title": f"{name} — Agent 결과",
                 "images": [overlay_png],
                 "text_blocks": [
-                    "최종 Steps:\n" + json.dumps(steps, ensure_ascii=False),
-                    "마지막 Feedback:\n" + json.dumps(history[-1]["feedback"] if history else {}, ensure_ascii=False),
+                    "Constraints:\n" + json.dumps(constraints, ensure_ascii=False),
+                    "Final Pipeline:\n" + json.dumps(steps, ensure_ascii=False),
                     "LLM 해석:\n" + out_text
                 ]
             })
             continue
 
-        # ---------- MANUAL MODE ----------
+        # ---------- Manual 모드 ----------
         y_work = np.asarray(y, float)
+
         if use_hampel:
-            _, y_work_list, _ = op_hampel(x, y_work.tolist(), {"window":hampel_win_v,"sigma":hampel_sigma_v})
+            _, y_work_list, _ = op_hampel(x, y_work.tolist(),
+                                          {"window": hampel_win_v, "sigma": hampel_sigma_v})
             y_work = np.asarray(y_work_list, float)
         if use_sg:
-            _, y_work_list, _ = op_sg(x, y_work.tolist(), {"window":sg_win_v,"poly":sg_poly_v})
+            _, y_work_list, _ = op_sg(x, y_work.tolist(),
+                                      {"window": sg_win_v, "poly": sg_poly_v})
             y_work = np.asarray(y_work_list, float)
 
         baseline = None
@@ -840,8 +1114,14 @@ def analyze(
             baseline = baseline_asls(y_corr, lam=bg_lam_v, p=bg_p_v, niter=bg_iter_v)
             y_corr = y_corr - baseline
 
-        onset_idx = detect_onset(x, y_corr.tolist(), win=on_win_v, poly=on_poly_v, z_thresh=on_z_v) if use_onset else None
-        peaks = detect_peaks_list(x, y_corr.tolist(), prominence_frac=prom_frac_v, distance_pts=dist_pts_v, width=width_v) if use_peaks else []
+        onset_idx = detect_onset(x, y_corr.tolist(),
+                                 win=on_win_v, poly=on_poly_v, z_thresh=on_z_v) if use_onset else None
+        peaks = detect_peaks_list(
+            x, y_corr.tolist(),
+            prominence_frac=prom_frac_v,
+            distance_pts=dist_pts_v,
+            width=width_v
+        ) if use_peaks else []
 
         if show_corr:
             overlay_png = plot_layers_dual_png(
@@ -863,63 +1143,67 @@ def analyze(
             )
         img64 = base64.b64encode(overlay_png).decode()
 
-        top_peaks_text = "\n".join([f"- peak @ {p['x']:.6g} (y={p['y']:.6g}, prom={p['prom']:.6g})" for p in peaks]) or "(no peaks)"
-        onset_line = f"onset @ {x[onset_idx]:.6g}" if (onset_idx is not None) else "(no onset)"
+        peak_lines = "\n".join(
+            [f"- peak @ {p['x']:.6g} (y={p['y']:.6g}, prom={p['prom']:.6g})" for p in peaks]
+        ) or "(no peaks)"
+        onset_line = f"onset @ {x[onset_idx]:.6g}" if onset_idx is not None else "(no onset)"
+
         base_prompt = (
             (prompt or "응답은 반드시 한국어로. 스펙트럼만 해석하라.").strip()
-            + "\n\n[전처리 옵션] DN(Hampel="+("Y" if use_hampel else "N")
-            + ", SG="+("Y" if use_sg else "N")+") | BG="+("Y" if use_bg else "N")
-            + " | ONSET="+("Y" if use_onset else "N")+" | PEAKS="+("Y" if use_peaks else "N")
+            + "\n\n[전처리 옵션] "
+            + f"Hampel={'Y' if use_hampel else 'N'}, SG={'Y' if use_sg else 'N'}, "
+            + f"BG={'Y' if use_bg else 'N'}, ONSET={'Y' if use_onset else 'N'}, PEAKS={'Y' if use_peaks else 'N'}"
             + f"\n[축] X={xlabel}, Y={ylabel}"
-            + f"\n[onset] {onset_line}\n[peaks]\n{top_peaks_text}\n이미지/형태 언급 금지."
+            + f"\n[onset] {onset_line}\n[peaks]\n{peak_lines}\n"
+            + "이미지/형태 언급 금지."
         )
         out_text = ollama_generate_once(model_chosen, base_prompt, OLLAMA_HOST, num_predict=800)
 
         params = {
             "Hampel": f"window={hampel_win_v}, sigma={hampel_sigma_v}" if use_hampel else "OFF",
             "Savitzky–Golay": f"window={sg_win_v}, poly={sg_poly_v}" if use_sg else "OFF",
-            "AsLS": f"λ={bg_lam_v}, p={bg_p_v}, iter={bg_iter_v}" if use_bg else "OFF",
+            "AsLS": f"lam={bg_lam_v}, p={bg_p_v}, iter={bg_iter_v}" if use_bg else "OFF",
             "Onset": f"win={on_win_v}, poly={on_poly_v}, z={on_z_v}" if use_onset else "OFF",
-            "Peaks": f"prom_frac={prom_frac_v}, dist={dist_pts_v}, width={width_v}" if use_peaks else "OFF"
+            "Peaks": f"prom_frac={prom_frac_v}, dist={dist_pts_v}, width={width_v}" if use_peaks else "OFF",
         }
         param_lines = "\n".join([f"{k}: {v}" for k, v in params.items()])
-        param_html = (
-            "<details class='small' style='margin:8px 0;'><summary>전처리 파라미터</summary>"
-            "<pre style='white-space:pre-wrap;'>" + param_lines + "</pre></details>"
-        )
 
-        pane_inner = (
+        pane = (
             f"<h3>{name} — Manual</h3>"
             f"<div class='preview'><img src='data:image/png;base64,{img64}'></div>"
             "<h3>Server Summary (text fed to LLM)</h3>"
-            "<pre>"+ base_prompt + "</pre>"
-            + param_html +
-            "<h3>LLM 해석</h3><div class='result'>"+ out_text + "</div>"
+            f"<pre>{base_prompt}</pre>"
+            "<details class='small'><summary>전처리 파라미터</summary>"
+            f"<pre>{param_lines}</pre></details>"
+            "<h3>LLM 해석</h3><div class='result'>" + out_text + "</div>"
         )
+
         tabs_labels.append(f"<span class='tablabel'>{name}</span>")
-        tabs_panes.append(f"<div class='tabpanel'>{pane_inner}</div>")
+        tabs_panes.append(f"<div class='tabpanel'>{pane}</div>")
 
         pdf_pages.append({
             "title": f"{name} — Manual 결과",
             "images": [overlay_png],
             "text_blocks": [
-                "전처리 파라미터:\n"+param_lines,
-                "LLM 해석:\n"+out_text
+                "전처리 파라미터:\n" + param_lines,
+                "LLM 해석:\n" + out_text
             ]
         })
 
-    # Tabs HTML
+    # 탭 / PDF 합치기
     tabs_html = (
         "<div id='tablabels'>" + "".join(tabs_labels) + "</div>"
-        + "<div id='tabpanes'>" + "".join(tabs_panes) + "</div>"
-        + "<script>(function(){{const ls=[...document.querySelectorAll('.tablabel')];const ps=[...document.querySelectorAll('.tabpanel')];function act(i){{ls.forEach((el,k)=>el.style.fontWeight=k===i?'bold':'normal');ps.forEach((el,k)=>el.className='tabpanel'+(k===i?' active':''));}}ls.forEach((el,i)=>el.addEventListener('click',()=>act(i)));if(ls.length)act(0);}})();</script>"
+        "<div id='tabpanes'>" + "".join(tabs_panes) + "</div>"
+        "<script>(function(){const ls=[...document.querySelectorAll('.tablabel')];"
+        "const ps=[...document.querySelectorAll('.tabpanel')];"
+        "function act(i){ls.forEach((e,k)=>e.style.fontWeight=k===i?'bold':'normal');"
+        "ps.forEach((e,k)=>e.className='tabpanel'+(k===i?' active':''));}"
+        "ls.forEach((e,i)=>e.addEventListener('click',()=>act(i)));if(ls.length)act(0);})();</script>"
     )
 
-    # PDF build
     pdf_buf = BytesIO()
     save_pdf_report(pdf_buf, pdf_pages)
-    pdf_bytes = pdf_buf.getvalue()
-    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+    pdf_b64 = base64.b64encode(pdf_buf.getvalue()).decode()
 
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Results</title>
 <style>
@@ -933,7 +1217,7 @@ def analyze(
 <h2>Results ({ensure_model_installed(TEXT_MODEL, OLLAMA_HOST)} @ {OLLAMA_HOST})</h2>
 <p><a download="spectrum_report.pdf" href="data:application/pdf;base64,{pdf_b64}">📄 PDF 다운로드</a></p>
 {tabs_html}
-<p class="small">* Text-only single host · Manual/Agent 지원</p>
+<p class="small">* Agent 모드: 프롬프트 → 제약(Constraints) → Pipeline 자동 설계.</p>
 <p><a href="/">← Back</a></p>
 </body></html>"""
     return HTMLResponse(html)
