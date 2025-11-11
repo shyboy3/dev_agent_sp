@@ -7,32 +7,47 @@ import tempfile
 from typing import List, Optional
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 import pytesseract
 from PIL import Image
 import httpx
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # =========================
-# 설정
+# 경로 & 설정
 # =========================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
 LLM_API_URL = "http://localhost:11434/api/generate"    # 로컬 LLM API (Ollama 예시)
 LLM_MODEL = "qwen2.5-7b-instruct"                      # 실제 설치한 모델 이름
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+FONT_NAME = "KoreanFont"
+
+# 한글 폰트 등록 (NotoSansCJKkr-Regular.otf 등)
+font_path = os.path.join(FONTS_DIR, "NotoSansCJKkr-Regular.otf")
+if os.path.exists(font_path):
+    pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
+else:
+    # 폰트 없으면 기본 폰트 사용 (이 경우 다시 네모 문제 생길 수 있음)
+    FONT_NAME = "Helvetica"
 
 app = FastAPI(title="Research Report Generator")
 
-# 정적 파일 (index.html, css, js) 서빙
 if not os.path.exists(STATIC_DIR):
     os.makedirs(STATIC_DIR)
 
@@ -40,7 +55,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # =========================
-# 유틸: LLM 호출
+# LLM 호출
 # =========================
 
 async def call_llm(prompt: str, system_prompt: str = "") -> str:
@@ -53,7 +68,6 @@ async def call_llm(prompt: str, system_prompt: str = "") -> str:
         r = await client.post(LLM_API_URL, json=payload)
         r.raise_for_status()
         data = r.json()
-        # Ollama 기준: {"model":..., "created_at":..., "response":"..."}
         return data.get("response", "")
 
 
@@ -72,8 +86,43 @@ class ReportMeta(BaseModel):
 
 
 # =========================
-# 파일 파서
+# 파일 파서 (이미지 & 스펙트럼 포함)
 # =========================
+
+def save_image_to_tmp(raw: bytes, filename: str, tmp_dir: str) -> str:
+    path = os.path.join(tmp_dir, filename)
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path
+
+def try_make_spectrum_plot(df: pd.DataFrame, filename: str, tmp_dir: str) -> Optional[str]:
+    """
+    스펙트럼으로 보이는 CSV는 라인 플롯을 생성해서 PNG로 저장.
+    단순 휴리스틱:
+      - 숫자 컬럼이 2개 이상이고 행이 일정 개수 이상이면
+      - 첫 번째 숫자 컬럼 = x, 두 번째 숫자 컬럼 = y 로 사용
+    """
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    if len(numeric_cols) < 2 or len(df) < 10:
+        return None
+
+    x = df[numeric_cols[0]].values
+    y = df[numeric_cols[1]].values
+
+    try:
+        plt.figure()
+        plt.plot(x, y)
+        plt.xlabel(str(numeric_cols[0]))
+        plt.ylabel(str(numeric_cols[1]))
+        plt.title(filename)
+        plt.tight_layout()
+        plot_path = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
+        plt.savefig(plot_path, dpi=200)
+        plt.close()
+        return plot_path
+    except Exception:
+        plt.close()
+        return None
 
 def parse_txt(raw: bytes, filename: str):
     text = raw.decode("utf-8", errors="ignore")
@@ -83,7 +132,7 @@ def parse_txt(raw: bytes, filename: str):
         "text": text
     }
 
-def parse_csv(raw: bytes, filename: str):
+def parse_csv(raw: bytes, filename: str, tmp_dir: str):
     df = pd.read_csv(io.BytesIO(raw))
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
@@ -97,22 +146,26 @@ def parse_csv(raw: bytes, filename: str):
     stats = {}
     if numeric_cols:
         desc = df[numeric_cols].describe().to_dict()
-        # JSON 직렬화용 float 변환
         stats = {col: {k: float(v) for k, v in m.items()} for col, m in desc.items()}
 
     sample_rows = df.head(20).to_dict(orient="records")
+
+    # 스펙트럼 플롯 시도
+    spectrum_plot = try_make_spectrum_plot(df, filename, tmp_dir)
 
     return {
         "type": "csv_result",
         "filename": filename,
         "profile": profile,
         "stats": stats,
-        "sample_rows": sample_rows
+        "sample_rows": sample_rows,
+        "spectrum_plot": spectrum_plot  # 있으면 PDF에 그림으로 삽입
     }
 
-def parse_image(raw: bytes, filename: str):
-    img = Image.open(io.BytesIO(raw))
+def parse_image(raw: bytes, filename: str, tmp_dir: str):
+    path = save_image_to_tmp(raw, filename, tmp_dir)
     try:
+        img = Image.open(io.BytesIO(raw))
         ocr = pytesseract.image_to_string(img, lang="eng+kor")
     except Exception:
         ocr = ""
@@ -120,19 +173,21 @@ def parse_image(raw: bytes, filename: str):
         "type": "image_result",
         "filename": filename,
         "ocr_hint": ocr.strip(),
-        "comment": "Microscopy or measurement image; use for morphology/defect/phase discussion."
+        "path": path
     }
 
-def parse_other(raw: bytes, filename: str):
+def parse_other(raw: bytes, filename: str, tmp_dir: str):
+    path = save_image_to_tmp(raw, filename, tmp_dir) if filename.lower().endswith((".png",".jpg",".jpeg",".tif",".tiff")) else None
     return {
         "type": "other_file",
         "filename": filename,
-        "comment": "Unsupported file type; mention only as supplemental data if needed."
+        "path": path,
+        "comment": "지원하지 않는 형식 (또는 별도 처리 필요). 참고용으로만 언급."
     }
 
 
 # =========================
-# 시스템 프롬프트 (연구 리포트 모드)
+# 시스템 프롬프트 (연구 리포트)
 # =========================
 
 SYSTEM_PROMPT = """
@@ -140,7 +195,7 @@ SYSTEM_PROMPT = """
 입력 자료를 기반으로 '시료 분석 결과 보고서' 초안을 작성합니다.
 
 규칙:
-1. 구조 (한국어, 마크다운 헤딩 사용 가능):
+1. 구조:
 # [Report Title]
 ## 1. Introduction & Objective
 ## 2. Sample Information
@@ -153,79 +208,123 @@ SYSTEM_PROMPT = """
 
 2. 스타일:
 - 논문/테크니컬 리포트 톤.
-- 과장 없이: "관찰된다", "시사한다", "가능성이 있다", "데이터 범위 내에서" 등 사용.
-- 인과관계는 섣불리 단정하지 않는다.
+- 과장 없이: "관찰된다", "시사한다", "가능성이 있다", "데이터 범위 내에서" 등.
+- 인과관계를 섣불리 단정하지 않는다.
 
 3. 데이터 사용:
 - 업로드된 txt/csv/image 내용은 참고용.
 - 최종 결과에는 raw 데이터 전체를 복붙하지 말 것.
-- 대신:
-  - 주요 피크/특징/상(phase)/조성/두께/입도/결함/계면 특성
-  - 공정 조건과 특성 간의 경향
-  를 요약해서 기술.
+- 주요 피크/상/조성/입도/계면 정보 및 경향만 요약.
 
 4. 이미지:
-- 이미지가 있다면 "그림 1", "그림 2" 등으로 언급.
-- 가능한 범위에서 형상/균일성/결함/계면 상태 등을 설명하되, 제공 정보 이상 추측 금지.
+- 실제 PDF에는 업로드된 이미지를 모두 포함한다 (이는 시스템이 처리).
+- 텍스트에서는 "그림 1", "그림 2" 등으로 적절히 언급.
 
 5. 메타데이터:
-- project_name, sample_id, techniques, key_questions가 있으면
-  제목, 서론, Discussion/Conclusion에 자연스럽게 반영.
+- project_name, sample_id, techniques, key_questions를 제목/서론/결론에 반영.
 """
 
 
 # =========================
-# 컨텍스트 & 리포트 생성
+# 리포트 텍스트 생성
 # =========================
 
 def build_context(meta: ReportMeta, parsed_files):
+    # LLM에는 path 같은 로컬 경로는 크게 의미 없으니 필요한 정보만 전달
+    sanitized_files = []
+    for f in parsed_files:
+        d = dict(f)
+        d.pop("path", None)
+        d.pop("spectrum_plot", None)
+        sanitized_files.append(d)
     return {
         "meta": meta.dict(),
-        "files": parsed_files
+        "files": sanitized_files
     }
 
 async def generate_report_text(meta: ReportMeta, parsed_files) -> str:
     context = build_context(meta, parsed_files)
-
     prompt = f"""
-다음은 시료 분석 프로젝트의 메타데이터와 분석 결과 요약입니다.
+다음은 시료 분석 프로젝트의 메타데이터와 파일 요약입니다.
 이를 기반으로 위 규칙에 맞는 '시료 분석 결과 보고서'를 작성하세요.
 
 [메타데이터 및 파일 요약]
 {json.dumps(context, ensure_ascii=False)}
 
 요구사항:
-- 제시된 구조를 따르되, 내용이 부족한 섹션은 간단히 기술.
-- key_questions가 있다면 Results/Discussion/Conclusion에서 직접적으로 다루세요.
-- techniques 정보에 맞는 현실적인 해석만 사용하세요.
+- 제시된 구조를 따르되, 내용 부족한 섹션은 간단히.
+- key_questions를 Results/Discussion/Conclusion에서 직접적으로 다룰 것.
+- techniques 정보에 맞는 현실적인 해석만 사용할 것.
 """
     return await call_llm(prompt, SYSTEM_PROMPT)
 
 
 # =========================
-# PDF 렌더링
+# PDF 렌더링 (텍스트 + 이미지 + 스펙트럼 플롯)
 # =========================
 
-def render_pdf(report_text: str) -> bytes:
+def render_pdf(report_text: str, parsed_files, tmp_dir: str) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
+
+    # 모든 스타일에 한글 폰트 적용
+    for name in ["Normal", "BodyText", "Heading1", "Heading2", "Heading3"]:
+        if name in styles:
+            styles[name].fontName = FONT_NAME
+
     story = []
 
+    # 1) LLM이 생성한 본문 먼저
     for line in report_text.splitlines():
         t = line.strip()
         if not t:
             story.append(Spacer(1, 6))
             continue
         if t.startswith("# "):
-            story.append(Paragraph(f"<b>{t[2:]}</b>", styles["Heading1"]))
+            story.append(Paragraph(t[2:], styles["Heading1"]))
         elif t.startswith("## "):
-            story.append(Paragraph(f"<b>{t[3:]}</b>", styles["Heading2"]))
+            story.append(Paragraph(t[3:], styles["Heading2"]))
         elif t.startswith("### "):
-            story.append(Paragraph(f"<b>{t[4:]}</b>", styles["Heading3"]))
+            story.append(Paragraph(t[4:], styles["Heading3"]))
         else:
             story.append(Paragraph(t, styles["BodyText"]))
         story.append(Spacer(1, 4))
+
+    # 2) Appendix: 업로드된 이미지 + 스펙트럼 플롯 전부 포함
+    figs = []
+
+    # 실제 이미지
+    for f in parsed_files:
+        if f.get("type") == "image_result" and f.get("path"):
+            figs.append(("이미지", f["filename"], f["path"]))
+        # 기타 파일 중 이미지인 경우
+        if f.get("type") == "other_file" and f.get("path") and f["path"].lower().endswith((".png",".jpg",".jpeg",".tif",".tiff")):
+            figs.append(("이미지", f["filename"], f["path"]))
+
+    # 스펙트럼 플롯
+    for f in parsed_files:
+        if f.get("type") == "csv_result" and f.get("spectrum_plot"):
+            figs.append(("스펙트럼", f["filename"], f["spectrum_plot"]))
+
+    if figs:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Appendix - Figures", styles["Heading2"]))
+        story.append(Spacer(1, 6))
+
+        fig_idx = 1
+        for kind, fname, path in figs:
+            if not os.path.exists(path):
+                continue
+            caption = f"Figure {fig_idx}. ({kind}) {fname}"
+            story.append(Paragraph(caption, styles["BodyText"]))
+            story.append(Spacer(1, 4))
+            # 이미지 폭을 페이지에 맞게 적당히 조정
+            img = RLImage(path)
+            img._restrictSize(500, 350)
+            story.append(img)
+            story.append(Spacer(1, 12))
+            fig_idx += 1
 
     doc.build(story)
     pdf_data = buffer.getvalue()
@@ -234,22 +333,20 @@ def render_pdf(report_text: str) -> bytes:
 
 
 # =========================
-# HTML UI: 메인 페이지
+# HTML UI
 # =========================
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # static/index.html을 서빙
     index_path = os.path.join(STATIC_DIR, "index.html")
     if os.path.exists(index_path):
         with open(index_path, "r", encoding="utf-8") as f:
             return HTMLResponse(f.read())
-    # 없으면 간단한 안내
-    return HTMLResponse("<h1>Research Report Generator</h1><p>index.html이 없습니다.</p>")
+    return HTMLResponse("<h1>Research Report Generator</h1><p>static/index.html 파일을 추가하세요.</p>")
 
 
 # =========================
-# PDF 생성 API (프론트에서 호출)
+# API: 웹폼에서 호출
 # =========================
 
 @app.post("/api/generate-research-report")
@@ -259,11 +356,10 @@ async def api_generate_research_report(
     sample_description: str = Form(""),
     operator: str = Form(""),
     date: str = Form(""),
-    techniques: str = Form(""),  # "TEM,EELS,XRD"
+    techniques: str = Form(""),
     key_questions: str = Form(""),
     files: List[UploadFile] = File(...)
 ):
-    # techniques 파싱
     tech_list = [t.strip() for t in techniques.split(",") if t.strip()] if techniques else []
 
     meta = ReportMeta(
@@ -276,27 +372,32 @@ async def api_generate_research_report(
         key_questions=key_questions or None,
     )
 
+    # temp dir: 이미지/플롯 저장용
+    tmp_dir = tempfile.mkdtemp()
     parsed_files = []
+
     for f in files:
         raw = await f.read()
         name = f.filename.lower()
+
         if name.endswith(".txt"):
             parsed_files.append(parse_txt(raw, f.filename))
         elif name.endswith(".csv"):
-            parsed_files.append(parse_csv(raw, f.filename))
+            parsed_files.append(parse_csv(raw, f.filename, tmp_dir))
         elif name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff")):
-            parsed_files.append(parse_image(raw, f.filename))
+            parsed_files.append(parse_image(raw, f.filename, tmp_dir))
         else:
-            parsed_files.append(parse_other(raw, f.filename))
+            parsed_files.append(parse_other(raw, f.filename, tmp_dir))
 
     report_text = await generate_report_text(meta, parsed_files)
-    pdf_bytes = render_pdf(report_text)
+    pdf_bytes = render_pdf(report_text, parsed_files, tmp_dir)
 
-    # 브라우저에서 직접 받기 좋게 application/pdf로 반환
     headers = {
         "Content-Disposition": 'inline; filename="research_report.pdf"'
     }
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
 
 
 static/index.html (최소 동작 버전, 바로 사용 가능):
