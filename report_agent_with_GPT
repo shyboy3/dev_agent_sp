@@ -1,1 +1,484 @@
-# Generator
+research_report_server_web.py:
+
+import os
+import io
+import json
+import tempfile
+from typing import List, Optional
+
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+
+import pytesseract
+from PIL import Image
+import httpx
+
+# =========================
+# 설정
+# =========================
+
+LLM_API_URL = "http://localhost:11434/api/generate"    # 로컬 LLM API (Ollama 예시)
+LLM_MODEL = "qwen2.5-7b-instruct"                      # 실제 설치한 모델 이름
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+app = FastAPI(title="Research Report Generator")
+
+# 정적 파일 (index.html, css, js) 서빙
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+# =========================
+# 유틸: LLM 호출
+# =========================
+
+async def call_llm(prompt: str, system_prompt: str = "") -> str:
+    payload = {
+        "model": LLM_MODEL,
+        "prompt": (system_prompt + "\n\n" + prompt).strip(),
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=600) as client:
+        r = await client.post(LLM_API_URL, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        # Ollama 기준: {"model":..., "created_at":..., "response":"..."}
+        return data.get("response", "")
+
+
+# =========================
+# 메타데이터 모델
+# =========================
+
+class ReportMeta(BaseModel):
+    project_name: Optional[str] = None
+    sample_id: Optional[str] = None
+    sample_description: Optional[str] = None
+    operator: Optional[str] = None
+    date: Optional[str] = None
+    techniques: Optional[List[str]] = None
+    key_questions: Optional[str] = None
+
+
+# =========================
+# 파일 파서
+# =========================
+
+def parse_txt(raw: bytes, filename: str):
+    text = raw.decode("utf-8", errors="ignore")
+    return {
+        "type": "note",
+        "filename": filename,
+        "text": text
+    }
+
+def parse_csv(raw: bytes, filename: str):
+    df = pd.read_csv(io.BytesIO(raw))
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    profile = {
+        "rows": int(len(df)),
+        "cols": int(len(df.columns)),
+        "columns": [str(c) for c in df.columns]
+    }
+
+    stats = {}
+    if numeric_cols:
+        desc = df[numeric_cols].describe().to_dict()
+        # JSON 직렬화용 float 변환
+        stats = {col: {k: float(v) for k, v in m.items()} for col, m in desc.items()}
+
+    sample_rows = df.head(20).to_dict(orient="records")
+
+    return {
+        "type": "csv_result",
+        "filename": filename,
+        "profile": profile,
+        "stats": stats,
+        "sample_rows": sample_rows
+    }
+
+def parse_image(raw: bytes, filename: str):
+    img = Image.open(io.BytesIO(raw))
+    try:
+        ocr = pytesseract.image_to_string(img, lang="eng+kor")
+    except Exception:
+        ocr = ""
+    return {
+        "type": "image_result",
+        "filename": filename,
+        "ocr_hint": ocr.strip(),
+        "comment": "Microscopy or measurement image; use for morphology/defect/phase discussion."
+    }
+
+def parse_other(raw: bytes, filename: str):
+    return {
+        "type": "other_file",
+        "filename": filename,
+        "comment": "Unsupported file type; mention only as supplemental data if needed."
+    }
+
+
+# =========================
+# 시스템 프롬프트 (연구 리포트 모드)
+# =========================
+
+SYSTEM_PROMPT = """
+당신은 재료/소자/나노구조 분석을 전문으로 하는 연구 리포트 작성자입니다.
+입력 자료를 기반으로 '시료 분석 결과 보고서' 초안을 작성합니다.
+
+규칙:
+1. 구조 (한국어, 마크다운 헤딩 사용 가능):
+# [Report Title]
+## 1. Introduction & Objective
+## 2. Sample Information
+## 3. Experimental Methods
+## 4. Results
+## 5. Discussion
+## 6. Conclusion
+## 7. Suggestions / Future Work
+(선택) ## Appendix (핵심 파라미터/간단 표만)
+
+2. 스타일:
+- 논문/테크니컬 리포트 톤.
+- 과장 없이: "관찰된다", "시사한다", "가능성이 있다", "데이터 범위 내에서" 등 사용.
+- 인과관계는 섣불리 단정하지 않는다.
+
+3. 데이터 사용:
+- 업로드된 txt/csv/image 내용은 참고용.
+- 최종 결과에는 raw 데이터 전체를 복붙하지 말 것.
+- 대신:
+  - 주요 피크/특징/상(phase)/조성/두께/입도/결함/계면 특성
+  - 공정 조건과 특성 간의 경향
+  를 요약해서 기술.
+
+4. 이미지:
+- 이미지가 있다면 "그림 1", "그림 2" 등으로 언급.
+- 가능한 범위에서 형상/균일성/결함/계면 상태 등을 설명하되, 제공 정보 이상 추측 금지.
+
+5. 메타데이터:
+- project_name, sample_id, techniques, key_questions가 있으면
+  제목, 서론, Discussion/Conclusion에 자연스럽게 반영.
+"""
+
+
+# =========================
+# 컨텍스트 & 리포트 생성
+# =========================
+
+def build_context(meta: ReportMeta, parsed_files):
+    return {
+        "meta": meta.dict(),
+        "files": parsed_files
+    }
+
+async def generate_report_text(meta: ReportMeta, parsed_files) -> str:
+    context = build_context(meta, parsed_files)
+
+    prompt = f"""
+다음은 시료 분석 프로젝트의 메타데이터와 분석 결과 요약입니다.
+이를 기반으로 위 규칙에 맞는 '시료 분석 결과 보고서'를 작성하세요.
+
+[메타데이터 및 파일 요약]
+{json.dumps(context, ensure_ascii=False)}
+
+요구사항:
+- 제시된 구조를 따르되, 내용이 부족한 섹션은 간단히 기술.
+- key_questions가 있다면 Results/Discussion/Conclusion에서 직접적으로 다루세요.
+- techniques 정보에 맞는 현실적인 해석만 사용하세요.
+"""
+    return await call_llm(prompt, SYSTEM_PROMPT)
+
+
+# =========================
+# PDF 렌더링
+# =========================
+
+def render_pdf(report_text: str) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+
+    for line in report_text.splitlines():
+        t = line.strip()
+        if not t:
+            story.append(Spacer(1, 6))
+            continue
+        if t.startswith("# "):
+            story.append(Paragraph(f"<b>{t[2:]}</b>", styles["Heading1"]))
+        elif t.startswith("## "):
+            story.append(Paragraph(f"<b>{t[3:]}</b>", styles["Heading2"]))
+        elif t.startswith("### "):
+            story.append(Paragraph(f"<b>{t[4:]}</b>", styles["Heading3"]))
+        else:
+            story.append(Paragraph(t, styles["BodyText"]))
+        story.append(Spacer(1, 4))
+
+    doc.build(story)
+    pdf_data = buffer.getvalue()
+    buffer.close()
+    return pdf_data
+
+
+# =========================
+# HTML UI: 메인 페이지
+# =========================
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    # static/index.html을 서빙
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    # 없으면 간단한 안내
+    return HTMLResponse("<h1>Research Report Generator</h1><p>index.html이 없습니다.</p>")
+
+
+# =========================
+# PDF 생성 API (프론트에서 호출)
+# =========================
+
+@app.post("/api/generate-research-report")
+async def api_generate_research_report(
+    project_name: str = Form(""),
+    sample_id: str = Form(""),
+    sample_description: str = Form(""),
+    operator: str = Form(""),
+    date: str = Form(""),
+    techniques: str = Form(""),  # "TEM,EELS,XRD"
+    key_questions: str = Form(""),
+    files: List[UploadFile] = File(...)
+):
+    # techniques 파싱
+    tech_list = [t.strip() for t in techniques.split(",") if t.strip()] if techniques else []
+
+    meta = ReportMeta(
+        project_name=project_name or None,
+        sample_id=sample_id or None,
+        sample_description=sample_description or None,
+        operator=operator or None,
+        date=date or None,
+        techniques=tech_list or None,
+        key_questions=key_questions or None,
+    )
+
+    parsed_files = []
+    for f in files:
+        raw = await f.read()
+        name = f.filename.lower()
+        if name.endswith(".txt"):
+            parsed_files.append(parse_txt(raw, f.filename))
+        elif name.endswith(".csv"):
+            parsed_files.append(parse_csv(raw, f.filename))
+        elif name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff")):
+            parsed_files.append(parse_image(raw, f.filename))
+        else:
+            parsed_files.append(parse_other(raw, f.filename))
+
+    report_text = await generate_report_text(meta, parsed_files)
+    pdf_bytes = render_pdf(report_text)
+
+    # 브라우저에서 직접 받기 좋게 application/pdf로 반환
+    headers = {
+        "Content-Disposition": 'inline; filename="research_report.pdf"'
+    }
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+static/index.html (최소 동작 버전, 바로 사용 가능):
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>연구 시료 분석 리포트 생성기</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; }
+    h1 { margin-bottom: 4px; }
+    .subtitle { color: #666; margin-bottom: 20px; }
+    .section { margin-bottom: 16px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; }
+    .section h2 { margin: 0 0 8px; font-size: 16px; }
+    label { display: block; margin-top: 6px; font-size: 13px; }
+    input[type="text"], input[type="date"], textarea {
+      width: 100%; padding: 6px 8px; margin-top: 2px;
+      box-sizing: border-box; font-size: 13px;
+    }
+    textarea { resize: vertical; min-height: 60px; }
+    .chips label { display: inline-flex; align-items: center; margin-right: 8px; margin-top: 4px; }
+    .chips input { margin-right: 4px; }
+    .file-box { padding: 8px; background:#fafafa; border-radius:6px; border:1px dashed #bbb; }
+    button {
+      margin-top: 10px; padding: 10px 18px; font-size: 14px;
+      border: none; border-radius: 6px; cursor: pointer;
+      background: #2563eb; color: #fff;
+    }
+    button:disabled { opacity: 0.6; cursor: default; }
+    #status { margin-top: 10px; font-size: 13px; color: #444; }
+    #pdf-container { margin-top: 20px; }
+    #pdf-frame { width: 100%; height: 600px; border: 1px solid #ccc; border-radius: 6px; }
+    #download-link { display: inline-block; margin-top: 8px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>연구 시료 분석 리포트 생성기</h1>
+  <div class="subtitle">
+    시료 관련 메타데이터와 분석 결과 파일을 업로드하면,<br>
+    로컬 LLM이 자동으로 연구용 리포트 초안을 생성합니다.
+  </div>
+
+  <form id="report-form">
+    <div class="section">
+      <h2>기본 정보</h2>
+      <label>Project Name
+        <input type="text" name="project_name" placeholder="예: Hf-ZrO2 Gate Stack Reliability Study" />
+      </label>
+      <label>Sample ID
+        <input type="text" name="sample_id" placeholder="예: HZ-ALD-230901-03" />
+      </label>
+      <label>Sample Description
+        <textarea name="sample_description" placeholder="시료 구조, 공정 조건, 스택 정보 등을 간단히 기입"></textarea>
+      </label>
+      <label>Operator / Author
+        <input type="text" name="operator" placeholder="작성자 이름" />
+      </label>
+      <label>Date
+        <input type="date" name="date" />
+      </label>
+    </div>
+
+    <div class="section">
+      <h2>분석 기법</h2>
+      <div class="chips">
+        <label><input type="checkbox" value="TEM"> TEM</label>
+        <label><input type="checkbox" value="STEM"> STEM</label>
+        <label><input type="checkbox" value="SEM"> SEM</label>
+        <label><input type="checkbox" value="EDS"> EDS</label>
+        <label><input type="checkbox" value="EELS"> EELS</label>
+        <label><input type="checkbox" value="XRD"> XRD</label>
+        <label><input type="checkbox" value="XPS"> XPS</label>
+        <label><input type="checkbox" value="AFM"> AFM</label>
+        <label><input type="checkbox" value="Raman"> Raman</label>
+        <label><input type="checkbox" value="PL"> PL</label>
+        <label><input type="checkbox" value="IV"> IV/CV</label>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>핵심 질문 / 분석 목적</h2>
+      <textarea name="key_questions"
+        placeholder="예: ferroelectric phase fraction 평가, interface roughness 및 diffusion 여부, oxygen vacancy 분포, leakage 관련 결함 유무 등"></textarea>
+    </div>
+
+    <div class="section">
+      <h2>데이터 업로드</h2>
+      <div class="file-box">
+        <p style="margin:0 0 4px; font-size:12px;">
+          지원: csv (수치 결과), txt (노트/로그), png/jpg/tif (이미지), 기타 파일은 참고용으로만 표시됩니다.
+        </p>
+        <input type="file" id="files" name="files" multiple />
+      </div>
+    </div>
+
+    <button type="submit" id="submit-btn">리포트 생성</button>
+    <div id="status"></div>
+  </form>
+
+  <div id="pdf-container" style="display:none;">
+    <h2>생성된 리포트</h2>
+    <iframe id="pdf-frame"></iframe>
+    <a id="download-link" href="#" download="research_report.pdf">📥 PDF 다운로드</a>
+  </div>
+
+  <script>
+    const form = document.getElementById('report-form');
+    const statusEl = document.getElementById('status');
+    const submitBtn = document.getElementById('submit-btn');
+    const pdfContainer = document.getElementById('pdf-container');
+    const pdfFrame = document.getElementById('pdf-frame');
+    const downloadLink = document.getElementById('download-link');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      statusEl.textContent = "리포트를 생성 중입니다. (로컬 LLM 처리)";
+      submitBtn.disabled = true;
+      pdfContainer.style.display = 'none';
+
+      const fd = new FormData();
+
+      // 기본 필드
+      fd.append('project_name', form.project_name.value);
+      fd.append('sample_id', form.sample_id.value);
+      fd.append('sample_description', form.sample_description.value);
+      fd.append('operator', form.operator.value);
+      fd.append('date', form.date.value);
+
+      // techniques 체크박스 → "TEM,EELS,XRD" 형태 문자열
+      const techs = [];
+      form.querySelectorAll('.chips input[type="checkbox"]:checked').forEach(chk => {
+        techs.push(chk.value);
+      });
+      fd.append('techniques', techs.join(','));
+
+      // key_questions
+      fd.append('key_questions', form.key_questions.value);
+
+      // 파일들
+      const filesInput = document.getElementById('files');
+      if (filesInput.files.length === 0) {
+        statusEl.textContent = "⚠ 데이터 파일을 한 개 이상 업로드해주세요.";
+        submitBtn.disabled = false;
+        return;
+      }
+      for (const file of filesInput.files) {
+        fd.append('files', file);
+      }
+
+      try {
+        const res = await fetch('/api/generate-research-report', {
+          method: 'POST',
+          body: fd
+        });
+
+        if (!res.ok) {
+          throw new Error('서버 오류: ' + res.status);
+        }
+
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+
+        // PDF iframe에 표시
+        pdfFrame.src = url;
+        // 다운로드 링크 설정
+        downloadLink.href = url;
+        downloadLink.download = "research_report.pdf";
+
+        pdfContainer.style.display = 'block';
+        statusEl.textContent = "✅ 리포트가 생성되었습니다.";
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "❌ 리포트 생성 중 오류가 발생했습니다: " + err.message;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+
+
+
+
