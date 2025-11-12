@@ -113,6 +113,127 @@ def sniff_delimiter(sample_text: str) -> str:
 
 from charset_normalizer import from_bytes
 
+import csv, re
+from charset_normalizer import from_bytes
+
+NUM_TOKEN = re.compile(r"""
+    ^[ \t]*                                    # 앞 공백
+    [+-]?                                      # 부호
+    (?:\d+(?:[.,]\d+)?|\.\d+)                  # 숫자(소수 허용)
+    (?:[eE][+-]?\d+)?                          # 지수
+    [ \t]*$                                    # 뒤 공백
+""", re.VERBOSE)
+
+def looks_numeric(token: str) -> bool:
+    return bool(NUM_TOKEN.match(token))
+
+def split_tokens(line: str, sep_candidates=(',', ';', '\t', '|')):
+    # 후보 구분자 중 실제로 많이 보이는 것으로 분할
+    best_sep = max(sep_candidates, key=lambda s: line.count(s))
+    return line.split(best_sep), best_sep
+
+def detect_encoding(raw: bytes) -> str:
+    if raw.startswith(b'\xef\xbb\xbf'):
+        return 'utf-8-sig'
+    best = from_bytes(raw).best()
+    return best.encoding if best and best.encoding else 'utf-8'
+
+def find_table_start(sample_text: str):
+    """
+    머릿말 섞인 CSV에서 '숫자형 레코드가 연속으로 2~3줄 이상' 나타나는 지점을
+    테이블 시작으로 간주. (헤더 1줄 바로 위일 수도 있음)
+    """
+    lines = sample_text.splitlines()
+    sep = None
+    numeric_run = 0
+    start_idx = None
+
+    # 1차: 구분자 추정 (가장 자주 등장하는 구분자)
+    counts = {',': sample_text.count(','), ';': sample_text.count(';'),
+              '\t': sample_text.count('\t'), '|': sample_text.count('|')}
+    sep = max(counts, key=counts.get) if any(counts.values()) else ','
+
+    for i, ln in enumerate(lines):
+        # 빈 줄/주석 라인은 머릿말로 간주
+        if not ln.strip() or ln.strip().startswith(('#', '//', ';')):
+            numeric_run = 0
+            continue
+
+        tokens = ln.split(sep)
+        if len(tokens) < 2:
+            numeric_run = 0
+            continue
+
+        num_like = sum(looks_numeric(t) for t in tokens)
+        frac = num_like / max(1, len(tokens))
+
+        # 숫자형 비율이 충분히 높으면 데이터 라인이라고 판단
+        if num_like >= 2 and frac >= 0.5:
+            numeric_run += 1
+            if numeric_run >= 2:
+                # 연속 2줄 이상 숫자형이면, 그 블록의 첫 줄을 테이블 시작으로
+                start_idx = i - numeric_run + 1
+                break
+        else:
+            numeric_run = 0
+
+    # 헤더가 바로 숫자 앞줄에 있는 경우(문자 토큰 다수) 감지
+    header_idx = None
+    if start_idx and start_idx > 0:
+        prev = lines[start_idx - 1]
+        toks = prev.split(sep)
+        if len(toks) >= 2 and sum(looks_numeric(t) for t in toks) == 0:
+            header_idx = start_idx - 1
+
+    return sep, header_idx, start_idx
+
+def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
+    """
+    인코딩/구분자 감지 + 머릿말 스킵 + 헤더/데이터 자동 판별
+    """
+    raw = raw.replace(b'\x00', b'').replace(b'\r\n', b'\n')
+    enc = detect_encoding(raw)
+
+    # 첫 64KB만으로도 시작 위치 판단 충분
+    sample_text = raw[:65536].decode(enc, errors='ignore')
+    sep, header_idx, start_idx = find_table_start(sample_text)
+
+    # 시나리오별로 읽기 시도
+    trial_params = []
+
+    if start_idx is not None:
+        if header_idx is not None:
+            # 헤더 1줄 + 데이터 시작
+            trial_params.append(dict(encoding=enc, sep=sep, engine='c',
+                                     header=header_idx, skiprows=range(0, header_idx)))
+        else:
+            # 헤더 없이 바로 데이터가 시작
+            trial_params.append(dict(encoding=enc, sep=sep, engine='c',
+                                     header=None, skiprows=range(0, start_idx)))
+            # 또는 첫 줄을 헤더로 간주(장비가 첫 줄에 컬럼명 포함한 케이스)
+            trial_params.append(dict(encoding=enc, sep=sep, engine='c',
+                                     header=start_idx, skiprows=range(0, start_idx)))
+    else:
+        # 테이블 시작을 못 찾았으면 일반 스니핑 전략
+        trial_params.append(dict(encoding=enc, sep=sep, engine='c'))
+
+    # python 엔진, 인코딩 대체 재시도
+    alt_encs = ['utf-8-sig', 'cp949', 'euc-kr', 'latin1']
+    for p in list(trial_params):
+        trial_params.append({**p, 'engine': 'python', 'on_bad_lines': 'skip'})
+    for ae in alt_encs:
+        trial_params.append(dict(encoding=ae, sep=sep, engine='python', on_bad_lines='skip'))
+
+    # 시도
+    last_err = None
+    for params in trial_params:
+        try:
+            return pd.read_csv(io.BytesIO(raw), **params)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err or RuntimeError("CSV parsing failed")
+
 def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
     """
     다양한 인코딩/구분자 CSV 자동 감지 후 안전하게 DataFrame으로 로드
@@ -290,6 +411,75 @@ def to_numeric_series(s: pd.Series):
         except Exception:
             return float('nan')
     return txt.map(conv)
+
+def parse_csv(raw: bytes, filename: str, tmp_dir: str):
+    # 1) 엑셀 먼저 시도
+    df = try_read_excel(raw)
+    if df is None:
+        df = robust_read_csv_bytes(raw)
+
+    # 숫자열 부족하면 문자→숫자 변환 시도
+    numeric_cols = df.select_dtypes(include='number').columns.tolist()
+    if len(numeric_cols) < 2 and len(df.columns) >= 2:
+        def to_numeric_series(s: pd.Series):
+            txt = s.astype(str).str.replace(r'\s', '', regex=True)
+            def conv(x):
+                # 유럽식 소수점 대응
+                if re.search(r'[0-9],[0-9]{1,2}$', x) and x.count('.') > 0:
+                    x = x.replace('.', '').replace(',', '.')
+                else:
+                    x = x.replace(',', '')
+                try:
+                    return float(x)
+                except Exception:
+                    return float('nan')
+            return txt.map(conv)
+        for c in df.columns:
+            if df[c].dtype == object:
+                df[c] = to_numeric_series(df[c])
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+
+    profile = {
+        "rows": int(len(df)),
+        "cols": int(len(df.columns)),
+        "columns": [str(c) for c in df.columns]
+    }
+
+    stats = {}
+    num_only = df.select_dtypes(include='number')
+    if num_only.shape[1] > 0:
+        try:
+            desc = num_only.describe().to_dict()
+            stats = {col: {k: (float(v) if pd.notna(v) else None) for k, v in m.items()} for col, m in desc.items()}
+        except Exception:
+            stats = {}
+
+    sample_rows = df.head(20).to_dict(orient="records")
+
+    # 스펙트럼 플롯
+    spectrum_plot = None
+    if len(numeric_cols) >= 2 and len(df) >= 10:
+        x = df[numeric_cols[0]].values
+        y = df[numeric_cols[1]].values
+        try:
+            plt.figure()
+            plt.plot(x, y)
+            plt.xlabel(str(numeric_cols[0])); plt.ylabel(str(numeric_cols[1]))
+            plt.title(filename); plt.tight_layout()
+            spectrum_plot = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
+            plt.savefig(spectrum_plot, dpi=200); plt.close()
+        except Exception:
+            plt.close()
+
+    return {
+        "type": "csv_result",
+        "filename": filename,
+        "profile": profile,
+        "stats": stats,
+        "sample_rows": sample_rows,
+        "spectrum_plot": spectrum_plot
+    }
+
 
 def parse_csv(raw: bytes, filename: str, tmp_dir: str):
     # 1) 엑셀 먼저 시도 (xlsx를 csv로 이름만 바꾸는 경우도 있어서)
