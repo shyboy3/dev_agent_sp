@@ -111,6 +111,70 @@ def sniff_delimiter(sample_text: str) -> str:
         counts = {',': sample_text.count(','), ';': sample_text.count(';'), '\t': sample_text.count('\t')}
         return max(counts, key=counts.get) or ','
 
+from charset_normalizer import from_bytes
+
+def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
+    """
+    다양한 인코딩/구분자 CSV 자동 감지 후 안전하게 DataFrame으로 로드
+    """
+
+    # 널바이트/잘못된 줄바꿈 정리
+    raw = raw.replace(b'\x00', b'').replace(b'\r\n', b'\n')
+
+    # ① 인코딩 감지
+    enc_guess = 'utf-8'
+    try:
+        result = from_bytes(raw).best()
+        if result and result.encoding:
+            enc_guess = result.encoding
+    except Exception:
+        pass
+
+    # ② 샘플 텍스트로 구분자 추정
+    sample = raw[:4096]
+    try:
+        sample_text = sample.decode(enc_guess, errors='ignore')
+    except Exception:
+        # 감지 실패 시 CP949 한 번 더 시도
+        try:
+            sample_text = sample.decode('cp949', errors='ignore')
+            enc_guess = 'cp949'
+        except Exception:
+            sample_text = sample.decode('latin1', errors='ignore')
+            enc_guess = 'latin1'
+
+    import csv
+    try:
+        dialect = csv.Sniffer().sniff(sample_text, delimiters=[',',';','\t','|'])
+        sep = dialect.delimiter
+    except Exception:
+        sep = ','
+
+    # ③ 여러 엔진/인코딩 시도
+    tried = set()
+    for enc in [enc_guess, 'utf-8-sig', 'cp949', 'euc-kr', 'latin1']:
+        if enc in tried: continue
+        tried.add(enc)
+        for engine in ['c', 'python']:
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(raw),
+                    encoding=enc,
+                    sep=sep,
+                    engine=engine,
+                    on_bad_lines='skip'
+                )
+                return df
+            except UnicodeDecodeError:
+                continue
+            except pd.errors.ParserError:
+                continue
+            except Exception:
+                continue
+
+    # ④ 마지막 시도 실패 → raise
+    raise UnicodeDecodeError("robust_read_csv_bytes", b'', 0, 1, "모든 인코딩 시도 실패")
+
 def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
     # 널바이트/깨진 줄 제거
   #  raw = raw.replace(b'\x00', b'')
