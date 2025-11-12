@@ -463,6 +463,91 @@ def to_numeric_series(s: pd.Series):
             return float('nan')
     return txt.map(conv)
 
+## Last Version
+def parse_csv(raw: bytes, filename: str, tmp_dir: str):
+    # 0) 기본값
+    preamble = ""
+
+    # 1) 엑셀 먼저 시도
+    xlsx_df = try_read_excel(raw)
+    if xlsx_df is not None:
+        df = xlsx_df
+    else:
+        # 2) 견고한 CSV 로더: (df, preamble) 반환
+        df, preamble = robust_read_csv_bytes(raw)
+
+    # 혹시라도 df가 튜플인 경우 방어 (실수 대비)
+    if isinstance(df, tuple):
+        df, preamble = df
+
+    # === 여기부터는 기존 로직 그대로 ===
+    # 숫자 열 감지
+    numeric_cols = df.select_dtypes(include='number').columns.tolist()
+
+    # 숫자 열이 부족하면 문자→숫자 변환 시도
+    if len(numeric_cols) < 2 and len(df.columns) >= 2:
+        def to_numeric_series(s: pd.Series):
+            txt = s.astype(str).str.replace(r'\s', '', regex=True)
+            def conv(x):
+                # 유럽식 소수점 대응 (1.234,5 → 1234.5)
+                if re.search(r'[0-9],[0-9]{1,2}$', x) and x.count('.') > 0:
+                    x = x.replace('.', '').replace(',', '.')
+                else:
+                    x = x.replace(',', '')
+                try:
+                    return float(x)
+                except Exception:
+                    return float('nan')
+            return txt.map(conv)
+
+        for c in df.columns:
+            if df[c].dtype == object:
+                df[c] = to_numeric_series(df[c])
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+
+    profile = {
+        "rows": int(len(df)),
+        "cols": int(len(df.columns)),
+        "columns": [str(c) for c in df.columns]
+    }
+
+    stats = {}
+    num_only = df.select_dtypes(include='number')
+    if num_only.shape[1] > 0:
+        try:
+            desc = num_only.describe().to_dict()
+            stats = {col: {k: (float(v) if pd.notna(v) else None) for k, v in m.items()}
+                     for col, m in desc.items()}
+        except Exception:
+            stats = {}
+
+    sample_rows = df.head(20).to_dict(orient="records")
+
+    # 스펙트럼 플롯
+    spectrum_plot = None
+    if len(numeric_cols) >= 2 and len(df) >= 10:
+        x = df[numeric_cols[0]].values
+        y = df[numeric_cols[1]].values
+        try:
+            plt.figure()
+            plt.plot(x, y)
+            plt.xlabel(str(numeric_cols[0])); plt.ylabel(str(numeric_cols[1]))
+            plt.title(filename); plt.tight_layout()
+            spectrum_plot = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
+            plt.savefig(spectrum_plot, dpi=200); plt.close()
+        except Exception:
+            plt.close()
+
+    return {
+        "type": "csv_result",
+        "filename": filename,
+        "note": preamble,              # ⬅️ 머릿말을 LLM 컨텍스트로 전달
+        "profile": profile,
+        "stats": stats,
+        "sample_rows": sample_rows,
+        "spectrum_plot": spectrum_plot
+    }
+
 def parse_csv(raw: bytes, filename: str, tmp_dir: str):
     # 1) 엑셀 먼저 시도
     df = try_read_excel(raw)
