@@ -88,6 +88,85 @@ class ReportMeta(BaseModel):
 # =========================
 # 파일 파서 (이미지 & 스펙트럼 포함)
 # =========================
+import csv, re
+from charset_normalizer import from_bytes
+
+def detect_encoding(raw: bytes) -> str:
+    # BOM 우선 처리
+    if raw.startswith(b'\xef\xbb\xbf'):
+        return 'utf-8-sig'
+    # heuristic detection
+    best = from_bytes(raw).best()
+    if best and best.encoding:
+        return best.encoding
+    return 'utf-8'  # fallback
+
+def sniff_delimiter(sample_text: str) -> str:
+    # csv.Sniffer 로 시도 → 실패시 휴리스틱
+    try:
+        dialect = csv.Sniffer().sniff(sample_text, delimiters=[',',';','\t','|'])
+        return dialect.delimiter
+    except Exception:
+        # 간단 휴리스틱: 세미콜론 우세 → ';' / 탭 우세 → '\t' / 기본 ','
+        counts = {',': sample_text.count(','), ';': sample_text.count(';'), '\t': sample_text.count('\t')}
+        return max(counts, key=counts.get) or ','
+
+def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
+    # 널바이트/깨진 줄 제거
+  #  raw = raw.replace(b'\x00', b'')
+		raw = raw.replace(b'\r\n', b'\n')
+    enc = detect_encoding(raw)
+
+    # 샘플에서 구분자 추정
+    sample = raw[:4096].decode(enc, errors='ignore')
+    sep = sniff_delimiter(sample)
+
+    # 1차: C 엔진, 빠르고 정상 케이스
+    try:
+        return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=sep)
+    except Exception:
+        pass
+
+    # 2차: python 엔진 + 유연 옵션
+    try:
+        return pd.read_csv(
+            io.BytesIO(raw),
+            encoding=enc,
+            sep=sep,
+            engine='python',
+            on_bad_lines='skip',   # pandas>=1.3
+            quoting=csv.QUOTE_MINIMAL
+        )
+    except Exception:
+        pass
+
+    # 3차: 구분자 재시도 (세미콜론/탭/콤마 순환)
+    for alt_sep in [';', '\t', ',']:
+        try:
+            return pd.read_csv(
+                io.BytesIO(raw),
+                encoding=enc,
+                sep=alt_sep,
+                engine='python',
+                on_bad_lines='skip'
+            )
+        except Exception:
+            continue
+
+    # 4차: TSV로 가정
+    try:
+        return pd.read_table(io.BytesIO(raw), encoding=enc, engine='python', on_bad_lines='skip')
+    except Exception as e:
+        raise e
+
+def try_read_excel(raw: bytes) -> Optional[pd.DataFrame]:
+    try:
+        return pd.read_excel(io.BytesIO(raw))  # openpyxl 필요
+    except Exception:
+        return None
+
+
+
 
 def save_image_to_tmp(raw: bytes, filename: str, tmp_dir: str) -> str:
     path = os.path.join(tmp_dir, filename)
@@ -132,10 +211,37 @@ def parse_txt(raw: bytes, filename: str):
         "text": text
     }
 
-def parse_csv(raw: bytes, filename: str, tmp_dir: str):
-    df = pd.read_csv(io.BytesIO(raw))
+def to_numeric_series(s: pd.Series):
+    # '1,234.5' / '1.234,5' / '1 234,5' 등 다양한 지역 표기 → float
+    txt = s.astype(str).str.replace(r'\s', '', regex=True)
+    # 유럽식 소수점 대응: 쉼표가 소수점이고 점이 천단위일 수 있음
+    # 휴리스틱: 쉼표와 점이 모두 있고, 마지막 구간이 3자 미만이면 소수점으로 가정
+    def conv(x):
+        if re.search(r'[0-9],[0-9]{1,2}$', x) and x.count('.') > 0:
+            x = x.replace('.', '').replace(',', '.')
+        else:
+            x = x.replace(',', '')
+        try:
+            return float(x)
+        except Exception:
+            return float('nan')
+    return txt.map(conv)
 
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+def parse_csv(raw: bytes, filename: str, tmp_dir: str):
+    # 1) 엑셀 먼저 시도 (xlsx를 csv로 이름만 바꾸는 경우도 있어서)
+    df = try_read_excel(raw)
+    if df is None:
+        # 2) 견고한 CSV 로더
+        df = robust_read_csv_bytes(raw)
+
+    # 프로필/요약
+    numeric_cols = df.select_dtypes(include='number').columns.tolist()
+    # 숫자 열 없으면 문자 열을 숫자로 변환 시도 (스펙트럼 흔히 문자로 들어옴)
+    if len(numeric_cols) < 2 and len(df.columns) >= 2:
+        for c in df.columns:
+            if df[c].dtype == object:
+                df[c] = to_numeric_series(df[c])
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
 
     profile = {
         "rows": int(len(df)),
@@ -144,14 +250,33 @@ def parse_csv(raw: bytes, filename: str, tmp_dir: str):
     }
 
     stats = {}
-    if numeric_cols:
-        desc = df[numeric_cols].describe().to_dict()
-        stats = {col: {k: float(v) for k, v in m.items()} for col, m in desc.items()}
+    num_only = df.select_dtypes(include='number')
+    if num_only.shape[1] > 0:
+        try:
+            desc = num_only.describe().to_dict()
+            stats = {col: {k: (float(v) if pd.notna(v) else None) for k, v in m.items()} for col, m in desc.items()}
+        except Exception:
+            stats = {}
 
     sample_rows = df.head(20).to_dict(orient="records")
 
-    # 스펙트럼 플롯 시도
-    spectrum_plot = try_make_spectrum_plot(df, filename, tmp_dir)
+    # 스펙트럼 플롯 (숫자 컬럼 2개 이상)
+    spectrum_plot = None
+    if len(numeric_cols) >= 2 and len(df) >= 10:
+        x = df[numeric_cols[0]].values
+        y = df[numeric_cols[1]].values
+        try:
+            plt.figure()
+            plt.plot(x, y)
+            plt.xlabel(str(numeric_cols[0]))
+            plt.ylabel(str(numeric_cols[1]))
+            plt.title(filename)
+            plt.tight_layout()
+            spectrum_plot = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
+            plt.savefig(spectrum_plot, dpi=200)
+            plt.close()
+        except Exception:
+            plt.close()
 
     return {
         "type": "csv_result",
@@ -159,7 +284,7 @@ def parse_csv(raw: bytes, filename: str, tmp_dir: str):
         "profile": profile,
         "stats": stats,
         "sample_rows": sample_rows,
-        "spectrum_plot": spectrum_plot  # 있으면 PDF에 그림으로 삽입
+        "spectrum_plot": spectrum_plot
     }
 
 def parse_image(raw: bytes, filename: str, tmp_dir: str):
@@ -222,6 +347,9 @@ SYSTEM_PROMPT = """
 
 5. 메타데이터:
 - project_name, sample_id, techniques, key_questions를 제목/서론/결론에 반영.
+
+6. 표기:
+- 화학식/지수/아래첨자는 유니코드 문자(HfO₂)가 아니라 HTML 스타일 표기(HfO<sub>2</sub>, 10<sup>-3</sup>)로 작성하세요.
 """
 
 
@@ -262,6 +390,39 @@ async def generate_report_text(meta: ReportMeta, parsed_files) -> str:
 # =========================
 # PDF 렌더링 (텍스트 + 이미지 + 스펙트럼 플롯)
 # =========================
+SUB_MAP = {
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+}
+SUP_MAP = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "⁻": "-", "⁺": "+",
+}
+
+def normalize_sub_sup(text: str) -> str:
+    # 유니코드 아래첨자 → <sub>숫자</sub>
+    for u, d in SUB_MAP.items():
+        if u in text:
+            text = text.replace(u, f"<sub>{d}</sub>")
+    # 유니코드 위첨자 → <sup>...</sup>
+    # (예: 10⁻³ 같은 케이스를 단순 처리)
+    # 연속된 위첨자 숫자/기호를 묶어서 변환
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in SUP_MAP:
+            buf = []
+            while i < len(text) and text[i] in SUP_MAP:
+                buf.append(SUP_MAP[text[i]])
+                i += 1
+            out.append(f"<sup>{''.join(buf)}</sup>")
+            continue
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 def render_pdf(report_text: str, parsed_files, tmp_dir: str) -> bytes:
     buffer = io.BytesIO()
@@ -276,7 +437,26 @@ def render_pdf(report_text: str, parsed_files, tmp_dir: str) -> bytes:
     story = []
 
     # 1) LLM이 생성한 본문 먼저
-    for line in report_text.splitlines():
+  for line in report_text.splitlines():
+    t = line.strip()
+    if not t:
+        story.append(Spacer(1, 6))
+        continue
+
+    # 🔹 아래/위첨자 유니코드 → <sub>/<sup> 태그로 변환
+    t = normalize_sub_sup(t)
+
+    if t.startswith("# "):
+        story.append(Paragraph(t[2:], styles["Heading1"]))
+    elif t.startswith("## "):
+        story.append(Paragraph(t[3:], styles["Heading2"]))
+    elif t.startswith("### "):
+        story.append(Paragraph(t[4:], styles["Heading3"]))
+    else:
+        story.append(Paragraph(t, styles["BodyText"]))
+    story.append(Spacer(1, 4))  
+##
+		for line in report_text.splitlines():
         t = line.strip()
         if not t:
             story.append(Spacer(1, 6))
@@ -290,7 +470,7 @@ def render_pdf(report_text: str, parsed_files, tmp_dir: str) -> bytes:
         else:
             story.append(Paragraph(t, styles["BodyText"]))
         story.append(Spacer(1, 4))
-
+##
     # 2) Appendix: 업로드된 이미지 + 스펙트럼 플롯 전부 포함
     figs = []
 
