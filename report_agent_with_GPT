@@ -454,39 +454,65 @@ async def generate_report_text(meta: ReportMeta, parsed_files) -> str:
 # =========================
 # PDF 렌더링 (텍스트 + 이미지 + 스펙트럼 플롯)
 # =========================
-SUB_MAP = {
-    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
-    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
-}
-SUP_MAP = {
-    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
-    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
-    "⁻": "-", "⁺": "+",
-}
+import re, html
+
+ALLOWED_SIMPLE_TAGS = {"b","/b","i","/i","u","/u","sub","/sub","sup","/sup"}
+BR_PATTERN = re.compile(r"</?\s*br\s*/?\s*>", re.IGNORECASE)
+
+SUB_MAP = {"₀":"0","₁":"1","₂":"2","₃":"3","₄":"4","₅":"5","₆":"6","₇":"7","₈":"8","₉":"9"}
+SUP_MAP = {"⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9","⁻":"-","⁺":"+"}
 
 def normalize_sub_sup(text: str) -> str:
     # 유니코드 아래첨자 → <sub>숫자</sub>
     for u, d in SUB_MAP.items():
-        if u in text:
-            text = text.replace(u, f"<sub>{d}</sub>")
-    # 유니코드 위첨자 → <sup>...</sup>
-    # (예: 10⁻³ 같은 케이스를 단순 처리)
-    # 연속된 위첨자 숫자/기호를 묶어서 변환
-    out = []
-    i = 0
+        text = text.replace(u, f"<sub>{d}</sub>")
+    # 유니코드 위첨자 시퀀스 → <sup>...</sup>
+    out, i = [], 0
     while i < len(text):
-        ch = text[i]
-        if ch in SUP_MAP:
+        if text[i] in SUP_MAP:
             buf = []
             while i < len(text) and text[i] in SUP_MAP:
                 buf.append(SUP_MAP[text[i]])
                 i += 1
             out.append(f"<sup>{''.join(buf)}</sup>")
-            continue
         else:
-            out.append(ch)
-            i += 1
+            out.append(text[i]); i += 1
     return "".join(out)
+
+def sanitize_markup(raw: str) -> str:
+    # 1) 유니코드 첨자 정규화
+    t = normalize_sub_sup(raw)
+
+    # 2) br 교정: 어떤 형태든 전부 <br/> 로
+    def _br_repl(m): return "<br/>"
+    t = BR_PATTERN.sub(_br_repl, t)
+
+    # 3) 일단 전체 이스케이프
+    t = html.escape(t)
+
+    # 4) 허용 태그만 되돌리기 (+ <br/>)
+    #   &lt;sub&gt; → <sub>  등의 패턴을 되살림
+    for tag in ["b","/b","i","/i","u","/u","sub","/sub","sup","/sup"]:
+        t = t.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+    t = t.replace("&lt;br/&gt;", "<br/>")
+
+    # 5) 첨자 태그 짝 맞추기: 닫힘 과잉 제거, 부족하면 닫힘 추가
+    def fix_tag_balance(txt: str, tag: str) -> str:
+        opens = len(re.findall(fr"<{tag}>", txt))
+        closes = len(re.findall(fr"</{tag}>", txt))
+        if closes > opens:
+            # 과잉 닫힘 제거 (앞에서부터)
+            extra = closes - opens
+            txt = re.sub(fr"</{tag}>", "", txt, count=extra)
+        elif opens > closes:
+            # 부족한 닫힘을 맨 끝에 추가
+            txt += "</{}>".format(tag) * (opens - closes)
+        return txt
+
+    t = fix_tag_balance(t, "sub")
+    t = fix_tag_balance(t, "sup")
+
+    return t
 
 def render_pdf(report_text: str, parsed_files, tmp_dir: str) -> bytes:
     buffer = io.BytesIO()
