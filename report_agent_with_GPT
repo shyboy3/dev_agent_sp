@@ -344,6 +344,57 @@ def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
     except Exception as e:
         raise e
 
+## 최신 버전
+def robust_read_csv_bytes(raw: bytes):
+    """
+    인코딩/구분자 감지 + 머릿말 스킵 + 헤더/데이터 자동 판별
+    """
+    raw = raw.replace(b'\x00', b'').replace(b'\r\n', b'\n')
+    enc = detect_encoding(raw)
+
+    sample_text = raw[:65536].decode(enc, errors='ignore')
+    sep, header_idx, start_idx = find_table_start(sample_text)
+
+    # 스킵할 줄 목록 만들기
+    skiprows = None
+    header = 'infer'
+    if start_idx is not None:
+        if header_idx is not None:
+            skiprows = list(range(0, header_idx))
+            header = header_idx
+        else:
+            skiprows = list(range(0, start_idx))
+            header = None
+
+    # 실제 머릿말 텍스트 추출 (LLM 컨텍스트용)
+    preamble_text = ""
+    if start_idx:
+        preamble_text = "\n".join(sample_text.splitlines()[:start_idx]).strip()
+
+    # CSV 읽기 시도
+    df = None
+    last_err = None
+    for enc_try in [enc, "utf-8-sig", "cp949", "euc-kr", "latin1"]:
+        for engine in ["c", "python"]:
+            try:
+                df = pd.read_csv(io.BytesIO(raw),
+                                 encoding=enc_try,
+                                 sep=sep or ',',
+                                 header=header,
+                                 skiprows=skiprows,
+                                 engine=engine,
+                                 on_bad_lines='skip')
+                break
+            except Exception as e:
+                last_err = e
+        if df is not None:
+            break
+
+    if df is None:
+        raise last_err or RuntimeError("CSV parsing failed")
+
+    return df, preamble_text
+
 def try_read_excel(raw: bytes) -> Optional[pd.DataFrame]:
     try:
         return pd.read_excel(io.BytesIO(raw))  # openpyxl 필요
@@ -624,6 +675,19 @@ def build_context(meta: ReportMeta, parsed_files):
     return {
         "meta": meta.dict(),
         "files": sanitized_files
+    }
+
+## 최신 버전
+def build_context(meta: ReportMeta, parsed_files):
+    sanitized_files = []
+    for f in parsed_files:
+        d = dict(f)
+        d.pop("path", None)
+        d.pop("spectrum_plot", None)
+        sanitized_files.append(d)
+    return {
+        "meta": meta.dict(),
+        "files": sanitized_files   # note 도 여기 포함됨
     }
 
 async def generate_report_text(meta: ReportMeta, parsed_files) -> str:
