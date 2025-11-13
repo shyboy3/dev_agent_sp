@@ -700,6 +700,60 @@ def parse_other(raw: bytes, filename: str, tmp_dir: str):
         "comment": "지원하지 않는 형식 (또는 별도 처리 필요). 참고용으로만 언급."
     }
 
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from PIL import Image as PILImage
+import io
+
+def parse_pptx(raw: bytes, filename: str, tmp_dir: str):
+    tmp_pptx = os.path.join(tmp_dir, filename)
+    with open(tmp_pptx,"wb") as f:
+        f.write(raw)
+    prs = Presentation(tmp_pptx)
+    texts = []
+    images = []
+
+    for si, slide in enumerate(prs.slides, 1):
+        slide_texts = []
+        for shape in slide.shapes:
+            # 텍스트 추출
+            if hasattr(shape, "text") and shape.text:
+                slide_texts.append(shape.text)
+
+            # 그림 추출
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                img = shape.image
+                blob = img.blob
+                ext = (img.ext or "png").lower()
+
+                # 가능한 경우 PNG로 변환
+                out_ext = "png"
+                out_name = f"{os.path.splitext(filename)[0]}_s{si}_{len(images)+1}.{out_ext}"
+                path = os.path.join(tmp_dir, out_name)
+
+                try:
+                    # PIL로 열어서 PNG로 저장 시도
+                    pil = PILImage.open(io.BytesIO(blob))
+                    pil.save(path, format="PNG")
+                except Exception:
+                    # 변환 실패하면 원래 확장자로 그냥 저장 (마지막 수단)
+                    out_ext = ext
+                    out_name = f"{os.path.splitext(filename)[0]}_s{si}_{len(images)+1}.{out_ext}"
+                    path = os.path.join(tmp_dir, out_name)
+                    with open(path, "wb") as out:
+                        out.write(blob)
+
+                images.append(path)
+
+        if slide_texts:
+            texts.append(f"[Slide {si}]\n" + "\n".join(slide_texts))
+
+    return {
+        "type": "pptx_doc",
+        "filename": filename,
+        "text_chunks": texts[:120],
+        "extracted_images": images,
+    }
 
 # =========================
 # 시스템 프롬프트 (연구 리포트)
