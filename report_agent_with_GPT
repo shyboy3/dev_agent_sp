@@ -1008,7 +1008,80 @@ async def api_generate_research_report(
     }
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
+@app.post("/api/generate-from-server")
+async def api_generate_from_server(job: ServerFileJob, request: Request):
+    # 1) 보안: 로컬에서만 허용
+    if request.client.host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(status_code=403, detail="이 엔드포인트는 서버 로컬에서만 사용할 수 있습니다.")
 
+    # 2) 메타 구성 (기존과 동일)
+    tech_list = [t.strip() for t in job.techniques.split(",") if t.strip()] if job.techniques else []
+    meta = ReportMeta(
+        project_name=job.project_name or None,
+        sample_id=job.sample_id or None,
+        sample_description=job.sample_description or None,
+        operator=job.operator or None,
+        date=job.date or None,
+        techniques=tech_list or None,
+        key_questions=job.key_questions or None,
+    )
+
+    tmp_dir = tempfile.mkdtemp()
+    parsed_files = []
+
+    # 3) 경로별로 파일 읽기
+    for rel in job.paths:
+        rel = rel.strip()
+        if not rel:
+            continue
+
+        # DATA_ROOT 기준 상대 경로로 제한
+        full_path = os.path.abspath(os.path.join(DATA_ROOT, rel))
+        if not full_path.startswith(os.path.abspath(DATA_ROOT)):
+            # 상위 디렉토리 탈출 방지
+            continue
+        if not os.path.exists(full_path):
+            continue
+
+        with open(full_path, "rb") as f:
+            raw = f.read()
+        name = os.path.basename(full_path).lower()
+
+        # 기존 업로드 핸들링과 동일한 분기
+        if name.endswith(".txt"):
+            parsed_files.append(parse_txt(raw, os.path.basename(full_path)))
+        elif name.endswith(".csv"):
+            parsed_files.append(parse_csv(raw, os.path.basename(full_path), tmp_dir))
+        elif name.endswith((".png",".jpg",".jpeg",".tif",".tiff")):
+            parsed_files.append(parse_image(raw, os.path.basename(full_path), tmp_dir))
+        elif name.endswith(".pdf"):
+            parsed_files.append(parse_pdf_local(raw, os.path.basename(full_path), tmp_dir))
+        elif name.endswith(".pptx"):
+            parsed_files.append(parse_pptx(raw, os.path.basename(full_path), tmp_dir))
+        elif name.endswith(".docx"):
+            parsed_files.append(parse_docx(raw, os.path.basename(full_path), tmp_dir))
+        else:
+            path=None
+            if name.endswith((".bmp",".gif",".webp")):
+                path = os.path.join(tmp_dir, os.path.basename(full_path))
+                with open(path,"wb") as out:
+                    out.write(raw)
+            parsed_files.append({"type":"other_file","filename":os.path.basename(full_path),
+                                 "path":path,"comment":"참고 파일"})
+
+    if not parsed_files:
+        raise HTTPException(status_code=400, detail="유효한 서버 로컬 파일이 없습니다.")
+
+    # 문서 이미지 → Qwen-VL 요약
+    parsed_files = await enrich_items_with_mm(parsed_files)
+
+    # 본문 생성
+    report_text = await generate_report_text(meta, parsed_files)
+
+    # PDF 렌더
+    pdf_bytes = render_pdf(report_text, parsed_files, tmp_dir)
+    headers = {"Content-Disposition": 'inline; filename=\"research_report_server_files.pdf\"'}
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 
 static/index.html (최소 동작 버전, 바로 사용 가능):
