@@ -755,6 +755,121 @@ def parse_pptx(raw: bytes, filename: str, tmp_dir: str):
         "extracted_images": images,
     }
 
+import fitz  # PyMuPDF
+import os, io
+
+def parse_pdf_local(raw: bytes, filename: str, tmp_dir: str):
+    texts = []
+    images = []   # embedded 이미지 + 페이지 전체 캡처 + (옵션) crop
+
+    base_name = os.path.splitext(filename)[0]
+
+    # 1) PyMuPDF로 텍스트 + embedded 이미지 + 페이지 전체 캡처
+    with fitz.open(stream=raw, filetype="pdf") as doc:
+        for pno in range(len(doc)):
+            page = doc[pno]
+
+            # ---- 텍스트 추출 ----
+            txt = page.get_text("text")
+            if txt and txt.strip():
+                texts.append(f"[Page {pno+1}]\n{txt.strip()}")
+
+            # ---- embedded 이미지 추출 ----
+            for img in page.get_images(full=True):
+                xref = img[0]
+                pix = fitz.Pixmap(doc, xref)
+                if pix.alpha:  # 알파 채널 있으면 RGB로 변환
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                ipath = os.path.join(
+                    tmp_dir,
+                    f"{base_name}_p{pno+1}_img{xref}.png"
+                )
+                pix.save(ipath)
+                images.append(ipath)
+
+            # ---- ★ 페이지 전체 캡처(벡터 그래프/도형 포함) ----
+            try:
+                pix_page = page.get_pixmap(dpi=200)
+                ppath = os.path.join(
+                    tmp_dir,
+                    f"{base_name}_page{pno+1}_full.png"
+                )
+                pix_page.save(ppath)
+                images.append(ppath)
+            except Exception:
+                # 페이지 렌더 실패 시는 그냥 넘어감
+                pass
+
+    # 2) (선택) unstructured 기반 crop 로직을 쓰고 있다면 여기서 이어서 붙이기
+    #    기존 코드에 _HAS_UNSTRUCTURED 블록이 있었다면 아래처럼 합치면 됨.
+    if '_HAS_UNSTRUCTURED' in globals() and _HAS_UNSTRUCTURED:
+        try:
+            from unstructured.partition.pdf import partition_pdf
+            import numpy as np, cv2
+
+            crops = []
+            els = partition_pdf(
+                file=io.BytesIO(raw),
+                strategy="hi_res",
+                extract_images_in_pdf=True,
+                languages=["kor+eng"],
+                infer_table_structure=False,
+            )
+
+            with fitz.open(stream=raw, filetype="pdf") as doc:
+                for el in els:
+                    md = getattr(el, "metadata", None)
+                    if not md or not getattr(md, "coordinates", None):
+                        continue
+                    c = md.coordinates
+                    if not hasattr(c, "points"):
+                        continue
+
+                    page_idx = getattr(md, "page_number", 1) - 1
+                    if page_idx < 0 or page_idx >= len(doc):
+                        continue
+
+                    page = doc[page_idx]
+                    pix = page.get_pixmap(dpi=200)
+                    import numpy as np, cv2
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                    if pix.n == 4:
+                        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+
+                    layout_w = getattr(c, "layout_width", pix.w)
+                    layout_h = getattr(c, "layout_height", pix.h)
+                    x0, y0 = c.points[0]
+                    x3, y1 = c.points[3]
+
+                    rx = pix.w / layout_w
+                    ry = pix.h / layout_h
+                    top    = int(min(y0, y1) * ry)
+                    left   = int(min(x0, x3) * rx)
+                    bottom = int(max(y0, y1) * ry)
+                    right  = int(max(x0, x3) * rx)
+
+                    crop = img[top:bottom, left:right]
+                    kind = getattr(el, "category", "image")
+                    opath = os.path.join(
+                        tmp_dir,
+                        f"{base_name}_{kind}_p{page_idx+1}_{len(crops)}.png"
+                    )
+                    cv2.imwrite(opath, crop)
+                    crops.append(opath)
+
+            images.extend(crops)
+        except Exception:
+            # unstructured 쪽에서 에러 나도 전체 파이프라인은 계속 가게
+            pass
+
+    return {
+        "type": "pdf_doc",
+        "filename": filename,
+        "text_chunks": texts[:120],
+        "extracted_images": images,
+    }
+
+
 # =========================
 # 시스템 프롬프트 (연구 리포트)
 # =========================
