@@ -1,784 +1,83 @@
-research_report_server_web.py:
-
-import os
-import io
-import json
-import tempfile
-from typing import List, Optional
-
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse, HTMLResponse, Response
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-
-import pytesseract
-from PIL import Image
-import httpx
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-# =========================
-# 경로 & 설정
-# =========================
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
-FONTS_DIR = os.path.join(BASE_DIR, "fonts")
-
-LLM_API_URL = "http://localhost:11434/api/generate"    # 로컬 LLM API (Ollama 예시)
-LLM_MODEL = "qwen2.5-7b-instruct"                      # 실제 설치한 모델 이름
-
-FONT_NAME = "KoreanFont"
-
-# 한글 폰트 등록 (NotoSansCJKkr-Regular.otf 등)
-font_path = os.path.join(FONTS_DIR, "NotoSansCJKkr-Regular.otf")
-if os.path.exists(font_path):
-    pdfmetrics.registerFont(TTFont(FONT_NAME, font_path))
-else:
-    # 폰트 없으면 기본 폰트 사용 (이 경우 다시 네모 문제 생길 수 있음)
-    FONT_NAME = "Helvetica"
-
-app = FastAPI(title="Research Report Generator")
-
-if not os.path.exists(STATIC_DIR):
-    os.makedirs(STATIC_DIR)
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-# =========================
-# LLM 호출
-# =========================
-
-async def call_llm(prompt: str, system_prompt: str = "") -> str:
-    payload = {
-        "model": LLM_MODEL,
-        "prompt": (system_prompt + "\n\n" + prompt).strip(),
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=600) as client:
-        r = await client.post(LLM_API_URL, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", "")
-
-
-# =========================
-# 메타데이터 모델
-# =========================
-
-class ReportMeta(BaseModel):
-    project_name: Optional[str] = None
-    sample_id: Optional[str] = None
-    sample_description: Optional[str] = None
-    operator: Optional[str] = None
-    date: Optional[str] = None
-    techniques: Optional[List[str]] = None
-    key_questions: Optional[str] = None
-
-
-# =========================
-# 파일 파서 (이미지 & 스펙트럼 포함)
-# =========================
-import csv, re
-from charset_normalizer import from_bytes
-
-def detect_encoding(raw: bytes) -> str:
-    # BOM 우선 처리
-    if raw.startswith(b'\xef\xbb\xbf'):
-        return 'utf-8-sig'
-    # heuristic detection
-    best = from_bytes(raw).best()
-    if best and best.encoding:
-        return best.encoding
-    return 'utf-8'  # fallback
-
-def sniff_delimiter(sample_text: str) -> str:
-    # csv.Sniffer 로 시도 → 실패시 휴리스틱
+def is_decorative_image(path: str) -> bool:
+    """로고/아이콘처럼 너무 작은/띠 모양 이미지는 True로 반환."""
     try:
-        dialect = csv.Sniffer().sniff(sample_text, delimiters=[',',';','\t','|'])
-        return dialect.delimiter
+        with PILImage.open(path) as im:
+            w, h = im.size
     except Exception:
-        # 간단 휴리스틱: 세미콜론 우세 → ';' / 탭 우세 → '\t' / 기본 ','
-        counts = {',': sample_text.count(','), ';': sample_text.count(';'), '\t': sample_text.count('\t')}
-        return max(counts, key=counts.get) or ','
+        return False  # 열 수 없으면 필터링하지 않음
 
-from charset_normalizer import from_bytes
+    area = w * h
 
-import csv, re
-from charset_normalizer import from_bytes
+    # (1) 너무 작은 건 장식용으로 간주 (예: 200x100 이하면)
+    if area < 50_000:  # 필요하면 숫자 조정 가능
+        return True
 
-NUM_TOKEN = re.compile(r"""
-    ^[ \t]*                                    # 앞 공백
-    [+-]?                                      # 부호
-    (?:\d+(?:[.,]\d+)?|\.\d+)                  # 숫자(소수 허용)
-    (?:[eE][+-]?\d+)?                          # 지수
-    [ \t]*$                                    # 뒤 공백
-""", re.VERBOSE)
+    # (2) 가로로만 긴 배너, 세로로만 긴 띠 (ex: 로고/헤더)
+    ratio = max(w, h) / max(1, min(w, h))
+    if ratio > 5:  # 5배 이상 길쭉하면 장식으로 봄
+        return True
 
-def looks_numeric(token: str) -> bool:
-    return bool(NUM_TOKEN.match(token))
+    return False
 
-def split_tokens(line: str, sep_candidates=(',', ';', '\t', '|')):
-    # 후보 구분자 중 실제로 많이 보이는 것으로 분할
-    best_sep = max(sep_candidates, key=lambda s: line.count(s))
-    return line.split(best_sep), best_sep
 
-def detect_encoding(raw: bytes) -> str:
-    if raw.startswith(b'\xef\xbb\xbf'):
-        return 'utf-8-sig'
-    best = from_bytes(raw).best()
-    return best.encoding if best and best.encoding else 'utf-8'
 
-def find_table_start(sample_text: str):
-    """
-    머릿말 섞인 CSV에서 '숫자형 레코드가 연속으로 2~3줄 이상' 나타나는 지점을
-    테이블 시작으로 간주. (헤더 1줄 바로 위일 수도 있음)
-    """
-    lines = sample_text.splitlines()
-    sep = None
-    numeric_run = 0
-    start_idx = None
 
-    # 1차: 구분자 추정 (가장 자주 등장하는 구분자)
-    counts = {',': sample_text.count(','), ';': sample_text.count(';'),
-              '\t': sample_text.count('\t'), '|': sample_text.count('|')}
-    sep = max(counts, key=counts.get) if any(counts.values()) else ','
 
-    for i, ln in enumerate(lines):
-        # 빈 줄/주석 라인은 머릿말로 간주
-        if not ln.strip() or ln.strip().startswith(('#', '//', ';')):
-            numeric_run = 0
+figs = []
+for item in parsed_files:
+    imgs = item.get("extracted_images") or []
+    if not imgs:
+        continue
+    for path in imgs:
+        if not path or not os.path.exists(path):
             continue
-
-        tokens = ln.split(sep)
-        if len(tokens) < 2:
-            numeric_run = 0
+        # ★ 장식용 이미지면 스킵
+        if is_decorative_image(path):
             continue
+        figs.append((item.get("filename","unnamed"), path))
 
-        num_like = sum(looks_numeric(t) for t in tokens)
-        frac = num_like / max(1, len(tokens))
 
-        # 숫자형 비율이 충분히 높으면 데이터 라인이라고 판단
-        if num_like >= 2 and frac >= 0.5:
-            numeric_run += 1
-            if numeric_run >= 2:
-                # 연속 2줄 이상 숫자형이면, 그 블록의 첫 줄을 테이블 시작으로
-                start_idx = i - numeric_run + 1
-                break
-        else:
-            numeric_run = 0
 
-    # 헤더가 바로 숫자 앞줄에 있는 경우(문자 토큰 다수) 감지
-    header_idx = None
-    if start_idx and start_idx > 0:
-        prev = lines[start_idx - 1]
-        toks = prev.split(sep)
-        if len(toks) >= 2 and sum(looks_numeric(t) for t in toks) == 0:
-            header_idx = start_idx - 1
 
-    return sep, header_idx, start_idx
+# Java 11+ 설치 (이미 있으면 패스)
+# Windows면 Adoptium Temurin 같은 JDK 설치 후 PATH 잡기
 
-def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
-    """
-    인코딩/구분자 감지 + 머릿말 스킵 + 헤더/데이터 자동 판별
-    """
-    raw = raw.replace(b'\x00', b'').replace(b'\r\n', b'\n')
-    enc = detect_encoding(raw)
+pip install -U opendataloader-pdf
 
-    # 첫 64KB만으로도 시작 위치 판단 충분
-    sample_text = raw[:65536].decode(enc, errors='ignore')
-    sep, header_idx, start_idx = find_table_start(sample_text)
 
-    # 시나리오별로 읽기 시도
-    trial_params = []
 
-    if start_idx is not None:
-        if header_idx is not None:
-            # 헤더 1줄 + 데이터 시작
-            trial_params.append(dict(encoding=enc, sep=sep, engine='c',
-                                     header=header_idx, skiprows=range(0, header_idx)))
-        else:
-            # 헤더 없이 바로 데이터가 시작
-            trial_params.append(dict(encoding=enc, sep=sep, engine='c',
-                                     header=None, skiprows=range(0, start_idx)))
-            # 또는 첫 줄을 헤더로 간주(장비가 첫 줄에 컬럼명 포함한 케이스)
-            trial_params.append(dict(encoding=enc, sep=sep, engine='c',
-                                     header=start_idx, skiprows=range(0, start_idx)))
-    else:
-        # 테이블 시작을 못 찾았으면 일반 스니핑 전략
-        trial_params.append(dict(encoding=enc, sep=sep, engine='c'))
 
-    # python 엔진, 인코딩 대체 재시도
-    alt_encs = ['utf-8-sig', 'cp949', 'euc-kr', 'latin1']
-    for p in list(trial_params):
-        trial_params.append({**p, 'engine': 'python', 'on_bad_lines': 'skip'})
-    for ae in alt_encs:
-        trial_params.append(dict(encoding=ae, sep=sep, engine='python', on_bad_lines='skip'))
-
-    # 시도
-    last_err = None
-    for params in trial_params:
-        try:
-            return pd.read_csv(io.BytesIO(raw), **params)
-        except Exception as e:
-            last_err = e
-            continue
-    raise last_err or RuntimeError("CSV parsing failed")
-
-def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
-    """
-    다양한 인코딩/구분자 CSV 자동 감지 후 안전하게 DataFrame으로 로드
-    """
-
-    # 널바이트/잘못된 줄바꿈 정리
-    raw = raw.replace(b'\x00', b'').replace(b'\r\n', b'\n')
-
-    # ① 인코딩 감지
-    enc_guess = 'utf-8'
-    try:
-        result = from_bytes(raw).best()
-        if result and result.encoding:
-            enc_guess = result.encoding
-    except Exception:
-        pass
-
-    # ② 샘플 텍스트로 구분자 추정
-    sample = raw[:4096]
-    try:
-        sample_text = sample.decode(enc_guess, errors='ignore')
-    except Exception:
-        # 감지 실패 시 CP949 한 번 더 시도
-        try:
-            sample_text = sample.decode('cp949', errors='ignore')
-            enc_guess = 'cp949'
-        except Exception:
-            sample_text = sample.decode('latin1', errors='ignore')
-            enc_guess = 'latin1'
-
-    import csv
-    try:
-        dialect = csv.Sniffer().sniff(sample_text, delimiters=[',',';','\t','|'])
-        sep = dialect.delimiter
-    except Exception:
-        sep = ','
-
-    # ③ 여러 엔진/인코딩 시도
-    tried = set()
-    for enc in [enc_guess, 'utf-8-sig', 'cp949', 'euc-kr', 'latin1']:
-        if enc in tried: continue
-        tried.add(enc)
-        for engine in ['c', 'python']:
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(raw),
-                    encoding=enc,
-                    sep=sep,
-                    engine=engine,
-                    on_bad_lines='skip'
-                )
-                return df
-            except UnicodeDecodeError:
-                continue
-            except pd.errors.ParserError:
-                continue
-            except Exception:
-                continue
-
-    # ④ 마지막 시도 실패 → raise
-    raise UnicodeDecodeError("robust_read_csv_bytes", b'', 0, 1, "모든 인코딩 시도 실패")
-
-def robust_read_csv_bytes(raw: bytes) -> pd.DataFrame:
-    # 널바이트/깨진 줄 제거
-  #  raw = raw.replace(b'\x00', b'')
-		raw = raw.replace(b'\r\n', b'\n')
-    enc = detect_encoding(raw)
-
-    # 샘플에서 구분자 추정
-    sample = raw[:4096].decode(enc, errors='ignore')
-    sep = sniff_delimiter(sample)
-
-    # 1차: C 엔진, 빠르고 정상 케이스
-    try:
-        return pd.read_csv(io.BytesIO(raw), encoding=enc, sep=sep)
-    except Exception:
-        pass
-
-    # 2차: python 엔진 + 유연 옵션
-    try:
-        return pd.read_csv(
-            io.BytesIO(raw),
-            encoding=enc,
-            sep=sep,
-            engine='python',
-            on_bad_lines='skip',   # pandas>=1.3
-            quoting=csv.QUOTE_MINIMAL
-        )
-    except Exception:
-        pass
-
-    # 3차: 구분자 재시도 (세미콜론/탭/콤마 순환)
-    for alt_sep in [';', '\t', ',']:
-        try:
-            return pd.read_csv(
-                io.BytesIO(raw),
-                encoding=enc,
-                sep=alt_sep,
-                engine='python',
-                on_bad_lines='skip'
-            )
-        except Exception:
-            continue
-
-    # 4차: TSV로 가정
-    try:
-        return pd.read_table(io.BytesIO(raw), encoding=enc, engine='python', on_bad_lines='skip')
-    except Exception as e:
-        raise e
-
-## 최신 버전
-def robust_read_csv_bytes(raw: bytes):
-    """
-    인코딩/구분자 감지 + 머릿말 스킵 + 헤더/데이터 자동 판별
-    """
-    raw = raw.replace(b'\x00', b'').replace(b'\r\n', b'\n')
-    enc = detect_encoding(raw)
-
-    sample_text = raw[:65536].decode(enc, errors='ignore')
-    sep, header_idx, start_idx = find_table_start(sample_text)
-
-    # 스킵할 줄 목록 만들기
-    skiprows = None
-    header = 'infer'
-    if start_idx is not None:
-        if header_idx is not None:
-            skiprows = list(range(0, header_idx))
-            header = header_idx
-        else:
-            skiprows = list(range(0, start_idx))
-            header = None
-
-    # 실제 머릿말 텍스트 추출 (LLM 컨텍스트용)
-    preamble_text = ""
-    if start_idx:
-        preamble_text = "\n".join(sample_text.splitlines()[:start_idx]).strip()
-
-    # CSV 읽기 시도
-    df = None
-    last_err = None
-    for enc_try in [enc, "utf-8-sig", "cp949", "euc-kr", "latin1"]:
-        for engine in ["c", "python"]:
-            try:
-                df = pd.read_csv(io.BytesIO(raw),
-                                 encoding=enc_try,
-                                 sep=sep or ',',
-                                 header=header,
-                                 skiprows=skiprows,
-                                 engine=engine,
-                                 on_bad_lines='skip')
-                break
-            except Exception as e:
-                last_err = e
-        if df is not None:
-            break
-
-    if df is None:
-        raise last_err or RuntimeError("CSV parsing failed")
-
-    return df, preamble_text
-
-def try_read_excel(raw: bytes) -> Optional[pd.DataFrame]:
-    try:
-        return pd.read_excel(io.BytesIO(raw))  # openpyxl 필요
-    except Exception:
-        return None
-
-
-
-
-def save_image_to_tmp(raw: bytes, filename: str, tmp_dir: str) -> str:
-    path = os.path.join(tmp_dir, filename)
-    with open(path, "wb") as f:
-        f.write(raw)
-    return path
-
-def try_make_spectrum_plot(df: pd.DataFrame, filename: str, tmp_dir: str) -> Optional[str]:
-    """
-    스펙트럼으로 보이는 CSV는 라인 플롯을 생성해서 PNG로 저장.
-    단순 휴리스틱:
-      - 숫자 컬럼이 2개 이상이고 행이 일정 개수 이상이면
-      - 첫 번째 숫자 컬럼 = x, 두 번째 숫자 컬럼 = y 로 사용
-    """
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    if len(numeric_cols) < 2 or len(df) < 10:
-        return None
-
-    x = df[numeric_cols[0]].values
-    y = df[numeric_cols[1]].values
-
-    try:
-        plt.figure()
-        plt.plot(x, y)
-        plt.xlabel(str(numeric_cols[0]))
-        plt.ylabel(str(numeric_cols[1]))
-        plt.title(filename)
-        plt.tight_layout()
-        plot_path = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
-        plt.savefig(plot_path, dpi=200)
-        plt.close()
-        return plot_path
-    except Exception:
-        plt.close()
-        return None
-
-def parse_txt(raw: bytes, filename: str):
-    text = raw.decode("utf-8", errors="ignore")
-    return {
-        "type": "note",
-        "filename": filename,
-        "text": text
-    }
-
-def to_numeric_series(s: pd.Series):
-    # '1,234.5' / '1.234,5' / '1 234,5' 등 다양한 지역 표기 → float
-    txt = s.astype(str).str.replace(r'\s', '', regex=True)
-    # 유럽식 소수점 대응: 쉼표가 소수점이고 점이 천단위일 수 있음
-    # 휴리스틱: 쉼표와 점이 모두 있고, 마지막 구간이 3자 미만이면 소수점으로 가정
-    def conv(x):
-        if re.search(r'[0-9],[0-9]{1,2}$', x) and x.count('.') > 0:
-            x = x.replace('.', '').replace(',', '.')
-        else:
-            x = x.replace(',', '')
-        try:
-            return float(x)
-        except Exception:
-            return float('nan')
-    return txt.map(conv)
-
-## Last Version
-def parse_csv(raw: bytes, filename: str, tmp_dir: str):
-    # 0) 기본값
-    preamble = ""
-
-    # 1) 엑셀 먼저 시도
-    xlsx_df = try_read_excel(raw)
-    if xlsx_df is not None:
-        df = xlsx_df
-    else:
-        # 2) 견고한 CSV 로더: (df, preamble) 반환
-        df, preamble = robust_read_csv_bytes(raw)
-
-    # 혹시라도 df가 튜플인 경우 방어 (실수 대비)
-    if isinstance(df, tuple):
-        df, preamble = df
-
-    # === 여기부터는 기존 로직 그대로 ===
-    # 숫자 열 감지
-    numeric_cols = df.select_dtypes(include='number').columns.tolist()
-
-    # 숫자 열이 부족하면 문자→숫자 변환 시도
-    if len(numeric_cols) < 2 and len(df.columns) >= 2:
-        def to_numeric_series(s: pd.Series):
-            txt = s.astype(str).str.replace(r'\s', '', regex=True)
-            def conv(x):
-                # 유럽식 소수점 대응 (1.234,5 → 1234.5)
-                if re.search(r'[0-9],[0-9]{1,2}$', x) and x.count('.') > 0:
-                    x = x.replace('.', '').replace(',', '.')
-                else:
-                    x = x.replace(',', '')
-                try:
-                    return float(x)
-                except Exception:
-                    return float('nan')
-            return txt.map(conv)
-
-        for c in df.columns:
-            if df[c].dtype == object:
-                df[c] = to_numeric_series(df[c])
-        numeric_cols = df.select_dtypes(include='number').columns.tolist()
-
-    profile = {
-        "rows": int(len(df)),
-        "cols": int(len(df.columns)),
-        "columns": [str(c) for c in df.columns]
-    }
-
-    stats = {}
-    num_only = df.select_dtypes(include='number')
-    if num_only.shape[1] > 0:
-        try:
-            desc = num_only.describe().to_dict()
-            stats = {col: {k: (float(v) if pd.notna(v) else None) for k, v in m.items()}
-                     for col, m in desc.items()}
-        except Exception:
-            stats = {}
-
-    sample_rows = df.head(20).to_dict(orient="records")
-
-    # 스펙트럼 플롯
-    spectrum_plot = None
-    if len(numeric_cols) >= 2 and len(df) >= 10:
-        x = df[numeric_cols[0]].values
-        y = df[numeric_cols[1]].values
-        try:
-            plt.figure()
-            plt.plot(x, y)
-            plt.xlabel(str(numeric_cols[0])); plt.ylabel(str(numeric_cols[1]))
-            plt.title(filename); plt.tight_layout()
-            spectrum_plot = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
-            plt.savefig(spectrum_plot, dpi=200); plt.close()
-        except Exception:
-            plt.close()
-
-    return {
-        "type": "csv_result",
-        "filename": filename,
-        "note": preamble,              # ⬅️ 머릿말을 LLM 컨텍스트로 전달
-        "profile": profile,
-        "stats": stats,
-        "sample_rows": sample_rows,
-        "spectrum_plot": spectrum_plot
-    }
-
-def parse_csv(raw: bytes, filename: str, tmp_dir: str):
-    # 1) 엑셀 먼저 시도
-    df = try_read_excel(raw)
-    if df is None:
-        df = robust_read_csv_bytes(raw)
-
-    # 숫자열 부족하면 문자→숫자 변환 시도
-    numeric_cols = df.select_dtypes(include='number').columns.tolist()
-    if len(numeric_cols) < 2 and len(df.columns) >= 2:
-        def to_numeric_series(s: pd.Series):
-            txt = s.astype(str).str.replace(r'\s', '', regex=True)
-            def conv(x):
-                # 유럽식 소수점 대응
-                if re.search(r'[0-9],[0-9]{1,2}$', x) and x.count('.') > 0:
-                    x = x.replace('.', '').replace(',', '.')
-                else:
-                    x = x.replace(',', '')
-                try:
-                    return float(x)
-                except Exception:
-                    return float('nan')
-            return txt.map(conv)
-        for c in df.columns:
-            if df[c].dtype == object:
-                df[c] = to_numeric_series(df[c])
-        numeric_cols = df.select_dtypes(include='number').columns.tolist()
-
-    profile = {
-        "rows": int(len(df)),
-        "cols": int(len(df.columns)),
-        "columns": [str(c) for c in df.columns]
-    }
-
-    stats = {}
-    num_only = df.select_dtypes(include='number')
-    if num_only.shape[1] > 0:
-        try:
-            desc = num_only.describe().to_dict()
-            stats = {col: {k: (float(v) if pd.notna(v) else None) for k, v in m.items()} for col, m in desc.items()}
-        except Exception:
-            stats = {}
-
-    sample_rows = df.head(20).to_dict(orient="records")
-
-    # 스펙트럼 플롯
-    spectrum_plot = None
-    if len(numeric_cols) >= 2 and len(df) >= 10:
-        x = df[numeric_cols[0]].values
-        y = df[numeric_cols[1]].values
-        try:
-            plt.figure()
-            plt.plot(x, y)
-            plt.xlabel(str(numeric_cols[0])); plt.ylabel(str(numeric_cols[1]))
-            plt.title(filename); plt.tight_layout()
-            spectrum_plot = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
-            plt.savefig(spectrum_plot, dpi=200); plt.close()
-        except Exception:
-            plt.close()
-
-    return {
-        "type": "csv_result",
-        "filename": filename,
-        "profile": profile,
-        "stats": stats,
-        "sample_rows": sample_rows,
-        "spectrum_plot": spectrum_plot
-    }
-
-
-def parse_csv(raw: bytes, filename: str, tmp_dir: str):
-    # 1) 엑셀 먼저 시도 (xlsx를 csv로 이름만 바꾸는 경우도 있어서)
-    df = try_read_excel(raw)
-    if df is None:
-        # 2) 견고한 CSV 로더
-        df = robust_read_csv_bytes(raw)
-
-    # 프로필/요약
-    numeric_cols = df.select_dtypes(include='number').columns.tolist()
-    # 숫자 열 없으면 문자 열을 숫자로 변환 시도 (스펙트럼 흔히 문자로 들어옴)
-    if len(numeric_cols) < 2 and len(df.columns) >= 2:
-        for c in df.columns:
-            if df[c].dtype == object:
-                df[c] = to_numeric_series(df[c])
-        numeric_cols = df.select_dtypes(include='number').columns.tolist()
-
-    profile = {
-        "rows": int(len(df)),
-        "cols": int(len(df.columns)),
-        "columns": [str(c) for c in df.columns]
-    }
-
-    stats = {}
-    num_only = df.select_dtypes(include='number')
-    if num_only.shape[1] > 0:
-        try:
-            desc = num_only.describe().to_dict()
-            stats = {col: {k: (float(v) if pd.notna(v) else None) for k, v in m.items()} for col, m in desc.items()}
-        except Exception:
-            stats = {}
-
-    sample_rows = df.head(20).to_dict(orient="records")
-
-    # 스펙트럼 플롯 (숫자 컬럼 2개 이상)
-    spectrum_plot = None
-    if len(numeric_cols) >= 2 and len(df) >= 10:
-        x = df[numeric_cols[0]].values
-        y = df[numeric_cols[1]].values
-        try:
-            plt.figure()
-            plt.plot(x, y)
-            plt.xlabel(str(numeric_cols[0]))
-            plt.ylabel(str(numeric_cols[1]))
-            plt.title(filename)
-            plt.tight_layout()
-            spectrum_plot = os.path.join(tmp_dir, f"{os.path.splitext(filename)[0]}_spectrum.png")
-            plt.savefig(spectrum_plot, dpi=200)
-            plt.close()
-        except Exception:
-            plt.close()
-
-    return {
-        "type": "csv_result",
-        "filename": filename,
-        "profile": profile,
-        "stats": stats,
-        "sample_rows": sample_rows,
-        "spectrum_plot": spectrum_plot
-    }
-
-def parse_image(raw: bytes, filename: str, tmp_dir: str):
-    path = save_image_to_tmp(raw, filename, tmp_dir)
-    try:
-        img = Image.open(io.BytesIO(raw))
-        ocr = pytesseract.image_to_string(img, lang="eng+kor")
-    except Exception:
-        ocr = ""
-    return {
-        "type": "image_result",
-        "filename": filename,
-        "ocr_hint": ocr.strip(),
-        "path": path
-    }
-
-def parse_other(raw: bytes, filename: str, tmp_dir: str):
-    path = save_image_to_tmp(raw, filename, tmp_dir) if filename.lower().endswith((".png",".jpg",".jpeg",".tif",".tiff")) else None
-    return {
-        "type": "other_file",
-        "filename": filename,
-        "path": path,
-        "comment": "지원하지 않는 형식 (또는 별도 처리 필요). 참고용으로만 언급."
-    }
-
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+import os, io, json
+import fitz  # PyMuPDF
 from PIL import Image as PILImage
-import io
 
-def parse_pptx(raw: bytes, filename: str, tmp_dir: str):
-    tmp_pptx = os.path.join(tmp_dir, filename)
-    with open(tmp_pptx,"wb") as f:
-        f.write(raw)
-    prs = Presentation(tmp_pptx)
-    texts = []
+try:
+    import opendataloader_pdf
+    _HAS_ODL = True
+except ImportError:
+    _HAS_ODL = False
+
+
+
+
+
+
+
+
+def _extract_images_from_pdf(raw: bytes, filename: str, tmp_dir: str):
+    """PyMuPDF로 embedded 이미지 + 페이지 전체 캡처를 PNG로 추출."""
+    base_name = os.path.splitext(filename)[0]
     images = []
 
-    for si, slide in enumerate(prs.slides, 1):
-        slide_texts = []
-        for shape in slide.shapes:
-            # 텍스트 추출
-            if hasattr(shape, "text") and shape.text:
-                slide_texts.append(shape.text)
-
-            # 그림 추출
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                img = shape.image
-                blob = img.blob
-                ext = (img.ext or "png").lower()
-
-                # 가능한 경우 PNG로 변환
-                out_ext = "png"
-                out_name = f"{os.path.splitext(filename)[0]}_s{si}_{len(images)+1}.{out_ext}"
-                path = os.path.join(tmp_dir, out_name)
-
-                try:
-                    # PIL로 열어서 PNG로 저장 시도
-                    pil = PILImage.open(io.BytesIO(blob))
-                    pil.save(path, format="PNG")
-                except Exception:
-                    # 변환 실패하면 원래 확장자로 그냥 저장 (마지막 수단)
-                    out_ext = ext
-                    out_name = f"{os.path.splitext(filename)[0]}_s{si}_{len(images)+1}.{out_ext}"
-                    path = os.path.join(tmp_dir, out_name)
-                    with open(path, "wb") as out:
-                        out.write(blob)
-
-                images.append(path)
-
-        if slide_texts:
-            texts.append(f"[Slide {si}]\n" + "\n".join(slide_texts))
-
-    return {
-        "type": "pptx_doc",
-        "filename": filename,
-        "text_chunks": texts[:120],
-        "extracted_images": images,
-    }
-
-import fitz  # PyMuPDF
-import os, io
-
-def parse_pdf_local(raw: bytes, filename: str, tmp_dir: str):
-    texts = []
-    images = []   # embedded 이미지 + 페이지 전체 캡처 + (옵션) crop
-
-    base_name = os.path.splitext(filename)[0]
-
-    # 1) PyMuPDF로 텍스트 + embedded 이미지 + 페이지 전체 캡처
     with fitz.open(stream=raw, filetype="pdf") as doc:
         for pno in range(len(doc)):
             page = doc[pno]
 
-            # ---- 텍스트 추출 ----
-            txt = page.get_text("text")
-            if txt and txt.strip():
-                texts.append(f"[Page {pno+1}]\n{txt.strip()}")
-
-            # ---- embedded 이미지 추출 ----
+            # embedded 이미지
             for img in page.get_images(full=True):
                 xref = img[0]
                 pix = fitz.Pixmap(doc, xref)
-                if pix.alpha:  # 알파 채널 있으면 RGB로 변환
+                if pix.alpha:
                     pix = fitz.Pixmap(fitz.csRGB, pix)
                 ipath = os.path.join(
                     tmp_dir,
@@ -787,7 +86,7 @@ def parse_pdf_local(raw: bytes, filename: str, tmp_dir: str):
                 pix.save(ipath)
                 images.append(ipath)
 
-            # ---- ★ 페이지 전체 캡처(벡터 그래프/도형 포함) ----
+            # 페이지 전체 캡처
             try:
                 pix_page = page.get_pixmap(dpi=200)
                 ppath = os.path.join(
@@ -797,701 +96,115 @@ def parse_pdf_local(raw: bytes, filename: str, tmp_dir: str):
                 pix_page.save(ppath)
                 images.append(ppath)
             except Exception:
-                # 페이지 렌더 실패 시는 그냥 넘어감
                 pass
 
-    # 2) (선택) unstructured 기반 crop 로직을 쓰고 있다면 여기서 이어서 붙이기
-    #    기존 코드에 _HAS_UNSTRUCTURED 블록이 있었다면 아래처럼 합치면 됨.
-    if '_HAS_UNSTRUCTURED' in globals() and _HAS_UNSTRUCTURED:
+    return images
+
+
+
+
+
+
+
+def parse_pdf_local(raw: bytes, filename: str, tmp_dir: str):
+    """
+    - 텍스트/레이아웃: OpenDataLoader-PDF(JSON) 사용
+    - 이미지: PyMuPDF로 추출
+    """
+    base_name = os.path.splitext(filename)[0]
+
+    # 1) 텍스트/레이아웃: OpenDataLoader-PDF
+    text_chunks = []
+
+    if _HAS_ODL:
+        # raw bytes를 임시 파일로 저장 (ODL은 경로 기반)
+        tmp_pdf = os.path.join(tmp_dir, f"odl_{base_name}.pdf")
+        with open(tmp_pdf, "wb") as f:
+            f.write(raw)
+
         try:
-            from unstructured.partition.pdf import partition_pdf
-            import numpy as np, cv2
-
-            crops = []
-            els = partition_pdf(
-                file=io.BytesIO(raw),
-                strategy="hi_res",
-                extract_images_in_pdf=True,
-                languages=["kor+eng"],
-                infer_table_structure=False,
+            # JSON 출력 생성
+            opendataloader_pdf.convert(
+                input_path=[tmp_pdf],
+                output_dir=tmp_dir,
+                format=["json"],
+                quiet=True,
             )
+            json_path = os.path.join(tmp_dir, f"{os.path.basename(tmp_pdf)}.json")
+            # 실제 생성 파일 이름이 원본 basename 기준일 수 있어서 fallback
+            if not os.path.exists(json_path):
+                alt = os.path.join(tmp_dir, f"{base_name}.json")
+                if os.path.exists(alt):
+                    json_path = alt
 
-            with fitz.open(stream=raw, filetype="pdf") as doc:
-                for el in els:
-                    md = getattr(el, "metadata", None)
-                    if not md or not getattr(md, "coordinates", None):
-                        continue
-                    c = md.coordinates
-                    if not hasattr(c, "points"):
-                        continue
+            if os.path.exists(json_path):
+                with open(json_path, "r", encoding="utf-8") as jf:
+                    data = json.load(jf)
 
-                    page_idx = getattr(md, "page_number", 1) - 1
-                    if page_idx < 0 or page_idx >= len(doc):
-                        continue
+                # JSON 트리에서 텍스트를 쭉 모으는 헬퍼
+                collected = []
 
-                    page = doc[page_idx]
-                    pix = page.get_pixmap(dpi=200)
-                    import numpy as np, cv2
-                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                    if pix.n == 4:
-                        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+                def _walk(node):
+                    if isinstance(node, dict):
+                        txt = node.get("text")
+                        if txt:
+                            collected.append(txt)
+                        kids = node.get("kids") or node.get("children") or []
+                        for k in kids:
+                            _walk(k)
+                    elif isinstance(node, list):
+                        for k in node:
+                            _walk(k)
 
-                    layout_w = getattr(c, "layout_width", pix.w)
-                    layout_h = getattr(c, "layout_height", pix.h)
-                    x0, y0 = c.points[0]
-                    x3, y1 = c.points[3]
+                _walk(data)
 
-                    rx = pix.w / layout_w
-                    ry = pix.h / layout_h
-                    top    = int(min(y0, y1) * ry)
-                    left   = int(min(x0, x3) * rx)
-                    bottom = int(max(y0, y1) * ry)
-                    right  = int(max(x0, x3) * rx)
+                # 너무 잘게 쪼개지지 않게, 적당히 묶어서 chunk 생성
+                if collected:
+                    big_text = "\n".join(collected)
+                    # 문단 단위로 쪼개기
+                    paras = [p.strip() for p in big_text.split("\n\n") if p.strip()]
+                    chunk = []
+                    cur_len = 0
+                    for p in paras:
+                        if cur_len + len(p) > 3000 and chunk:
+                            text_chunks.append("\n\n".join(chunk))
+                            chunk = [p]
+                            cur_len = len(p)
+                        else:
+                            chunk.append(p)
+                            cur_len += len(p)
+                    if chunk:
+                        text_chunks.append("\n\n".join(chunk))
+        except Exception as e:
+            # ODL 실패 시 fallback으로 내려감
+            print(f"[WARN] OpenDataLoader PDF 실패: {e}")
 
-                    crop = img[top:bottom, left:right]
-                    kind = getattr(el, "category", "image")
-                    opath = os.path.join(
-                        tmp_dir,
-                        f"{base_name}_{kind}_p{page_idx+1}_{len(crops)}.png"
-                    )
-                    cv2.imwrite(opath, crop)
-                    crops.append(opath)
+    # 2) fallback: OpenDataLoader가 없거나/실패했을 때 PyMuPDF로 텍스트만 뽑기
+    if not text_chunks:
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            for pno in range(len(doc)):
+                page = doc[pno]
+                txt = page.get_text("text")
+                if txt and txt.strip():
+                    text_chunks.append(f"[Page {pno+1}]\n{txt.strip()}")
 
-            images.extend(crops)
-        except Exception:
-            # unstructured 쪽에서 에러 나도 전체 파이프라인은 계속 가게
-            pass
+    # 3) 이미지 추출 (PyMuPDF)
+    images = _extract_images_from_pdf(raw, filename, tmp_dir)
 
     return {
         "type": "pdf_doc",
         "filename": filename,
-        "text_chunks": texts[:120],
+        "text_chunks": text_chunks[:120],  # 필요하면 조절
         "extracted_images": images,
     }
 
 
-# =========================
-# 시스템 프롬프트 (연구 리포트)
-# =========================
 
-SYSTEM_PROMPT = """
-당신은 재료/소자/나노구조 분석을 전문으로 하는 연구 리포트 작성자입니다.
-입력 자료를 기반으로 '시료 분석 결과 보고서' 초안을 작성합니다.
 
-규칙:
-1. 구조:
-# [Report Title]
-## 1. Introduction & Objective
-## 2. Sample Information
-## 3. Experimental Methods
-## 4. Results
-## 5. Discussion
-## 6. Conclusion
-## 7. Suggestions / Future Work
-(선택) ## Appendix (핵심 파라미터/간단 표만)
 
-2. 스타일:
-- 논문/테크니컬 리포트 톤.
-- 과장 없이: "관찰된다", "시사한다", "가능성이 있다", "데이터 범위 내에서" 등.
-- 인과관계를 섣불리 단정하지 않는다.
 
-3. 데이터 사용:
-- 업로드된 txt/csv/image 내용은 참고용.
-- 최종 결과에는 raw 데이터 전체를 복붙하지 말 것.
-- 주요 피크/상/조성/입도/계면 정보 및 경향만 요약.
-
-4. 이미지:
-- 실제 PDF에는 업로드된 이미지를 모두 포함한다 (이는 시스템이 처리).
-- 텍스트에서는 "그림 1", "그림 2" 등으로 적절히 언급.
-
-5. 메타데이터:
-- project_name, sample_id, techniques, key_questions를 제목/서론/결론에 반영.
-
-6. 표기:
-- 화학식/지수/아래첨자는 유니코드 문자(HfO₂)가 아니라 HTML 스타일 표기(HfO<sub>2</sub>, 10<sup>-3</sup>)로 작성하세요.
-- 줄바꿈은 HTML의 <br/>가 아닌 '빈 줄(두 줄바꿈)'로 표현하세요. 실제 줄바꿈 태그가 필요하면 <br/>만 사용하세요.
-- 화학식 지수/아래첨자는 반드시 HTML 표기(HfO<sub>2</sub>, 10<sup>-3</sup>)로 쓰고, 유니코드 첨자 문자는 사용하지 마세요.
-"""
-
-
-# =========================
-# 리포트 텍스트 생성
-# =========================
-
-def build_context(meta: ReportMeta, parsed_files):
-    # LLM에는 path 같은 로컬 경로는 크게 의미 없으니 필요한 정보만 전달
-    sanitized_files = []
-    for f in parsed_files:
-        d = dict(f)
-        d.pop("path", None)
-        d.pop("spectrum_plot", None)
-        sanitized_files.append(d)
-    return {
-        "meta": meta.dict(),
-        "files": sanitized_files
-    }
-
-## 최신 버전
-def build_context(meta: ReportMeta, parsed_files):
-    sanitized_files = []
-    for f in parsed_files:
-        d = dict(f)
-        d.pop("path", None)
-        d.pop("spectrum_plot", None)
-        sanitized_files.append(d)
-    return {
-        "meta": meta.dict(),
-        "files": sanitized_files   # note 도 여기 포함됨
-    }
-
-async def generate_report_text(meta: ReportMeta, parsed_files) -> str:
-    context = build_context(meta, parsed_files)
-    prompt = f"""
-다음은 시료 분석 프로젝트의 메타데이터와 파일 요약입니다.
-이를 기반으로 위 규칙에 맞는 '시료 분석 결과 보고서'를 작성하세요.
-
-[메타데이터 및 파일 요약]
-{json.dumps(context, ensure_ascii=False)}
-
-요구사항:
-- 제시된 구조를 따르되, 내용 부족한 섹션은 간단히.
-- key_questions를 Results/Discussion/Conclusion에서 직접적으로 다룰 것.
-- techniques 정보에 맞는 현실적인 해석만 사용할 것.
-"""
-    return await call_llm(prompt, SYSTEM_PROMPT)
-
-
-# =========================
-# PDF 렌더링 (텍스트 + 이미지 + 스펙트럼 플롯)
-# =========================
-import re, html
-
-ALLOWED_SIMPLE_TAGS = {"b","/b","i","/i","u","/u","sub","/sub","sup","/sup"}
-BR_PATTERN = re.compile(r"</?\s*br\s*/?\s*>", re.IGNORECASE)
-
-SUB_MAP = {"₀":"0","₁":"1","₂":"2","₃":"3","₄":"4","₅":"5","₆":"6","₇":"7","₈":"8","₉":"9"}
-SUP_MAP = {"⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9","⁻":"-","⁺":"+"}
-
-def normalize_sub_sup(text: str) -> str:
-    # 유니코드 아래첨자 → <sub>숫자</sub>
-    for u, d in SUB_MAP.items():
-        text = text.replace(u, f"<sub>{d}</sub>")
-    # 유니코드 위첨자 시퀀스 → <sup>...</sup>
-    out, i = [], 0
-    while i < len(text):
-        if text[i] in SUP_MAP:
-            buf = []
-            while i < len(text) and text[i] in SUP_MAP:
-                buf.append(SUP_MAP[text[i]])
-                i += 1
-            out.append(f"<sup>{''.join(buf)}</sup>")
-        else:
-            out.append(text[i]); i += 1
-    return "".join(out)
-
-def sanitize_markup(raw: str) -> str:
-    # 1) 유니코드 첨자 정규화
-    t = normalize_sub_sup(raw)
-
-    # 2) br 교정: 어떤 형태든 전부 <br/> 로
-    def _br_repl(m): return "<br/>"
-    t = BR_PATTERN.sub(_br_repl, t)
-
-    # 3) 일단 전체 이스케이프
-    t = html.escape(t)
-
-    # 4) 허용 태그만 되돌리기 (+ <br/>)
-    #   &lt;sub&gt; → <sub>  등의 패턴을 되살림
-    for tag in ["b","/b","i","/i","u","/u","sub","/sub","sup","/sup"]:
-        t = t.replace(f"&lt;{tag}&gt;", f"<{tag}>")
-    t = t.replace("&lt;br/&gt;", "<br/>")
-
-    # 5) 첨자 태그 짝 맞추기: 닫힘 과잉 제거, 부족하면 닫힘 추가
-    def fix_tag_balance(txt: str, tag: str) -> str:
-        opens = len(re.findall(fr"<{tag}>", txt))
-        closes = len(re.findall(fr"</{tag}>", txt))
-        if closes > opens:
-            # 과잉 닫힘 제거 (앞에서부터)
-            extra = closes - opens
-            txt = re.sub(fr"</{tag}>", "", txt, count=extra)
-        elif opens > closes:
-            # 부족한 닫힘을 맨 끝에 추가
-            txt += "</{}>".format(tag) * (opens - closes)
-        return txt
-
-    t = fix_tag_balance(t, "sub")
-    t = fix_tag_balance(t, "sup")
-
-    return t
-
-def render_pdf(report_text: str, parsed_files, tmp_dir: str) -> bytes:
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-
-    # 모든 스타일에 한글 폰트 적용
-    for name in ["Normal", "BodyText", "Heading1", "Heading2", "Heading3"]:
-        if name in styles:
-            styles[name].fontName = FONT_NAME
-
-    story = []
-
-    # 1) LLM이 생성한 본문 먼저
-  for line in report_text.splitlines():
-    t = line.strip()
-    if not t:
-        story.append(Spacer(1, 6))
-        continue
-
-    # 🔹 아래/위첨자 유니코드 → <sub>/<sup> 태그로 변환
-    t = normalize_sub_sup(t)
-
-    if t.startswith("# "):
-        story.append(Paragraph(t[2:], styles["Heading1"]))
-    elif t.startswith("## "):
-        story.append(Paragraph(t[3:], styles["Heading2"]))
-    elif t.startswith("### "):
-        story.append(Paragraph(t[4:], styles["Heading3"]))
-    else:
-        story.append(Paragraph(t, styles["BodyText"]))
-    story.append(Spacer(1, 4))  
-##
-		for line in report_text.splitlines():
-        t = line.strip()
-        if not t:
-            story.append(Spacer(1, 6))
-            continue
-        if t.startswith("# "):
-            story.append(Paragraph(t[2:], styles["Heading1"]))
-        elif t.startswith("## "):
-            story.append(Paragraph(t[3:], styles["Heading2"]))
-        elif t.startswith("### "):
-            story.append(Paragraph(t[4:], styles["Heading3"]))
-        else:
-            story.append(Paragraph(t, styles["BodyText"]))
-        story.append(Spacer(1, 4))
-##
-    # 2) Appendix: 업로드된 이미지 + 스펙트럼 플롯 전부 포함
-    figs = []
-
-    # 실제 이미지
-    for f in parsed_files:
-        if f.get("type") == "image_result" and f.get("path"):
-            figs.append(("이미지", f["filename"], f["path"]))
-        # 기타 파일 중 이미지인 경우
-        if f.get("type") == "other_file" and f.get("path") and f["path"].lower().endswith((".png",".jpg",".jpeg",".tif",".tiff")):
-            figs.append(("이미지", f["filename"], f["path"]))
-
-    # 스펙트럼 플롯
-    for f in parsed_files:
-        if f.get("type") == "csv_result" and f.get("spectrum_plot"):
-            figs.append(("스펙트럼", f["filename"], f["spectrum_plot"]))
-
-    if figs:
-        story.append(Spacer(1, 12))
-        story.append(Paragraph("Appendix - Figures", styles["Heading2"]))
-        story.append(Spacer(1, 6))
-
-        fig_idx = 1
-        for kind, fname, path in figs:
-            if not os.path.exists(path):
-                continue
-            caption = f"Figure {fig_idx}. ({kind}) {fname}"
-            story.append(Paragraph(caption, styles["BodyText"]))
-            story.append(Spacer(1, 4))
-            # 이미지 폭을 페이지에 맞게 적당히 조정
-            img = RLImage(path)
-            img._restrictSize(500, 350)
-            story.append(img)
-            story.append(Spacer(1, 12))
-            fig_idx += 1
-
-    doc.build(story)
-    pdf_data = buffer.getvalue()
-    buffer.close()
-    return pdf_data
-
-
-# =========================
-# HTML UI
-# =========================
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    index_path = os.path.join(STATIC_DIR, "index.html")
-    if os.path.exists(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
-    return HTMLResponse("<h1>Research Report Generator</h1><p>static/index.html 파일을 추가하세요.</p>")
-
-
-# =========================
-# API: 웹폼에서 호출
-# =========================
-
-@app.post("/api/generate-research-report")
-async def api_generate_research_report(
-    project_name: str = Form(""),
-    sample_id: str = Form(""),
-    sample_description: str = Form(""),
-    operator: str = Form(""),
-    date: str = Form(""),
-    techniques: str = Form(""),
-    key_questions: str = Form(""),
-    files: List[UploadFile] = File(...)
-):
-    tech_list = [t.strip() for t in techniques.split(",") if t.strip()] if techniques else []
-
-    meta = ReportMeta(
-        project_name=project_name or None,
-        sample_id=sample_id or None,
-        sample_description=sample_description or None,
-        operator=operator or None,
-        date=date or None,
-        techniques=tech_list or None,
-        key_questions=key_questions or None,
-    )
-
-    # temp dir: 이미지/플롯 저장용
-    tmp_dir = tempfile.mkdtemp()
-    parsed_files = []
-
-    for f in files:
-        raw = await f.read()
-        name = f.filename.lower()
-
-        if name.endswith(".txt"):
-            parsed_files.append(parse_txt(raw, f.filename))
-        elif name.endswith(".csv"):
-            parsed_files.append(parse_csv(raw, f.filename, tmp_dir))
-        elif name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff")):
-            parsed_files.append(parse_image(raw, f.filename, tmp_dir))
-        else:
-            parsed_files.append(parse_other(raw, f.filename, tmp_dir))
-
-    report_text = await generate_report_text(meta, parsed_files)
-    pdf_bytes = render_pdf(report_text, parsed_files, tmp_dir)
-
-    headers = {
-        "Content-Disposition": 'inline; filename="research_report.pdf"'
-    }
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-
-@app.post("/api/generate-from-server")
-async def api_generate_from_server(job: ServerFileJob, request: Request):
-    # 1) 보안: 로컬에서만 허용
-    if request.client.host not in ("127.0.0.1", "localhost", "::1"):
-        raise HTTPException(status_code=403, detail="이 엔드포인트는 서버 로컬에서만 사용할 수 있습니다.")
-
-    # 2) 메타 구성 (기존과 동일)
-    tech_list = [t.strip() for t in job.techniques.split(",") if t.strip()] if job.techniques else []
-    meta = ReportMeta(
-        project_name=job.project_name or None,
-        sample_id=job.sample_id or None,
-        sample_description=job.sample_description or None,
-        operator=job.operator or None,
-        date=job.date or None,
-        techniques=tech_list or None,
-        key_questions=job.key_questions or None,
-    )
-
-    tmp_dir = tempfile.mkdtemp()
-    parsed_files = []
-
-    # 3) 경로별로 파일 읽기
-    for rel in job.paths:
-        rel = rel.strip()
-        if not rel:
-            continue
-
-        # DATA_ROOT 기준 상대 경로로 제한
-        full_path = os.path.abspath(os.path.join(DATA_ROOT, rel))
-        if not full_path.startswith(os.path.abspath(DATA_ROOT)):
-            # 상위 디렉토리 탈출 방지
-            continue
-        if not os.path.exists(full_path):
-            continue
-
-        with open(full_path, "rb") as f:
-            raw = f.read()
-        name = os.path.basename(full_path).lower()
-
-        # 기존 업로드 핸들링과 동일한 분기
-        if name.endswith(".txt"):
-            parsed_files.append(parse_txt(raw, os.path.basename(full_path)))
-        elif name.endswith(".csv"):
-            parsed_files.append(parse_csv(raw, os.path.basename(full_path), tmp_dir))
-        elif name.endswith((".png",".jpg",".jpeg",".tif",".tiff")):
-            parsed_files.append(parse_image(raw, os.path.basename(full_path), tmp_dir))
-        elif name.endswith(".pdf"):
-            parsed_files.append(parse_pdf_local(raw, os.path.basename(full_path), tmp_dir))
-        elif name.endswith(".pptx"):
-            parsed_files.append(parse_pptx(raw, os.path.basename(full_path), tmp_dir))
-        elif name.endswith(".docx"):
-            parsed_files.append(parse_docx(raw, os.path.basename(full_path), tmp_dir))
-        else:
-            path=None
-            if name.endswith((".bmp",".gif",".webp")):
-                path = os.path.join(tmp_dir, os.path.basename(full_path))
-                with open(path,"wb") as out:
-                    out.write(raw)
-            parsed_files.append({"type":"other_file","filename":os.path.basename(full_path),
-                                 "path":path,"comment":"참고 파일"})
-
-    if not parsed_files:
-        raise HTTPException(status_code=400, detail="유효한 서버 로컬 파일이 없습니다.")
-
-    # 문서 이미지 → Qwen-VL 요약
-    parsed_files = await enrich_items_with_mm(parsed_files)
-
-    # 본문 생성
-    report_text = await generate_report_text(meta, parsed_files)
-
-    # PDF 렌더
-    pdf_bytes = render_pdf(report_text, parsed_files, tmp_dir)
-    headers = {"Content-Disposition": 'inline; filename=\"research_report_server_files.pdf\"'}
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-
-
-<div class="section">
-  <h3>서버 로컬 파일 (관리자)</h3>
-  <div style="font-size:12px;color:#666">
-    서버에서 접속한 경우, DATA_ROOT 기준 상대 경로를 한 줄에 하나씩 입력하세요.<br>
-    예) wafer1/ftir_spectrum.csv<br>
-    예) projectA/report.pdf
-  </div>
-  <textarea id="server_paths" placeholder="example:&#10;sample1/eels_map.csv&#10;sample1/sem_image.tif"></textarea>
-  <button type="button" id="btn-server">서버 로컬 파일로 리포트 생성</button>
-</div>
-
-
-const btnServer = document.getElementById('btn-server');
-
-btnServer.addEventListener('click', async () => {
-  const serverPathsRaw = document.getElementById('server_paths').value || '';
-  const paths = serverPathsRaw
-                  .split(/\r?\n/)
-                  .map(s => s.trim())
-                  .filter(s => s.length > 0);
-
-  if (!paths.length) {
-    st.textContent = "⚠ 서버 로컬 파일 경로를 한 줄에 하나씩 입력하세요.";
-    return;
-  }
-
-  st.textContent = "서버 로컬 파일로 리포트 생성 중...";
-  const techs = [...document.querySelectorAll('input[name="techniques"]:checked')].map(x => x.value);
-
-  const payload = {
-    project_name: f.project_name.value || "",
-    sample_id: f.sample_id.value || "",
-    sample_description: f.sample_description.value || "",
-    operator: f.operator.value || "",
-    date: f.date.value || "",
-    techniques: techs.join(','),
-    key_questions: f.key_questions.value || "",
-    paths: paths
-  };
-
-  try {
-    const res = await fetch('/api/generate-from-server', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) throw new Error('서버 오류: '+res.status);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    frame.src = url;
-    dl.href = url;
-    cont.style.display = 'block';
-    st.textContent = "✅ 완료 (서버 로컬 파일 기반)";
-  } catch (err) {
-    st.textContent = "❌ 오류: " + err.message;
-  }
-});
-
-
-
-static/index.html (최소 동작 버전, 바로 사용 가능):
-
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8" />
-  <title>연구 시료 분석 리포트 생성기</title>
-  <style>
-    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; }
-    h1 { margin-bottom: 4px; }
-    .subtitle { color: #666; margin-bottom: 20px; }
-    .section { margin-bottom: 16px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; }
-    .section h2 { margin: 0 0 8px; font-size: 16px; }
-    label { display: block; margin-top: 6px; font-size: 13px; }
-    input[type="text"], input[type="date"], textarea {
-      width: 100%; padding: 6px 8px; margin-top: 2px;
-      box-sizing: border-box; font-size: 13px;
-    }
-    textarea { resize: vertical; min-height: 60px; }
-    .chips label { display: inline-flex; align-items: center; margin-right: 8px; margin-top: 4px; }
-    .chips input { margin-right: 4px; }
-    .file-box { padding: 8px; background:#fafafa; border-radius:6px; border:1px dashed #bbb; }
-    button {
-      margin-top: 10px; padding: 10px 18px; font-size: 14px;
-      border: none; border-radius: 6px; cursor: pointer;
-      background: #2563eb; color: #fff;
-    }
-    button:disabled { opacity: 0.6; cursor: default; }
-    #status { margin-top: 10px; font-size: 13px; color: #444; }
-    #pdf-container { margin-top: 20px; }
-    #pdf-frame { width: 100%; height: 600px; border: 1px solid #ccc; border-radius: 6px; }
-    #download-link { display: inline-block; margin-top: 8px; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <h1>연구 시료 분석 리포트 생성기</h1>
-  <div class="subtitle">
-    시료 관련 메타데이터와 분석 결과 파일을 업로드하면,<br>
-    로컬 LLM이 자동으로 연구용 리포트 초안을 생성합니다.
-  </div>
-
-  <form id="report-form">
-    <div class="section">
-      <h2>기본 정보</h2>
-      <label>Project Name
-        <input type="text" name="project_name" placeholder="예: Hf-ZrO2 Gate Stack Reliability Study" />
-      </label>
-      <label>Sample ID
-        <input type="text" name="sample_id" placeholder="예: HZ-ALD-230901-03" />
-      </label>
-      <label>Sample Description
-        <textarea name="sample_description" placeholder="시료 구조, 공정 조건, 스택 정보 등을 간단히 기입"></textarea>
-      </label>
-      <label>Operator / Author
-        <input type="text" name="operator" placeholder="작성자 이름" />
-      </label>
-      <label>Date
-        <input type="date" name="date" />
-      </label>
-    </div>
-
-    <div class="section">
-      <h2>분석 기법</h2>
-      <div class="chips">
-        <label><input type="checkbox" value="TEM"> TEM</label>
-        <label><input type="checkbox" value="STEM"> STEM</label>
-        <label><input type="checkbox" value="SEM"> SEM</label>
-        <label><input type="checkbox" value="EDS"> EDS</label>
-        <label><input type="checkbox" value="EELS"> EELS</label>
-        <label><input type="checkbox" value="XRD"> XRD</label>
-        <label><input type="checkbox" value="XPS"> XPS</label>
-        <label><input type="checkbox" value="AFM"> AFM</label>
-        <label><input type="checkbox" value="Raman"> Raman</label>
-        <label><input type="checkbox" value="PL"> PL</label>
-        <label><input type="checkbox" value="IV"> IV/CV</label>
-      </div>
-    </div>
-
-    <div class="section">
-      <h2>핵심 질문 / 분석 목적</h2>
-      <textarea name="key_questions"
-        placeholder="예: ferroelectric phase fraction 평가, interface roughness 및 diffusion 여부, oxygen vacancy 분포, leakage 관련 결함 유무 등"></textarea>
-    </div>
-
-    <div class="section">
-      <h2>데이터 업로드</h2>
-      <div class="file-box">
-        <p style="margin:0 0 4px; font-size:12px;">
-          지원: csv (수치 결과), txt (노트/로그), png/jpg/tif (이미지), 기타 파일은 참고용으로만 표시됩니다.
-        </p>
-        <input type="file" id="files" name="files" multiple />
-      </div>
-    </div>
-
-    <button type="submit" id="submit-btn">리포트 생성</button>
-    <div id="status"></div>
-  </form>
-
-  <div id="pdf-container" style="display:none;">
-    <h2>생성된 리포트</h2>
-    <iframe id="pdf-frame"></iframe>
-    <a id="download-link" href="#" download="research_report.pdf">📥 PDF 다운로드</a>
-  </div>
-
-  <script>
-    const form = document.getElementById('report-form');
-    const statusEl = document.getElementById('status');
-    const submitBtn = document.getElementById('submit-btn');
-    const pdfContainer = document.getElementById('pdf-container');
-    const pdfFrame = document.getElementById('pdf-frame');
-    const downloadLink = document.getElementById('download-link');
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      statusEl.textContent = "리포트를 생성 중입니다. (로컬 LLM 처리)";
-      submitBtn.disabled = true;
-      pdfContainer.style.display = 'none';
-
-      const fd = new FormData();
-
-      // 기본 필드
-      fd.append('project_name', form.project_name.value);
-      fd.append('sample_id', form.sample_id.value);
-      fd.append('sample_description', form.sample_description.value);
-      fd.append('operator', form.operator.value);
-      fd.append('date', form.date.value);
-
-      // techniques 체크박스 → "TEM,EELS,XRD" 형태 문자열
-      const techs = [];
-      form.querySelectorAll('.chips input[type="checkbox"]:checked').forEach(chk => {
-        techs.push(chk.value);
-      });
-      fd.append('techniques', techs.join(','));
-
-      // key_questions
-      fd.append('key_questions', form.key_questions.value);
-
-      // 파일들
-      const filesInput = document.getElementById('files');
-      if (filesInput.files.length === 0) {
-        statusEl.textContent = "⚠ 데이터 파일을 한 개 이상 업로드해주세요.";
-        submitBtn.disabled = false;
-        return;
-      }
-      for (const file of filesInput.files) {
-        fd.append('files', file);
-      }
-
-      try {
-        const res = await fetch('/api/generate-research-report', {
-          method: 'POST',
-          body: fd
-        });
-
-        if (!res.ok) {
-          throw new Error('서버 오류: ' + res.status);
-        }
-
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-
-        // PDF iframe에 표시
-        pdfFrame.src = url;
-        // 다운로드 링크 설정
-        downloadLink.href = url;
-        downloadLink.download = "research_report.pdf";
-
-        pdfContainer.style.display = 'block';
-        statusEl.textContent = "✅ 리포트가 생성되었습니다.";
-      } catch (err) {
-        console.error(err);
-        statusEl.textContent = "❌ 리포트 생성 중 오류가 발생했습니다: " + err.message;
-      } finally {
-        submitBtn.disabled = false;
-      }
-    });
-  </script>
-</body>
-</html>
+elif name.endswith(".pdf"):
+    parsed_files.append(parse_pdf_local(raw, os.path.basename(full_path), tmp_dir))
 
 
 
