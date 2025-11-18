@@ -1,304 +1,394 @@
-#Functions
-import base64, json, httpx
+model_clients.py
 
-async def analyze_figure_image(
-    image_path: str,
-    backend: str,
-    api_url: str,
-    model_name: str,
-    api_key: str | None = None,
-) -> dict | None:
+# model_clients.py
+
+from __future__ import annotations
+from typing import Optional, Dict, Any, List
+import base64
+import json
+import os
+import httpx
+
+FigureAnalysis = Dict[str, Any]
+
+
+class TextModelClient:
     """
-    그림 1장의 의미를 분석해서 공통 FigureAnalysis dict로 돌려준다.
-    backend 값에 따라 Qwen / 다른 모델 분기.
+    텍스트 전용 LLM 클라이언트.
+    - 기본은 OpenAI 호환 /v1/chat/completions 스타일 가정.
+    - gpt-oss:20b, qwen3-vl:30b-a3b-instruct(텍스트만) 등에 사용.
     """
-    if backend == "qwen":
-        return await _analyze_with_qwen(image_path, api_url, model_name, api_key)
-    elif backend == "openai":
-        return await _analyze_with_openai(image_path, api_url, model_name, api_key)
-    # elif backend == "ollama": ...
-    else:
-        return None
+
+    def __init__(
+        self,
+        api_url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        backend: str = "openai_compat",
+        timeout: float = 120.0,
+    ):
+        self.api_url = api_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.backend = backend
+        self.timeout = timeout
+
+    async def chat_completion(
+        self,
+        system_prompt: str,
+        user_content: str | List[Dict[str, Any]],
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        system + user 메시지를 던지고, 텍스트 응답만 문자열로 받는 헬퍼.
+        user_content가 string이면 그대로, list면 content로 사용.
+        """
+
+        # OpenAI 호환 backend 기준
+        if self.backend == "openai_compat":
+            messages: List[Dict[str, Any]] = []
+
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+
+            if isinstance(user_content, str):
+                messages.append({"role": "user", "content": user_content})
+            else:
+                # 이미 content 배열이 준비된 경우 (예: 다중 파트)
+                messages.append({"role": "user", "content": user_content})
+
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+
+            headers: Dict[str, str] = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(f"{self.api_url}/v1/chat/completions", json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+
+        # 다른 backend 타입을 쓰고 싶으면 여기서 분기 추가
+        raise NotImplementedError(f"Unsupported text backend: {self.backend}")
+    
+
+class VisionModelClient:
+    """
+    비전(LMV) 클라이언트.
+    - 이미지 + 텍스트를 넣고, FigureAnalysis JSON을 받도록 설계.
+    - backend / model 설정만 바꿔주면 Qwen2.5-VL, Qwen3-VL 등 교체 가능.
+    """
+
+    def __init__(
+        self,
+        api_url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        backend: str = "openai_compat",
+        timeout: float = 120.0,
+    ):
+        self.api_url = api_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.backend = backend
+        self.timeout = timeout
+
+    def _figure_prompt(self) -> str:
+        # 여기 프롬프트는 공통. 모델이 바뀌어도 그대로 사용.
+        return """You are an expert scientific figure interpreter.
+
+You will receive ONE scientific image (plot, spectrum, table screenshot, or microscopy image).
+Carefully analyze it and respond ONLY with a single JSON object, no extra text.
+
+The JSON schema MUST be:
+
+{
+  "kind": "plot" | "spectrum" | "table" | "microscopy" | "logo_or_decorative" | "other",
+  "short_caption": "one-sentence description in Korean",
+  "key_findings": [
+    "bullet 1 in Korean",
+    "bullet 2 in Korean"
+  ],
+  "axes": {
+    "x_label": "string or null",
+    "y_label": "string or null",
+    "x_unit": "string or null",
+    "y_unit": "string or null"
+  },
+  "table": {
+    "header": [ "col1", "col2", ... ],
+    "rows": [
+      ["r1c1","r1c2",...],
+      ["r2c1","r2c2",...]
+    ]
+  } | null
+}
+
+Rules:
+- If the image is NOT a table, set "table" to null.
+- If the image is a table screenshot, try to reconstruct header/rows in "table".
+- If it is clearly just a company logo, icon, or UI decoration, set "kind": "logo_or_decorative".
+- Do not add any fields beyond this schema.
+- Respond with VALID JSON only (no comments, no markdown, no explanation).
+"""
+
+    async def analyze_figure(self, image_path: str) -> Optional[FigureAnalysis]:
+        """
+        이미지 1장을 분석해서 FigureAnalysis dict로 반환.
+        실패 시 None.
+        """
+        if self.backend == "openai_compat":
+            return await self._analyze_openai_compat(image_path)
+
+        # 다른 backend (예: ollama, custom) 쓰고 싶으면 여기 분기 추가
+        raise NotImplementedError(f"Unsupported vision backend: {self.backend}")
+
+    async def _analyze_openai_compat(self, image_path: str) -> Optional[FigureAnalysis]:
+        try:
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+            prompt = self._figure_prompt()
+
+            # OpenAI 호환 멀티모달 payload
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_b64}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.1,
+            }
+
+            headers: Dict[str, str] = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(f"{self.api_url}/v1/chat/completions", json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+            content = data["choices"][0]["message"]["content"]
+
+            # 모델이 JSON string으로 응답하도록 프롬프트를 강제했기 때문에, 여기서 파싱
+            return json.loads(content)
+
+        except Exception as e:
+            print(f"[WARN] Vision model call failed ({image_path}): {e}")
+            return None
+
+
+
+
+research_report_server_all_in_one.py (혹은 메인 서버 파일) 상단에서:
+
+
+import os
+from model_clients import TextModelClient, VisionModelClient
+
+# 예시: 환경변수에서 읽기 (없으면 기본값)
+TEXT_API_URL = os.getenv("TEXT_API_URL", "http://localhost:8000")
+TEXT_MODEL   = os.getenv("TEXT_MODEL_NAME", "gpt-oss:20b")
+TEXT_API_KEY = os.getenv("TEXT_API_KEY", "")
+
+VISION_API_URL = os.getenv("VISION_API_URL", "http://localhost:8000")
+VISION_MODEL   = os.getenv("VISION_MODEL_NAME", "qwen2.5-vl:7b")
+VISION_API_KEY = os.getenv("VISION_API_KEY", "")
+
+# 텍스트 모델 클라이언트 (기본: gpt-oss:20b)
+text_client = TextModelClient(
+    api_url=TEXT_API_URL,
+    model=TEXT_MODEL,
+    api_key=TEXT_API_KEY or None,
+    backend="openai_compat",
+)
+
+# 비전 모델 클라이언트 (기본: qwen2.5-vl:7b)
+vision_client = VisionModelClient(
+    api_url=VISION_API_URL,
+    model=VISION_MODEL,
+    api_key=VISION_API_KEY or None,
+    backend="openai_compat",
+)
+
+
+
+TEXT_MODEL_NAME=qwen3-vl:30b-a3b-instruct 이런 식으로 환경변수만 갈아끼우면 됨.
+	•	비전 모델을 Qwen3-VL로 바꾸고 싶으면:
+VISION_MODEL_NAME=qwen3-vl:30b-a3b-instruct
+
+즉, 코드는 그대로 두고 설정만 바꾸는 구조.
 
 
 
 
 
 
+3. 텍스트 리포트 생성 부분 바꾸기 (generate_report_text 예시)
 
-FIGURE_PROMPT = """... (아까 만든 JSON만 출력하라는 프롬프트) ..."""
-
-async def _analyze_with_qwen(image_path: str, api_url: str, model_name: str, api_key: str | None):
-    try:
-        with open(image_path, "rb") as f:
-            b = f.read()
-        b64 = base64.b64encode(b).decode("utf-8")
-
-        payload = {
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": FIGURE_PROMPT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                }
-            ],
-            "temperature": 0.1,
-        }
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(api_url, json=payload, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        return json.loads(content)  # → FigureAnalysis dict
-    except Exception as e:
-        print(f"[WARN] Qwen-VL failed: {e}")
-        return None
+지금 generate_report_text(meta, parsed_files) 안에서
+직접 httpx로 LLM을 부르고 있을 텐데, 그 부분을 text_client로 바꾸면 돼.
 
 
+예를들어:
+# 예시: 기존에 있던 것 (대략)
+# async def generate_report_text(meta, parsed_files):
+#     ctx = build_context(meta, parsed_files)
+#     system_prompt = SYSTEM_PROMPT
+#     payload = {...}
+#     async with httpx.AsyncClient() as client:
+#         ...
+#     return content
 
 
+이렇게 바꾸는 느낌:
+import json
 
-async def _analyze_with_openai(...):
-    # 여기만 OpenAI 스타일 payload로 구현
-    ...
+SYSTEM_PROMPT = """
+당신은 재료/소자 분석 연구 리포트를 작성하는 전문 리포트 작성 어시스턴트입니다.
+(중략: 이미 쓰고 있던 SYSTEM 프롬프트 내용)
+"""
+
+async def generate_report_text(meta, parsed_files):
+    ctx = build_context(meta, parsed_files)  # meta + files + headings + tables + mm_summaries 등
+    user_content = json.dumps(ctx, ensure_ascii=False)
+
+    # text_client는 전역으로 만들어둔 TextModelClient 인스턴스
+    report_text = await text_client.chat_completion(
+        system_prompt=SYSTEM_PROMPT,
+        user_content=user_content,
+        temperature=0.3,
+        max_tokens=None,  # 필요하면 제한
+    )
+    return report_text
 
 
+이제 텍스트 LLM을 변경하고 싶으면 text_client 생성 시 model만 바꾸면 됨.
 
-async def enrich_items_with_mm(parsed_files, backend, api_url, model_name, api_key=None):
-    if not backend:
+
+4. 비전 해석 붙이는 부분 바꾸기 (enrich_items_with_mm)
+
+이전에는 Qwen 전용 함수를 썼다면,
+이제는 vision_client.analyze_figure(image_path)만 부르면 됨.
+
+from PIL import Image as PILImage
+import os
+from typing import List, Dict, Any
+
+async def enrich_items_with_mm(parsed_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    - parsed_files 안의 각 item에서 extracted_images를 찾아
+      적당한 이미지들만 골라 VisionModelClient로 해석.
+    - 결과는 item["mm_summaries"]에 누적.
+    """
+    if vision_client is None:
         return parsed_files
 
     tasks = []
 
     for item in parsed_files:
         imgs = item.get("extracted_images") or []
-        # 여기서 사이즈로 로고 필터링 + 상위 6개 선택 등은 그대로
-        selected = ...  
+        if not imgs:
+            continue
+
+        selected: List[str] = []
+
+        for path in imgs:
+            if not path or not os.path.exists(path):
+                continue
+
+            try:
+                with PILImage.open(path) as im:
+                    w, h = im.size
+                area = w * h
+                ratio = max(w, h) / max(1, min(w, h))
+            except Exception:
+                area = 0
+                ratio = 1
+
+            # 너무 작은 거나 길쭉한 배너는 로고/장식으로 보고 스킵
+            if area < 50_000 or ratio > 8:
+                continue
+
+            selected.append(path)
+            if len(selected) >= 6:  # 파일당 최대 6장 정도만
+                break
 
         for path in selected:
             tasks.append((item, path))
 
-    async def worker(itm, path):
-        analysis = await analyze_figure_image(path, backend, api_url, model_name, api_key)
+    async def worker(itm: Dict[str, Any], img_path: str):
+        analysis = await vision_client.analyze_figure(img_path)
         if not analysis:
             return
         mm_list = itm.setdefault("mm_summaries", [])
         mm_list.append({
-            "image_path": path,
+            "image_path": img_path,
             "analysis": analysis,
         })
 
+    # 비동기로 병렬 처리
+    import asyncio
     await asyncio.gather(*(worker(itm, p) for itm, p in tasks))
     return parsed_files
 
 
+여기서도 Qwen이라는 단어가 한 번도 안 나와:
+	•	Vision 모델을 Qwen2.5-vl:7b → Qwen3-vl:30b 로 바꾸고 싶으면
+VISION_MODEL_NAME만 갈아끼우면 끝.
 
+⸻
 
+5. 전체 흐름 요약
+	1.	모델 클라이언트 모듈 (model_clients.py)에
+	•	TextModelClient
+	•	VisionModelClient
+구현
+	2.	서버 시작할 때:
+	•	text_client = TextModelClient(...)
+	•	vision_client = VisionModelClient(...)
+를 전역/DI로 만들어둠
+	3.	리포트 생성 플로우:
+	•	파일 파싱 → parsed_files
+	•	parsed_files = await enrich_items_with_mm(parsed_files)
+	•	report_text = await generate_report_text(meta, parsed_files)
+	•	render_pdf(report_text, parsed_files, ...)
+	4.	모델 교체가 필요하면:
+	•	.env나 설정에서
+	•	TEXT_MODEL_NAME
+	•	VISION_MODEL_NAME
+	•	(필요 시 URL/API_KEY)
+만 수정하면 됨.
 
+이 정도 구조면:
+	•	지금 말한
+	•	텍스트: gpt-oss:20b (또는 qwen3-vl:30b-a3b-instruct)
+	•	비전: qwen2.5-vl:7b 또는 qwen3-vl:30b-a3b-instruct
+	•	이후에 다른 멀티모달 모델 추가할 때도
+adapter 함수 한 군데만 손보면 되니까 꽤 오래 버틸 거야.
 
-
-
-
-
-
-
-
-def _walk_odl_json(node, acc, page_hint=None):
-    """
-    OpenDataLoader JSON을 재귀적으로 돌면서
-    headings/paragraphs/lists/tables 를 acc dict에 채워 넣는 헬퍼.
-    acc = {
-      "headings": [ {level, text, page} ],
-      "blocks":   [ {kind, text, page} ],
-      "tables":   [ {page, header, rows, meta} ],
-    }
-    """
-    if isinstance(node, list):
-        for ch in node:
-            _walk_odl_json(ch, acc, page_hint=page_hint)
-        return
-
-    if not isinstance(node, dict):
-        return
-
-    ntype = (node.get("type") or "").lower()
-    text  = (node.get("text") or "").strip()
-    page  = node.get("page") or node.get("page_number") or page_hint
-
-    # 페이지 힌트 업데이트
-    page_hint = page or page_hint
-
-    # ---- Heading ----
-    if "heading" in ntype:
-        level = node.get("level") or node.get("heading_level") or 1
-        if text:
-            acc["headings"].append({
-                "level": int(level),
-                "text": text,
-                "page": page_hint,
-            })
-            acc["blocks"].append({
-                "kind": "heading",
-                "level": int(level),
-                "text": text,
-                "page": page_hint,
-            })
-
-    # ---- Paragraph / Text / List item ----
-    elif ntype in ("paragraph", "text", "list_item", "list-item", "bullet"):
-        if text:
-            acc["blocks"].append({
-                "kind": "paragraph",
-                "text": text,
-                "page": page_hint,
-            })
-
-    # ---- Table ----
-    elif "table" in ntype:
-        # 예시: {"type":"table","rows":[["A","B"],["1","2"],...]}
-        rows = node.get("rows") or node.get("table_rows") or []
-        header = []
-        body = []
-
-        if isinstance(rows, list) and rows:
-            # rows = list[list[str]] 라고 가정
-            header = rows[0]
-            body   = rows[1:] if len(rows) > 1 else []
-
-        acc["tables"].append({
-            "page": page_hint,
-            "header": header,
-            "rows": body,
-            "meta": {
-                "n_rows": len(rows),
-                "n_cols": max((len(r) for r in rows), default=0),
-                "raw_type": ntype,
-            },
-        })
-
-    # ---- 기타 블록도 text만 있으면 blocks에 추가 ----
-    else:
-        if text:
-            acc["blocks"].append({
-                "kind": ntype or "unknown",
-                "text": text,
-                "page": page_hint,
-            })
-
-    # children/kids 아래도 계속 탐색
-    for key in ("kids", "children", "contents", "content"):
-        if key in node:
-            _walk_odl_json(node[key], acc, page_hint=page_hint)
-
-
-
-
-
-import opendataloader_pdf
-import json, os, io, fitz
-
-def parse_pdf_local(raw: bytes, filename: str, tmp_dir: str):
-    base_name = os.path.splitext(filename)[0]
-
-    # =========================
-    # 1) OpenDataLoader JSON
-    # =========================
-    headings = []
-    blocks   = []
-    tables   = []
-
-    # ODL 결과를 저장할 임시 pdf/json 경로
-    tmp_pdf = os.path.join(tmp_dir, f"odl_{base_name}.pdf")
-    with open(tmp_pdf, "wb") as f:
-        f.write(raw)
-
-    try:
-        opendataloader_pdf.convert(
-            input_path=[tmp_pdf],
-            output_dir=tmp_dir,
-            format=["json"],
-            quiet=True,
-        )
-
-        # 출력 json 경로 추정
-        json_path = os.path.join(tmp_dir, f"{os.path.basename(tmp_pdf)}.json")
-        if not os.path.exists(json_path):
-            alt = os.path.join(tmp_dir, f"{base_name}.json")
-            if os.path.exists(alt):
-                json_path = alt
-
-        if os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as jf:
-                data = json.load(jf)
-
-            acc = {
-                "headings": [],
-                "blocks":   [],
-                "tables":   [],
-            }
-            _walk_odl_json(data, acc)
-            headings = acc["headings"]
-            blocks   = acc["blocks"]
-            tables   = acc["tables"]
-
-    except Exception as e:
-        print(f"[WARN] OpenDataLoader PDF 실패 (구조 정보 없음, PyMuPDF로 대체): {e}")
-
-    # =========================
-    # 2) fallback 텍스트 (ODL이 실패했거나, 너무 빈약할 때)
-    # =========================
-    text_chunks = []
-    if blocks:
-        # blocks를 페이지/순서대로 묶어서 적당한 길이로 chunking
-        cur = []
-        cur_len = 0
-        for b in blocks:
-            t = b.get("text","").strip()
-            if not t:
-                continue
-            # heading이면 앞에 ### 붙여서 구분해 주는 것도 가능
-            if b["kind"] == "heading":
-                t = f"[H{b.get('level',1)}] {t}"
-            if cur_len + len(t) > 3000 and cur:
-                text_chunks.append("\n\n".join(cur))
-                cur = [t]
-                cur_len = len(t)
-            else:
-                cur.append(t)
-                cur_len += len(t)
-        if cur:
-            text_chunks.append("\n\n".join(cur))
-
-    # 그래도 아무것도 없으면 PyMuPDF로 텍스트만 추출
-    if not text_chunks:
-        with fitz.open(stream=raw, filetype="pdf") as doc:
-            for pno in range(len(doc)):
-                page = doc[pno]
-                txt = page.get_text("text")
-                if txt and txt.strip():
-                    text_chunks.append(f"[Page {pno+1}]\n{txt.strip()}")
-
-    # =========================
-    # 3) 이미지 추출 (기존 PyMuPDF 로직 재사용)
-    # =========================
-    images = _extract_images_from_pdf(raw, filename, tmp_dir)
-
-    return {
-        "type": "pdf_doc",
-        "filename": filename,
-        "text_chunks": text_chunks[:120],
-        "extracted_images": images,
-        # 새 필드들
-        "headings": headings,
-        "tables": tables,   # ODL 기반 table 구조
-    }
-
+이제 네 쪽 엔드포인트(URL, 경로)가 만약 /v1/chat/completions랑 조금 다르면
+그 부분만 같이 맞춰보면 돼.
+필요하면, 너가 실제로 쓰는 curl 예시 한 줄만 알려줘도
+그 형식에 딱 맞게 TextModelClient / VisionModelClient 내부를 구체적으로 맞춰 줄게.
 
 
