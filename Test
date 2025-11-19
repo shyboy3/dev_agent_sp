@@ -767,3 +767,40 @@ parsed_files.append(parsed)
 
 
 
+def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> Dict[str, Any]:
+    ...
+    sheet_results: List[Dict[str, Any]] = []
+    text_summaries: List[str] = []
+
+    for sheet_name, df in sheets_dict.items():
+        blocks_info = split_dataframe_into_blocks(df)
+        blocks: List[Dict[str, Any]] = []
+
+        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
+            sub = df.iloc[r0:r1+1, c0:c1+1]
+            table = infer_table_from_block(sub)
+            if not table.empty:
+                blocks.append({
+                    "block_id": idx,
+                    "row_range": (r0, r1),
+                    "col_range": (c0, c1),
+                    "table": table,
+                })
+
+                # ★ LLM용 요약 텍스트도 같이 만든다 (첫 10행만)
+                preview = table.head(10)
+                txt = f"[XLSX sheet={sheet_name} block={idx}]\n"
+                txt += preview.to_csv(index=False)
+                text_summaries.append(txt)
+
+        sheet_results.append({
+            "sheet_name": sheet_name,
+            "blocks": blocks,
+        })
+
+    return {
+        "type": "xlsx_result",
+        "filename": filename,
+        "sheets": sheet_results,
+        "text_chunks": text_summaries,   # ★ 추가
+    }
