@@ -392,3 +392,378 @@ adapter 함수 한 군데만 손보면 되니까 꽤 오래 버틸 거야.
 그 형식에 딱 맞게 TextModelClient / VisionModelClient 내부를 구체적으로 맞춰 줄게.
 
 
+
+
+
+pip install python-docx
+# (선택) .doc까지 처리하고 싶으면
+pip install textract
+
+
+
+
+
+import os
+import io
+from typing import Dict, Any, List
+
+def parse_doc_like(raw: bytes, filename: str, tmp_dir: str) -> Dict[str, Any]:
+    """
+    .doc / .docx 문서를 텍스트 기반으로 파싱해서
+    리포트 컨텍스트에 넣기 좋은 형태로 반환.
+
+    반환 형식 예:
+    {
+      "type": "docx_doc",
+      "filename": "aaa.docx",
+      "text_chunks": ["문단1...", "문단2...", ...],
+    }
+    """
+    ext = os.path.splitext(filename.lower())[1]
+    base_type = "docx_doc"
+
+    text_chunks: List[str] = []
+
+    if ext == ".docx":
+        # python-docx 사용
+        try:
+            from docx import Document  # type: ignore
+        except ImportError:
+            print("[WARN] python-docx 미설치: docx 파싱 불가")
+            return {
+                "type": base_type,
+                "filename": filename,
+                "text_chunks": [],
+            }
+
+        doc = Document(io.BytesIO(raw))
+
+        # 1) 일반 문단
+        for p in doc.paragraphs:
+            txt = (p.text or "").strip()
+            if txt:
+                text_chunks.append(txt)
+
+        # 2) 표 안의 텍스트도 추가 (있으면)
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if row_text:
+                    text_chunks.append(" | ".join(row_text))
+
+    elif ext == ".doc":
+        base_type = "doc_doc"
+        # .doc는 python-docx 지원이 안되므로, textract 같은 걸로 텍스트만 추출 (옵션)
+        try:
+            import tempfile
+            import textract  # type: ignore
+
+            tmp_path = os.path.join(tmp_dir, filename)
+            with open(tmp_path, "wb") as f:
+                f.write(raw)
+
+            txt = textract.process(tmp_path).decode("utf-8", errors="ignore")
+            lines = [line.strip() for line in txt.splitlines() if line.strip()]
+            text_chunks.extend(lines)
+        except Exception as e:
+            print(f"[WARN] .doc 파싱 실패 (textract 필요): {e}")
+
+    else:
+        # 확장자 안 맞는 경우
+        return {
+            "type": "unknown_doc",
+            "filename": filename,
+            "text_chunks": [],
+        }
+
+    # 너무 잘게 쪼개지지 않게 일정 길이로 chunking
+    merged_chunks: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+    MAX_CHARS = 2000
+
+    for t in text_chunks:
+        if cur_len + len(t) > MAX_CHARS and cur:
+            merged_chunks.append("\n".join(cur))
+            cur = [t]
+            cur_len = len(t)
+        else:
+            cur.append(t)
+            cur_len += len(t)
+    if cur:
+        merged_chunks.append("\n".join(cur))
+
+    return {
+        "type": base_type,
+        "filename": filename,
+        "text_chunks": merged_chunks,
+    }
+
+
+
+
+
+
+import pandas as pd
+from typing import List, Tuple
+
+def split_dataframe_into_blocks(df: pd.DataFrame) -> List[Tuple[int, int, int, int]]:
+    """
+    DataFrame에서 '비어있지 않은 셀'들의 연결된 덩어리(connected component)를 찾아
+    각 덩어리의 bounding box (row_start, row_end, col_start, col_end)를 반환.
+
+    - 인접 정의: 상하좌우(4방향)
+    - 1~2줄 간격으로 떨어진 여러 테이블도 각기 다른 블록으로 인식 가능.
+    """
+    # 비어있는 셀은 False, 내용 있는 셀은 True
+    mask = df.notna() & (df.astype(str).apply(lambda s: s.str.strip()) != "")
+    mask = mask.fillna(False)
+
+    visited = pd.DataFrame(False, index=df.index, columns=df.columns)
+    blocks: List[Tuple[int, int, int, int]] = []
+
+    max_row, max_col = df.shape
+
+    # index, columns가 꼭 0,1,2,...가 아닐 수 있어서,
+    # 위치 기반으로 순회
+    for r in range(max_row):
+        for c in range(max_col):
+            if not mask.iat[r, c] or visited.iat[r, c]:
+                continue
+
+            # 새로운 블록 시작: BFS/DFS로 연결된 셀 탐색
+            stack = [(r, c)]
+            visited.iat[r, c] = True
+            r_min = r_max = r
+            c_min = c_max = c
+
+            while stack:
+                rr, cc = stack.pop()
+                r_min = min(r_min, rr)
+                r_max = max(r_max, rr)
+                c_min = min(c_min, cc)
+                c_max = max(c_max, cc)
+
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = rr + dr, cc + dc
+                    if 0 <= nr < max_row and 0 <= nc < max_col:
+                        if mask.iat[nr, nc] and not visited.iat[nr, nc]:
+                            visited.iat[nr, nc] = True
+                            stack.append((nr, nc))
+
+            # 너무 작은 (1셀짜리 등) 블록은 노이즈로 버리고 싶으면 여기서 필터링
+            if (r_max - r_min + 1) >= 2 or (c_max - c_min + 1) >= 2:
+                blocks.append((r_min, r_max, c_min, c_max))
+
+    return blocks
+
+
+
+
+
+
+
+def infer_table_from_block(df_block: pd.DataFrame) -> pd.DataFrame:
+    """
+    블록에서:
+    - 바깥쪽 완전 빈 행/열 제거
+    - 데이터 방향(세로/가로) 대략 추론
+    - 헤더 행(첫 행)을 컬럼명으로 사용하는 간단한 로직
+
+    필요하면 이 함수만 더 튜닝해서 헤더/유닛/샘플 이름 등 고급 추론 가능.
+    """
+
+    # 1) 바깥쪽 빈 행/열 제거
+    df_block = df_block.copy()
+
+    # 모두 NaN/공백인 행/열 제거
+    def _is_empty_series(s: pd.Series) -> bool:
+        return (~s.notna()).all() or (s.astype(str).str.strip() == "").all()
+
+    # 위쪽/아래쪽 빈 행
+    while df_block.shape[0] > 0 and _is_empty_series(df_block.iloc[0]):
+        df_block = df_block.iloc[1:]
+    while df_block.shape[0] > 0 and _is_empty_series(df_block.iloc[-1]):
+        df_block = df_block.iloc[:-1]
+
+    # 왼쪽/오른쪽 빈 열
+    while df_block.shape[1] > 0 and _is_empty_series(df_block.iloc[:, 0]):
+        df_block = df_block.iloc[:, 1:]
+    while df_block.shape[1] > 0 and _is_empty_series(df_block.iloc[:, -1]):
+        df_block = df_block.iloc[:, :-1]
+
+    if df_block.empty:
+        return df_block
+
+    # 2) 숫자 비율을 이용해 "행이 레코드"인지, "열이 레코드"인지 대충 판단
+    num_df = df_block.apply(pd.to_numeric, errors="coerce")
+    row_numeric_ratio = num_df.notna().sum(axis=1) / max(1, df_block.shape[1])
+    col_numeric_ratio = num_df.notna().sum(axis=0) / max(1, df_block.shape[0])
+
+    avg_row_ratio = row_numeric_ratio.mean()
+    avg_col_ratio = col_numeric_ratio.mean()
+
+    oriented = df_block
+
+    if avg_col_ratio > avg_row_ratio:
+        # 열 쪽에 숫자가 많이 몰려 있다 → 아마 가로로 누워있는 테이블일 확률 ↑
+        oriented = df_block.T
+
+    # 3) 헤더 행: 첫 번째 행을 헤더로 가정 (많은 실험 데이터가 이 패턴)
+    oriented = oriented.reset_index(drop=True)
+    header_row = oriented.iloc[0].fillna("").astype(str).str.strip()
+    data = oriented.iloc[1:].reset_index(drop=True)
+
+    # 컬럼명 비어있는 건 "col_0" 이런 식으로 보완
+    cols = []
+    for i, h in enumerate(header_row):
+        if h:
+            cols.append(h)
+        else:
+            cols.append(f"col_{i}")
+    data.columns = cols
+
+    return data
+
+
+
+
+
+import io
+from typing import Dict, Any, List
+
+def parse_csv_multi_blocks(raw: bytes, filename: str, encoding: str = "utf-8") -> Dict[str, Any]:
+    """
+    CSV를 읽되, 하나의 시트에 여러 개의 데이터 블록이 있을 수 있다고 가정하고
+    블록별로 테이블을 추출한다.
+
+    반환 예:
+    {
+      "type": "csv_result",
+      "filename": "...csv",
+      "blocks": [
+        {
+          "block_id": 1,
+          "table": <DataFrame>,
+        },
+        ...
+      ]
+    }
+    """
+    text = raw.decode(encoding, errors="ignore")
+    df = pd.read_csv(io.StringIO(text), header=None)  # header=None으로 날것 전체 읽기
+
+    blocks_info = split_dataframe_into_blocks(df)
+    blocks: List[Dict[str, Any]] = []
+
+    for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
+        sub = df.iloc[r0:r1+1, c0:c1+1]
+        table = infer_table_from_block(sub)
+        if not table.empty:
+            blocks.append({
+                "block_id": idx,
+                "row_range": (r0, r1),
+                "col_range": (c0, c1),
+                "table": table,
+            })
+
+    return {
+        "type": "csv_result",
+        "filename": filename,
+        "blocks": blocks,
+    }
+
+
+
+
+
+
+
+import tempfile
+
+def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> Dict[str, Any]:
+    """
+    XLSX 파일을 파싱해서,
+    - 각 sheet에서 여러 개의 데이터 블록(NxM)을 찾아내고
+    - 각 블록을 infer_table_from_block으로 정리.
+
+    반환 예:
+    {
+      "type": "xlsx_result",
+      "filename": "aaa.xlsx",
+      "sheets": [
+        {
+          "sheet_name": "Sheet1",
+          "blocks": [
+            {
+              "block_id": 1,
+              "row_range": (r0, r1),
+              "col_range": (c0, c1),
+              "table": <DataFrame>,
+            },
+            ...
+          ]
+        },
+        ...
+      ]
+    }
+    """
+    # raw를 임시 파일로 저장
+    xlsx_path = os.path.join(tmp_dir, filename)
+    with open(xlsx_path, "wb") as f:
+        f.write(raw)
+
+    # 모든 시트를 다 읽음: dict(sheet_name -> DataFrame)
+    sheets_dict = pd.read_excel(xlsx_path, sheet_name=None, header=None, engine=None)
+
+    sheet_results: List[Dict[str, Any]] = []
+
+    for sheet_name, df in sheets_dict.items():
+        blocks_info = split_dataframe_into_blocks(df)
+        blocks: List[Dict[str, Any]] = []
+
+        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
+            sub = df.iloc[r0:r1+1, c0:c1+1]
+            table = infer_table_from_block(sub)
+            if not table.empty:
+                blocks.append({
+                    "block_id": idx,
+                    "row_range": (r0, r1),
+                    "col_range": (c0, c1),
+                    "table": table,
+                })
+
+        sheet_results.append({
+            "sheet_name": sheet_name,
+            "blocks": blocks,
+        })
+
+    return {
+        "type": "xlsx_result",
+        "filename": filename,
+        "sheets": sheet_results,
+    }
+
+
+
+
+
+
+if name.lower().endswith(".pdf"):
+    parsed = parse_pdf_local(raw, name, tmp_dir)
+elif name.lower().endswith(".pptx"):
+    parsed = parse_pptx_local(raw, name, tmp_dir)
+elif name.lower().endswith(".csv"):
+    parsed = parse_csv_multi_blocks(raw, name)
+elif name.lower().endswith(".xlsx"):
+    parsed = parse_xlsx_multi_blocks(raw, name, tmp_dir)
+elif name.lower().endswith(".docx") or name.lower().endswith(".doc"):
+    parsed = parse_doc_like(raw, name, tmp_dir)
+...
+parsed_files.append(parsed)
+
+
+
+
+
+
