@@ -1,3 +1,84 @@
+import os
+import tempfile
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+def try_make_spectrum_plot(df: pd.DataFrame, out_prefix: str, tmp_dir: str) -> str | None:
+    """
+    - df: 하나의 블록 테이블 (infer_table_from_block 결과)
+    - out_prefix: 파일 이름 prefix
+    - tmp_dir: plot 저장할 기본 디렉토리 (없으면 시스템 temp 사용)
+
+    실패하면 None, 성공하면 png 경로 리턴.
+    """
+
+    # 0) 디버그: 들어온 df 상태 출력
+    print(f"[DEBUG] try_make_spectrum_plot: shape={df.shape}")
+    print("[DEBUG] head:\n", df.head())
+
+    if df is None or df.empty:
+        print("[DEBUG] try_make_spectrum_plot: empty df -> skip")
+        return None
+
+    # 1) 숫자 컬럼 찾기
+    df_num = df.apply(pd.to_numeric, errors="coerce")
+    print("[DEBUG] dtypes after to_numeric:\n", df_num.dtypes)
+
+    numeric_cols = [c for c in df_num.columns if df_num[c].notna().sum() > 0]
+    print("[DEBUG] numeric_cols:", numeric_cols)
+
+    if len(numeric_cols) == 0:
+        print("[DEBUG] try_make_spectrum_plot: no numeric columns -> skip")
+        return None
+
+    # 2) x,y 선택 규칙 (단순 버전)
+    if len(numeric_cols) >= 2:
+        x_col = numeric_cols[0]
+        y_col = numeric_cols[1]
+        x = df_num[x_col].values
+        y = df_num[y_col].values
+        x_label = str(x_col)
+        y_label = str(y_col)
+    else:
+        # 숫자 컬럼이 하나뿐이면 index vs 그 컬럼
+        y_col = numeric_cols[0]
+        x = np.arange(len(df_num))
+        y = df_num[y_col].values
+        x_label = "Index"
+        y_label = str(y_col)
+
+    # 3) 저장 디렉토리 결정
+    if not tmp_dir:
+        out_dir = os.path.join(tempfile.gettempdir(), "report_plots")
+    else:
+        out_dir = tmp_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_path = os.path.join(out_dir, f"{out_prefix}_plot.png")
+
+    # 4) 실제 플롯
+    try:
+        plt.figure()
+        plt.plot(x, y)
+        plt.xlabel(x_label)
+        plt.ylabel(y_label)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(f"[DEBUG] try_make_spectrum_plot: saved {out_path}")
+        return out_path
+    except Exception as e:
+        print(f"[WARN] try_make_spectrum_plot 실패: {e}")
+        try:
+            plt.close()
+        except Exception:
+            pass
+        return None
+
+
+
+
 import pandas as pd
 
 def make_json_safe(obj):
