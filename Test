@@ -942,4 +942,246 @@ def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> dict:
 
 
 
+import os
+import pandas as pd
+
+def parse_uploaded_file(filename: str, raw: bytes, tmp_dir: str) -> dict | None:
+    """
+    업로드된 한 개 파일을 형식에 맞게 파싱해서 dict로 돌려준다.
+    - pdf, pptx, 이미지, csv, xlsx, doc/docx 등
+    - 실패하면 None
+    """
+    ext = filename.lower()
+
+    try:
+        if ext.endswith(".pdf"):
+            print(f"[DEBUG] parse_pdf_local: {filename}")
+            return parse_pdf_local(raw, filename, tmp_dir)
+
+        elif ext.endswith(".pptx"):
+            print(f"[DEBUG] parse_pptx_local: {filename}")
+            return parse_pptx_local(raw, filename, tmp_dir)
+
+        elif ext.endswith(".csv"):
+            print(f"[DEBUG] parse_csv_multi_blocks: {filename}")
+            return parse_csv_multi_blocks(raw, filename, tmp_dir)
+
+        elif ext.endswith(".xlsx"):
+            print(f"[DEBUG] parse_xlsx_multi_blocks: {filename}")
+            return parse_xlsx_multi_blocks(raw, filename, tmp_dir)
+
+        elif ext.endswith(".docx") or ext.endswith(".doc"):
+            print(f"[DEBUG] parse_doc_like: {filename}")
+            return parse_doc_like(raw, filename, tmp_dir)
+
+        elif ext.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")):
+            # 이미지 업로드용
+            path = os.path.join(tmp_dir, filename)
+            with open(path, "wb") as f:
+                f.write(raw)
+            print(f"[DEBUG] image_result: {filename}")
+            return {
+                "type": "image_result",
+                "filename": filename,
+                "path": path,
+            }
+
+        else:
+            print(f"[WARN] unknown file type: {filename}")
+            return {
+                "type": "unknown",
+                "filename": filename,
+            }
+
+    except Exception as e:
+        print(f"[ERROR] parse_uploaded_file 실패: {filename} - {e}")
+        return None
+
+
+
+
+
+
+parsed_files: list[dict] = []
+
+print("DEBUG === start parsing uploads ===")
+for up in files:  # 여기서 'files'는 FastAPI UploadFile 리스트라고 가정
+    raw = await up.read()
+    name = up.filename
+    print(f"  [DEBUG upload] {name}, size={len(raw)} bytes")
+
+    parsed = parse_uploaded_file(name, raw, tmp_dir)
+    if parsed:
+        print(f"  [DEBUG parsed] {parsed.get('filename')} -> type={parsed.get('type')} source={parsed.get('source_format')}")
+        parsed_files.append(parsed)
+    else:
+        print(f"  [DEBUG parsed] {name} -> None (parse 실패)")
+
+print("DEBUG === parsed_files length:", len(parsed_files))
+
+
+
+
+
+
+
+
+
+
+
+import io
+
+def parse_csv_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> dict:
+    text = raw.decode("utf-8", errors="ignore")
+    df = pd.read_csv(io.StringIO(text), header=None)
+
+    blocks_info = split_dataframe_into_blocks(df)
+    blocks = []
+    text_summaries = []
+    plots = []
+    first_plot = None
+
+    for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
+        sub = df.iloc[r0:r1+1, c0:c1+1]
+        table = infer_table_from_block(sub)
+        if table.empty:
+            continue
+
+        blocks.append({
+            "block_id": idx,
+            "row_range": (r0, r1),
+            "col_range": (c0, c1),
+            "table": table,
+        })
+
+        preview = table.head(10)
+        txt = f"[CSV block={idx}]\n" + preview.to_csv(index=False)
+        text_summaries.append(txt)
+
+        if tmp_dir:
+            plot_path = try_make_spectrum_plot(
+                table,
+                f"{os.path.splitext(filename)[0]}_blk{idx}",
+                tmp_dir,
+            )
+            if plot_path:
+                plots.append(plot_path)
+                if first_plot is None:
+                    first_plot = plot_path
+
+    return {
+        "type": "csv_result",
+        "source_format": "csv",
+        "filename": filename,
+        "blocks": blocks,
+        "text_chunks": text_summaries,
+        "plots": plots,
+        "spectrum_plot": first_plot,
+    }
+
+
+
+
+
+
+
+
+
+def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> dict:
+    xlsx_path = os.path.join(tmp_dir, filename)
+    with open(xlsx_path, "wb") as f:
+        f.write(raw)
+
+    sheets_dict = pd.read_excel(xlsx_path, sheet_name=None, header=None)
+
+    sheet_results = []
+    text_summaries = []
+    plots = []
+    first_plot = None
+
+    for sheet_name, df in sheets_dict.items():
+        blocks_info = split_dataframe_into_blocks(df)
+        blocks = []
+
+        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
+            sub = df.iloc[r0:r1+1, c0:c1+1]
+            table = infer_table_from_block(sub)
+            if table.empty:
+                continue
+
+            blocks.append({
+                "block_id": idx,
+                "row_range": (r0, r1),
+                "col_range": (c0, c1),
+                "table": table,
+            })
+
+            preview = table.head(10)
+            txt = f"[XLSX sheet={sheet_name} block={idx}]\n" + preview.to_csv(index=False)
+            text_summaries.append(txt)
+
+            plot_path = try_make_spectrum_plot(
+                table,
+                f"{os.path.splitext(filename)[0]}_sheet{sheet_name}_blk{idx}",
+                tmp_dir,
+            )
+            if plot_path:
+                plots.append(plot_path)
+                if first_plot is None:
+                    first_plot = plot_path
+
+        sheet_results.append({
+            "sheet_name": sheet_name,
+            "blocks": blocks,
+        })
+
+    return {
+        "type": "csv_result",          # csv/xlsx 내부 타입 통일
+        "source_format": "xlsx",
+        "filename": filename,
+        "sheets": sheet_results,
+        "text_chunks": text_summaries,
+        "plots": plots,
+        "spectrum_plot": first_plot,
+    }
+
+
+
+
+
+
+print("DEBUG after parsing:")
+for f in parsed_files:
+    print(
+        f"  - {f['filename']}: "
+        f"type={f.get('type')}, "
+        f"source={f.get('source_format')}, "
+        f"text_chunks={len(f.get('text_chunks') or [])}, "
+        f"spectrum_plot={f.get('spectrum_plot')}, "
+        f"plots={f.get('plots')}"
+    )
+
+parsed_files = await enrich_items_with_mm(parsed_files)
+
+print("DEBUG after enrich:")
+for f in parsed_files:
+    print(
+        f"  - {f['filename']}: "
+        f"type={f.get('type')}, "
+        f"source={f.get('source_format')}, "
+        f"text_chunks={len(f.get('text_chunks') or [])}, "
+        f"spectrum_plot={f.get('spectrum_plot')}, "
+        f"plots={f.get('plots')}"
+    )
+
+report_text = await generate_report_text(meta, parsed_files)
+pdf_bytes = render_pdf(report_text, parsed_files, tmp_dir)
+
+
+
+
+
+
+
+
 
