@@ -1,3 +1,34 @@
+import pandas as pd
+
+def make_json_safe(obj):
+    """
+    LLM에 넘길 컨텍스트를 위해:
+    - DataFrame, Series 같은 건 JSON에서 처리 가능한 dict/list로 변환
+    - 나머지는 그대로 재귀 내려가기
+    """
+    if isinstance(obj, pd.DataFrame):
+        # 너무 크면 head(20) 정도로 줄이는 것도 가능
+        return {
+            "__type__": "dataframe",
+            "columns": list(obj.columns),
+            "rows": obj.head(20).to_dict(orient="records"),
+        }
+    if isinstance(obj, pd.Series):
+        return {
+            "__type__": "series",
+            "values": obj.tolist(),
+        }
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(v) for v in obj]
+    # 그 외 (int, float, str, None 등)는 그대로
+    return obj
+
+
+
+
+
 model_clients.py
 
 # model_clients.py
