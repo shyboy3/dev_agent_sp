@@ -266,58 +266,51 @@ import pandas as pd
 import numpy as np
 from scipy.signal import find_peaks
 import cv2
-from ollama import Client  # ★ 수정됨: Client 클래스 import
-import torch
+from ollama import Client 
 from PIL import Image
 from pdf2image import convert_from_bytes
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-from qwen_vl_utils import process_vision_info
 
-# --- 0. 설정 ---
-# ★ 수정됨: 호스트 주소를 명시적으로 지정
+# --- 0. 사용자 환경 설정 (User Config) ---
+
+# 1. Ollama 주소 (윈도우 환경 고려 명시적 지정)
 OLLAMA_HOST = "http://127.0.0.1:11434"
+
+# 2. 사용할 모델 이름 (ollama list 명령어로 확인된 이름이어야 함)
+# 사용자 요청 모델: qwen3-vl:30b-a3b-instruct
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct"  
+TEXT_MODEL = "llama3:70b"  # 종합 리포트용 (없으면 llama3로 변경)
+
+# 클라이언트 초기화
 ollama_client = Client(host=OLLAMA_HOST)
 
-# --- 1. 모델 및 리소스 관리 ---
-ml_models = {}
-
+# --- 1. 서버 수명주기 관리 ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"🚀 Initializing A6000 Backend Server...")
+    print(f"🚀 Starting A6000 Analysis Server (Ollama Mode)")
+    print(f"🎯 Vision Model: {VISION_MODEL}")
+    print(f"🎯 Text Model:   {TEXT_MODEL}")
     
-    # 1. Ollama 연결 테스트
+    # 연결 테스트
     try:
-        print(f"📡 Testing connection to Ollama at {OLLAMA_HOST}...")
-        ollama_client.list() # 연결 테스트용 호출
-        print("✅ Ollama Connected Successfully!")
-    except Exception as e:
-        print(f"❌ Ollama Connection FAILED! Make sure 'ollama serve' is running.")
-        print(f"   Error: {e}")
-
-    # 2. HuggingFace Qwen2-VL 로드 (A6000용)
-    print("⏳ Loading Qwen2-VL Model (This may take a while)...")
-    try:
-        model_path = "Qwen/Qwen2-VL-7B-Instruct" 
+        print(f"📡 Connecting to Ollama at {OLLAMA_HOST}...")
+        models = ollama_client.list()
         
-        ml_models["qwen_model"] = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-        ml_models["qwen_processor"] = AutoProcessor.from_pretrained(model_path, min_pixels=256*28*28, max_pixels=1280*28*28)
-        print("✅ Qwen2-VL Model Loaded!")
+        # 모델 존재 여부 확인 (경고만 출력하고 실행은 계속함)
+        installed_models = [m['name'] for m in models['models']]
+        if VISION_MODEL not in installed_models:
+            print(f"⚠️ Warning: Vision model '{VISION_MODEL}' not found in 'ollama list'.")
+            print(f"   (It might download automatically upon first request, or check the name.)")
+        else:
+            print(f"✅ Vision Model '{VISION_MODEL}' is ready.")
+            
     except Exception as e:
-        print(f"⚠️ Qwen2-VL Load Failed: {e}")
-        print("   -> PDF Vision Analysis will be skipped.")
+        print(f"❌ Error connecting to Ollama: {e}")
+        print("   Please ensure 'ollama serve' is running!")
     
     yield
-    
-    ml_models.clear()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    print("👋 Shutting down server...")
 
-app = FastAPI(title="A6000 Final Analyst", lifespan=lifespan)
+app = FastAPI(title="Ollama Native Analyst", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -326,79 +319,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 2. 분석 엔진 ---
+# --- 2. 분석 함수들 (Ollama API 활용) ---
 
-def run_qwen_inference(image: Image.Image, prompt: str) -> str:
-    """Qwen2-VL Inference"""
-    if "qwen_model" not in ml_models:
-        return "[Error] Vision Model not loaded."
-
-    model = ml_models["qwen_model"]
-    processor = ml_models["qwen_processor"]
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-
-    text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
-    
-    inputs = processor(
-        text=[text_input],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    ).to(model.device)
-
-    with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_new_tokens=1024)
-    
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
-    
-    return output_text
-
-async def analyze_pdf_advanced(content: bytes, filename: str):
+async def analyze_with_vision_model(image_bytes: bytes, prompt: str) -> str:
+    """이미지를 Base64로 변환하여 Ollama Vision 모델에게 전송"""
     try:
-        # Poppler 경로 문제시 에러 발생 가능
+        # Base64 인코딩
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # 비동기 실행을 위해 to_thread 사용
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{
+                'role': 'user',
+                'content': prompt,
+                'images': [img_b64]
+            }]
+        )
+        return response['message']['content']
+    except Exception as e:
+        return f"[Vision AI Error] {str(e)}"
+
+async def analyze_pdf(content: bytes, filename: str):
+    """PDF -> Image -> Ollama Vision (Page by Page)"""
+    try:
+        # Poppler를 이용해 PDF를 이미지로 변환
+        # (Windows 환경변수 PATH에 poppler/bin이 있어야 함)
         images = convert_from_bytes(content, first_page=1, last_page=3, fmt='jpeg')
         
         full_text = ""
         preview_image_b64 = None
 
-        for i, img in enumerate(images):
-            if i == 0:
-                buffered = io.BytesIO()
-                img.save(buffered, format="JPEG")
-                preview_image_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        print(f"📄 Processing PDF: {filename} ({len(images)} pages sample)")
 
-            page_content = run_qwen_inference(
-                img, 
-                "Transcribe this page into Markdown. Describe charts/tables in detail."
+        for i, img in enumerate(images):
+            # 첫 페이지는 썸네일용으로 저장
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            img_bytes = buffered.getvalue()
+            
+            if i == 0:
+                preview_image_b64 = base64.b64encode(img_bytes).decode('utf-8')
+
+            # Vision AI 분석 요청
+            print(f"   Analyzing Page {i+1} with {VISION_MODEL}...")
+            page_content = await analyze_with_vision_model(
+                img_bytes, 
+                "Transcribe this page into Markdown format. Keep tables and headers structurally correct. Do not summarize, just extract."
             )
             full_text += f"\n--- Page {i+1} ---\n{page_content}\n"
 
         return {
-            "type": "image",
+            "type": "image", # 프론트엔드 호환성을 위해 image 타입 사용
             "filename": filename,
-            "summary": f"**PDF Vision Analysis**\n\n{full_text}",
+            "summary": f"**PDF Analysis ({VISION_MODEL})**\n\n{full_text}",
             "image_b64": preview_image_b64
         }
     except Exception as e:
-        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
+        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)} (Check Poppler installed?)"}
+
+async def analyze_image(content: bytes, filename: str):
+    """일반 이미지 분석"""
+    try:
+        img_b64 = base64.b64encode(content).decode('utf-8')
+        
+        print(f"🖼️ Analyzing Image: {filename}")
+        description = await analyze_with_vision_model(
+            content, 
+            "Analyze this scientific image in detail. Identify defects, patterns, or key features."
+        )
+        
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": description,
+            "image_b64": img_b64
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
 
 async def analyze_spectrum(content: bytes, filename: str):
+    """스펙트럼 분석 (기존 SciPy 로직)"""
     try:
         try:
             df = pd.read_csv(io.BytesIO(content))
@@ -417,32 +419,14 @@ async def analyze_spectrum(content: bytes, filename: str):
         return {
             "type": "spectrum",
             "filename": filename,
-            "summary": f"Detected {len(peaks)} major peaks.",
+            "summary": f"Detected {len(peaks)} major peaks via Signal Processing.",
             "chart_data": chart_data,
             "peaks": peak_vals
         }
     except Exception as e:
         return {"type": "error", "filename": filename, "msg": str(e)}
 
-async def analyze_image_vision(content: bytes, filename: str):
-    try:
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-        description = run_qwen_inference(img, "Analyze this scientific image.")
-        
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-        
-        return {
-            "type": "image",
-            "filename": filename,
-            "summary": description,
-            "image_b64": img_b64
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-# --- 3. 라우터 ---
+# --- 3. 라우팅 및 오케스트레이션 ---
 
 @app.post("/api/analyze")
 async def analyze_orchestrator(files: List[UploadFile] = File(...)):
@@ -453,48 +437,42 @@ async def analyze_orchestrator(files: List[UploadFile] = File(...)):
         fname = file.filename.lower()
         
         if fname.endswith('.pdf'):
-            tasks.append(analyze_pdf_advanced(content, file.filename))
+            tasks.append(analyze_pdf(content, file.filename))
         elif fname.endswith(('.csv', '.txt', '.tsv')):
             tasks.append(analyze_spectrum(content, file.filename))
-        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif')):
-            tasks.append(analyze_image_vision(content, file.filename))
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+            tasks.append(analyze_image(content, file.filename))
             
+    # 병렬 처리 시작
     results = await asyncio.gather(*tasks)
     
-    # 종합 리포트 생성 (Ollama)
+    # 결과 취합 및 종합 리포트 작성
     valid_results = [r for r in results if r.get("type") != "error"]
     context_texts = []
     
     for r in valid_results:
         summary = r.get("summary", "")
-        context_texts.append(f"--- File: {r['filename']} ---\n{summary[:2000]}")
+        context_texts.append(f"--- File: {r['filename']} ---\n{summary[:3000]}") # 너무 길면 자름
     
     final_context = "\n".join(context_texts)
-    final_report = "분석 결과가 없습니다."
+    final_report = "분석된 데이터가 없습니다."
     
     if final_context:
         try:
-            # ★ 수정됨: 명시적 Client 사용 및 에러 로깅 강화
-            # 내 PC에 설치된 모델명을 여기에 정확히 적어주세요! (예: llama3, llama3:70b, mistral)
-            TARGET_MODEL = "llama3:70b" 
-            
-            print(f"🔍 Sending synthesis request to Ollama ({TARGET_MODEL})...")
-            
+            print(f"📝 Generating Final Report with {TEXT_MODEL}...")
             res = await asyncio.to_thread(
-                ollama_client.chat,  # client 객체 사용
-                model=TARGET_MODEL,
+                ollama_client.chat,
+                model=TEXT_MODEL,
                 messages=[{
                     'role': 'user', 
-                    'content': f"Synthesize these scientific results into a report:\n\n{final_context}"
+                    'content': f"Synthesize these scientific analysis results into a structured Markdown report. Highlight correlations between different data sources:\n\n{final_context}"
                 }]
             )
             final_report = res['message']['content']
-            print("✅ Synthesis Complete!")
+            print("✅ Report Generated!")
             
         except Exception as e:
-            err_msg = f"❌ Ollama Call Failed: {str(e)}\n(Check if model '{TARGET_MODEL}' is pulled and 'ollama serve' is running)"
-            print(err_msg)
-            final_report = err_msg
+            final_report = f"❌ Final Report Error: {str(e)}"
 
     return {
         "results": results,
@@ -509,8 +487,9 @@ async def serve_index():
 
 if __name__ == "__main__":
     import uvicorn
-    # 0.0.0.0으로 열어야 127.0.0.1 바인딩 문제 회피 가능
+    # 실행
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
