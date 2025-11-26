@@ -251,28 +251,74 @@ index.html
 main.py
 
 import os
-import json
+import io
 import asyncio
 import base64
-import io
+import json
 from typing import List, Dict, Any
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 import pandas as pd
 import numpy as np
 from scipy.signal import find_peaks
 import cv2
-import ollama
+from ollama import Client  # ★ 수정됨: Client 클래스 import
+import torch
+from PIL import Image
+from pdf2image import convert_from_bytes
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
-# --- 설정 및 모델 ---
-app = FastAPI(title="A6000 AI Analyst")
+# --- 0. 설정 ---
+# ★ 수정됨: 호스트 주소를 명시적으로 지정
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
 
-# CORS 설정 (혹시 모를 외부 접속 대비)
+# --- 1. 모델 및 리소스 관리 ---
+ml_models = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print(f"🚀 Initializing A6000 Backend Server...")
+    
+    # 1. Ollama 연결 테스트
+    try:
+        print(f"📡 Testing connection to Ollama at {OLLAMA_HOST}...")
+        ollama_client.list() # 연결 테스트용 호출
+        print("✅ Ollama Connected Successfully!")
+    except Exception as e:
+        print(f"❌ Ollama Connection FAILED! Make sure 'ollama serve' is running.")
+        print(f"   Error: {e}")
+
+    # 2. HuggingFace Qwen2-VL 로드 (A6000용)
+    print("⏳ Loading Qwen2-VL Model (This may take a while)...")
+    try:
+        model_path = "Qwen/Qwen2-VL-7B-Instruct" 
+        
+        ml_models["qwen_model"] = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        ml_models["qwen_processor"] = AutoProcessor.from_pretrained(model_path, min_pixels=256*28*28, max_pixels=1280*28*28)
+        print("✅ Qwen2-VL Model Loaded!")
+    except Exception as e:
+        print(f"⚠️ Qwen2-VL Load Failed: {e}")
+        print("   -> PDF Vision Analysis will be skipped.")
+    
+    yield
+    
+    ml_models.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+app = FastAPI(title="A6000 Final Analyst", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -280,110 +326,191 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 분석 엔진 (축약된 핵심 로직) ---
+# --- 2. 분석 엔진 ---
+
+def run_qwen_inference(image: Image.Image, prompt: str) -> str:
+    """Qwen2-VL Inference"""
+    if "qwen_model" not in ml_models:
+        return "[Error] Vision Model not loaded."
+
+    model = ml_models["qwen_model"]
+    processor = ml_models["qwen_processor"]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    text_input = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    
+    inputs = processor(
+        text=[text_input],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=1024)
+    
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )[0]
+    
+    return output_text
+
+async def analyze_pdf_advanced(content: bytes, filename: str):
+    try:
+        # Poppler 경로 문제시 에러 발생 가능
+        images = convert_from_bytes(content, first_page=1, last_page=3, fmt='jpeg')
+        
+        full_text = ""
+        preview_image_b64 = None
+
+        for i, img in enumerate(images):
+            if i == 0:
+                buffered = io.BytesIO()
+                img.save(buffered, format="JPEG")
+                preview_image_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+            page_content = run_qwen_inference(
+                img, 
+                "Transcribe this page into Markdown. Describe charts/tables in detail."
+            )
+            full_text += f"\n--- Page {i+1} ---\n{page_content}\n"
+
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": f"**PDF Vision Analysis**\n\n{full_text}",
+            "image_b64": preview_image_b64
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
 
 async def analyze_spectrum(content: bytes, filename: str):
-    """스펙트럼 분석 (SciPy + LLM)"""
     try:
-        # 1. 데이터 로드 (CSV/TXT 가정)
         try:
             df = pd.read_csv(io.BytesIO(content))
         except:
             df = pd.read_csv(io.BytesIO(content), delimiter='\t')
             
-        # 데이터가 숫자가 아닌 경우 등 예외처리 필요하지만 데모를 위해 생략
+        x = df.iloc[:, 0].values
         y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
-        x = df.iloc[:, 0].values if df.shape[1] > 1 else np.arange(len(y))
         
-        # 2. 피크 검출
         peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
-        peak_vals = [{"x": float(x[p]), "y": float(y[p])} for p in peaks]
         
-        # 3. 차트용 데이터 (다운샘플링하여 전송량 감소)
-        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::5], y[::5])]
+        step = max(1, len(x) // 1000)
+        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
+        peak_vals = [{"x": float(x[p]), "y": float(y[p])} for p in peaks]
 
         return {
             "type": "spectrum",
             "filename": filename,
-            "summary": f"Detected {len(peaks)} peaks.",
+            "summary": f"Detected {len(peaks)} major peaks.",
             "chart_data": chart_data,
             "peaks": peak_vals
         }
     except Exception as e:
         return {"type": "error", "filename": filename, "msg": str(e)}
 
-async def analyze_image(content: bytes, filename: str):
-    """이미지 분석 (Vision LLM)"""
+async def analyze_image_vision(content: bytes, filename: str):
     try:
-        # Vision LLM (Llava or Qwen) 호출
-        # A6000 환경이므로 base64 변환 후 로컬 Ollama 호출
-        img_b64 = base64.b64encode(content).decode('utf-8')
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+        description = run_qwen_inference(img, "Analyze this scientific image.")
         
-        # 실제 환경에서는 'llava' 또는 'qwen2-vl' 모델명 사용
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model="llava", 
-            messages=[{
-                'role': 'user',
-                'content': "Describe this scientific image in detail. Identify defects or key features.",
-                'images': [img_b64]
-            }]
-        )
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        img_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
         return {
             "type": "image",
             "filename": filename,
-            "summary": response['message']['content'],
-            "image_b64": img_b64 # 화면 표시용
+            "summary": description,
+            "image_b64": img_b64
         }
     except Exception as e:
-        # 모델이 없을 경우 대비한 Mock 응답
-        return {"type": "image", "filename": filename, "summary": f"Image analyzed (Mock: Ensure ollama is running). Error: {e}", "image_b64": img_b64}
+        return {"type": "error", "filename": filename, "msg": str(e)}
 
-# --- 라우터 ---
+# --- 3. 라우터 ---
 
 @app.post("/api/analyze")
-async def analyze_files(files: List[UploadFile] = File(...)):
-    """다중 파일 업로드 및 비동기 병렬 분석"""
+async def analyze_orchestrator(files: List[UploadFile] = File(...)):
     tasks = []
+    
     for file in files:
         content = await file.read()
         fname = file.filename.lower()
         
-        if fname.endswith(('.csv', '.txt', '.xlsx')):
+        if fname.endswith('.pdf'):
+            tasks.append(analyze_pdf_advanced(content, file.filename))
+        elif fname.endswith(('.csv', '.txt', '.tsv')):
             tasks.append(analyze_spectrum(content, file.filename))
         elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif')):
-            tasks.append(analyze_image(content, file.filename))
-        # PDF/PPT 로직 추가 가능
+            tasks.append(analyze_image_vision(content, file.filename))
             
     results = await asyncio.gather(*tasks)
     
-    # 종합 리포트 생성 (Text LLM)
-    context = "\n".join([f"- {r.get('filename')}: {r.get('summary')}" for r in results if 'summary' in r])
+    # 종합 리포트 생성 (Ollama)
+    valid_results = [r for r in results if r.get("type") != "error"]
+    context_texts = []
     
-    final_report = "종합 분석을 진행할 수 없습니다. (Ollama 연결 실패)"
-    try:
-        res = await asyncio.to_thread(
-            ollama.chat,
-            model="llama3",
-            messages=[{'role': 'user', 'content': f"Analyze these scientific findings into a report:\n{context}"}]
-        )
-        final_report = res['message']['content']
-    except:
-        pass
+    for r in valid_results:
+        summary = r.get("summary", "")
+        context_texts.append(f"--- File: {r['filename']} ---\n{summary[:2000]}")
+    
+    final_context = "\n".join(context_texts)
+    final_report = "분석 결과가 없습니다."
+    
+    if final_context:
+        try:
+            # ★ 수정됨: 명시적 Client 사용 및 에러 로깅 강화
+            # 내 PC에 설치된 모델명을 여기에 정확히 적어주세요! (예: llama3, llama3:70b, mistral)
+            TARGET_MODEL = "llama3:70b" 
+            
+            print(f"🔍 Sending synthesis request to Ollama ({TARGET_MODEL})...")
+            
+            res = await asyncio.to_thread(
+                ollama_client.chat,  # client 객체 사용
+                model=TARGET_MODEL,
+                messages=[{
+                    'role': 'user', 
+                    'content': f"Synthesize these scientific results into a report:\n\n{final_context}"
+                }]
+            )
+            final_report = res['message']['content']
+            print("✅ Synthesis Complete!")
+            
+        except Exception as e:
+            err_msg = f"❌ Ollama Call Failed: {str(e)}\n(Check if model '{TARGET_MODEL}' is pulled and 'ollama serve' is running)"
+            print(err_msg)
+            final_report = err_msg
 
-    return {"results": results, "final_report": final_report}
+    return {
+        "results": results,
+        "final_report": final_report
+    }
 
-# ★ 핵심: 루트 경로 접속 시 HTML 파일 서빙
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
-    # 같은 폴더에 있는 index.html을 읽어서 반환
+async def serve_index():
     if os.path.exists("index.html"):
         return FileResponse("index.html")
-    return "index.html 파일을 찾을 수 없습니다."
+    return "<h1>index.html not found</h1>"
 
 if __name__ == "__main__":
     import uvicorn
-    # A6000 서버 IP로 접속 가능하게 host='0.0.0.0' 설정
+    # 0.0.0.0으로 열어야 127.0.0.1 바인딩 문제 회피 가능
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
 
