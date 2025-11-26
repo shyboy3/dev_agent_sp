@@ -1,1299 +1,389 @@
-import os
-import tempfile
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
+index.html
 
-def try_make_spectrum_plot(df: pd.DataFrame, out_prefix: str, tmp_dir: str) -> str | None:
-    """
-    - df: 하나의 블록 테이블 (infer_table_from_block 결과)
-    - out_prefix: 파일 이름 prefix
-    - tmp_dir: plot 저장할 기본 디렉토리 (없으면 시스템 temp 사용)
-
-    실패하면 None, 성공하면 png 경로 리턴.
-    """
-
-    # 0) 디버그: 들어온 df 상태 출력
-    print(f"[DEBUG] try_make_spectrum_plot: shape={df.shape}")
-    print("[DEBUG] head:\n", df.head())
-
-    if df is None or df.empty:
-        print("[DEBUG] try_make_spectrum_plot: empty df -> skip")
-        return None
-
-    # 1) 숫자 컬럼 찾기
-    df_num = df.apply(pd.to_numeric, errors="coerce")
-    print("[DEBUG] dtypes after to_numeric:\n", df_num.dtypes)
-
-    numeric_cols = [c for c in df_num.columns if df_num[c].notna().sum() > 0]
-    print("[DEBUG] numeric_cols:", numeric_cols)
-
-    if len(numeric_cols) == 0:
-        print("[DEBUG] try_make_spectrum_plot: no numeric columns -> skip")
-        return None
-
-    # 2) x,y 선택 규칙 (단순 버전)
-    if len(numeric_cols) >= 2:
-        x_col = numeric_cols[0]
-        y_col = numeric_cols[1]
-        x = df_num[x_col].values
-        y = df_num[y_col].values
-        x_label = str(x_col)
-        y_label = str(y_col)
-    else:
-        # 숫자 컬럼이 하나뿐이면 index vs 그 컬럼
-        y_col = numeric_cols[0]
-        x = np.arange(len(df_num))
-        y = df_num[y_col].values
-        x_label = "Index"
-        y_label = str(y_col)
-
-    # 3) 저장 디렉토리 결정
-    if not tmp_dir:
-        out_dir = os.path.join(tempfile.gettempdir(), "report_plots")
-    else:
-        out_dir = tmp_dir
-    os.makedirs(out_dir, exist_ok=True)
-
-    out_path = os.path.join(out_dir, f"{out_prefix}_plot.png")
-
-    # 4) 실제 플롯
-    try:
-        plt.figure()
-        plt.plot(x, y)
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=150)
-        plt.close()
-        print(f"[DEBUG] try_make_spectrum_plot: saved {out_path}")
-        return out_path
-    except Exception as e:
-        print(f"[WARN] try_make_spectrum_plot 실패: {e}")
-        try:
-            plt.close()
-        except Exception:
-            pass
-        return None
-
-
-
-
-import pandas as pd
-
-def make_json_safe(obj):
-    """
-    LLM에 넘길 컨텍스트를 위해:
-    - DataFrame, Series 같은 건 JSON에서 처리 가능한 dict/list로 변환
-    - 나머지는 그대로 재귀 내려가기
-    """
-    if isinstance(obj, pd.DataFrame):
-        # 너무 크면 head(20) 정도로 줄이는 것도 가능
-        return {
-            "__type__": "dataframe",
-            "columns": list(obj.columns),
-            "rows": obj.head(20).to_dict(orient="records"),
-        }
-    if isinstance(obj, pd.Series):
-        return {
-            "__type__": "series",
-            "values": obj.tolist(),
-        }
-    if isinstance(obj, dict):
-        return {k: make_json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [make_json_safe(v) for v in obj]
-    # 그 외 (int, float, str, None 등)는 그대로
-    return obj
-
-
-
-
-
-model_clients.py
-
-# model_clients.py
-
-from __future__ import annotations
-from typing import Optional, Dict, Any, List
-import base64
-import json
-import os
-import httpx
-
-FigureAnalysis = Dict[str, Any]
-
-
-class TextModelClient:
-    """
-    텍스트 전용 LLM 클라이언트.
-    - 기본은 OpenAI 호환 /v1/chat/completions 스타일 가정.
-    - gpt-oss:20b, qwen3-vl:30b-a3b-instruct(텍스트만) 등에 사용.
-    """
-
-    def __init__(
-        self,
-        api_url: str,
-        model: str,
-        api_key: Optional[str] = None,
-        backend: str = "openai_compat",
-        timeout: float = 120.0,
-    ):
-        self.api_url = api_url.rstrip("/")
-        self.model = model
-        self.api_key = api_key
-        self.backend = backend
-        self.timeout = timeout
-
-    async def chat_completion(
-        self,
-        system_prompt: str,
-        user_content: str | List[Dict[str, Any]],
-        temperature: float = 0.2,
-        max_tokens: Optional[int] = None,
-    ) -> str:
-        """
-        system + user 메시지를 던지고, 텍스트 응답만 문자열로 받는 헬퍼.
-        user_content가 string이면 그대로, list면 content로 사용.
-        """
-
-        # OpenAI 호환 backend 기준
-        if self.backend == "openai_compat":
-            messages: List[Dict[str, Any]] = []
-
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-
-            if isinstance(user_content, str):
-                messages.append({"role": "user", "content": user_content})
-            else:
-                # 이미 content 배열이 준비된 경우 (예: 다중 파트)
-                messages.append({"role": "user", "content": user_content})
-
-            payload: Dict[str, Any] = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-            }
-            if max_tokens is not None:
-                payload["max_tokens"] = max_tokens
-
-            headers: Dict[str, str] = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                r = await client.post(f"{self.api_url}/v1/chat/completions", json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
-
-        # 다른 backend 타입을 쓰고 싶으면 여기서 분기 추가
-        raise NotImplementedError(f"Unsupported text backend: {self.backend}")
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>A6000 AI Lab Analyst</title>
     
+    <!-- 1. 스타일 도구 (Tailwind CSS) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 2. 반응형 로직 도구 (Vue.js 3) -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- 3. 차트 도구 (Plotly.js) -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <!-- 4. 마크다운 렌더러 (Marked) -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- 5. 아이콘 (Lucide) -->
+    <script src="https://unpkg.com/lucide@latest"></script>
 
-class VisionModelClient:
-    """
-    비전(LMV) 클라이언트.
-    - 이미지 + 텍스트를 넣고, FigureAnalysis JSON을 받도록 설계.
-    - backend / model 설정만 바꿔주면 Qwen2.5-VL, Qwen3-VL 등 교체 가능.
-    """
+    <style>
+        .loader {
+            border-top-color: #3498db;
+            -webkit-animation: spinner 1.5s linear infinite;
+            animation: spinner 1.5s linear infinite;
+        }
+        @keyframes spinner {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800 font-sans">
+    <div id="app" class="min-h-screen p-6">
+        
+        <!-- Header -->
+        <header class="max-w-7xl mx-auto mb-8 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="bg-indigo-600 p-2 rounded-lg text-white">
+                    <i data-lucide="microscope" class="w-8 h-8"></i>
+                </div>
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-900">A6000 Multi-modal Analyst</h1>
+                    <p class="text-sm text-slate-500">Dual GPU Powered Local Analysis System</p>
+                </div>
+            </div>
+            <div class="flex gap-2 text-xs font-mono bg-slate-200 px-3 py-1 rounded">
+                <span class="text-green-600">● System Ready</span>
+                <span>|</span>
+                <span>GPU: A6000 x2</span>
+            </div>
+        </header>
 
-    def __init__(
-        self,
-        api_url: str,
-        model: str,
-        api_key: Optional[str] = None,
-        backend: str = "openai_compat",
-        timeout: float = 120.0,
-    ):
-        self.api_url = api_url.rstrip("/")
-        self.model = model
-        self.api_key = api_key
-        self.backend = backend
-        self.timeout = timeout
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
+            
+            <!-- Left: Upload & Status -->
+            <div class="space-y-6">
+                <!-- Dropzone -->
+                <div 
+                    class="bg-white p-8 rounded-xl shadow-sm border-2 border-dashed border-indigo-100 hover:border-indigo-400 transition-colors text-center cursor-pointer"
+                    @dragover.prevent
+                    @drop.prevent="handleDrop"
+                    @click="$refs.fileInput.click()"
+                >
+                    <input type="file" ref="fileInput" multiple class="hidden" @change="handleFileSelect">
+                    <i data-lucide="upload-cloud" class="w-12 h-12 mx-auto text-indigo-300 mb-4"></i>
+                    <p class="font-medium text-slate-700">파일을 드래그하거나 클릭하세요</p>
+                    <p class="text-xs text-slate-400 mt-2">CSV, PNG, JPG, PDF 지원</p>
+                </div>
 
-    def _figure_prompt(self) -> str:
-        # 여기 프롬프트는 공통. 모델이 바뀌어도 그대로 사용.
-        return """You are an expert scientific figure interpreter.
+                <!-- File List -->
+                <div v-if="files.length > 0" class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    <div class="p-4 bg-slate-50 border-b border-slate-100 font-semibold text-sm">
+                        업로드 대기 목록 ({{ files.length }})
+                    </div>
+                    <ul class="max-h-60 overflow-y-auto">
+                        <li v-for="(file, index) in files" :key="index" class="p-3 border-b last:border-0 flex justify-between items-center text-sm">
+                            <span class="truncate max-w-[200px]">{{ file.name }}</span>
+                            <button @click.stop="removeFile(index)" class="text-red-400 hover:text-red-600">×</button>
+                        </li>
+                    </ul>
+                    <div class="p-4">
+                        <button 
+                            @click="analyze" 
+                            :disabled="isAnalyzing"
+                            class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold flex justify-center items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            <span v-if="isAnalyzing" class="loader ease-linear rounded-full border-2 border-t-2 border-gray-200 h-5 w-5"></span>
+                            {{ isAnalyzing ? '분석 중...' : '종합 분석 실행' }}
+                        </button>
+                    </div>
+                </div>
+            </div>
 
-You will receive ONE scientific image (plot, spectrum, table screenshot, or microscopy image).
-Carefully analyze it and respond ONLY with a single JSON object, no extra text.
+            <!-- Right: Results -->
+            <div class="lg:col-span-2 space-y-6">
+                
+                <!-- Initial State -->
+                <div v-if="!result && !isAnalyzing" class="h-96 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col items-center justify-center text-slate-400">
+                    <i data-lucide="bar-chart-2" class="w-16 h-16 mb-4 opacity-50"></i>
+                    <p>데이터를 업로드하면 분석 결과가 여기에 표시됩니다.</p>
+                </div>
 
-The JSON schema MUST be:
+                <!-- Analysis Results -->
+                <div v-if="result" class="space-y-6 animate-fade-in">
+                    
+                    <!-- 1. Final Report -->
+                    <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                        <h2 class="text-xl font-bold mb-4 flex items-center gap-2 text-indigo-800">
+                            <i data-lucide="file-text"></i> 종합 리포트
+                        </h2>
+                        <div class="prose prose-slate max-w-none" v-html="renderMarkdown(result.final_report)"></div>
+                    </div>
 
-{
-  "kind": "plot" | "spectrum" | "table" | "microscopy" | "logo_or_decorative" | "other",
-  "short_caption": "one-sentence description in Korean",
-  "key_findings": [
-    "bullet 1 in Korean",
-    "bullet 2 in Korean"
-  ],
-  "axes": {
-    "x_label": "string or null",
-    "y_label": "string or null",
-    "x_unit": "string or null",
-    "y_unit": "string or null"
-  },
-  "table": {
-    "header": [ "col1", "col2", ... ],
-    "rows": [
-      ["r1c1","r1c2",...],
-      ["r2c1","r2c2",...]
-    ]
-  } | null
-}
+                    <!-- 2. Individual Results -->
+                    <div v-for="(item, idx) in result.results" :key="idx" class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                        
+                        <!-- Spectrum Type -->
+                        <div v-if="item.type === 'spectrum'">
+                            <h3 class="font-bold text-slate-700 mb-2 flex items-center gap-2">
+                                <i data-lucide="activity"></i> {{ item.filename }}
+                            </h3>
+                            <p class="text-sm text-slate-500 mb-4">{{ item.summary }}</p>
+                            <!-- Chart Container -->
+                            <div :id="'chart-' + idx" class="w-full h-64 bg-slate-50 rounded"></div>
+                        </div>
 
-Rules:
-- If the image is NOT a table, set "table" to null.
-- If the image is a table screenshot, try to reconstruct header/rows in "table".
-- If it is clearly just a company logo, icon, or UI decoration, set "kind": "logo_or_decorative".
-- Do not add any fields beyond this schema.
-- Respond with VALID JSON only (no comments, no markdown, no explanation).
-"""
+                        <!-- Image Type -->
+                        <div v-if="item.type === 'image'">
+                            <h3 class="font-bold text-slate-700 mb-2 flex items-center gap-2">
+                                <i data-lucide="image"></i> {{ item.filename }}
+                            </h3>
+                            <div class="grid grid-cols-2 gap-4">
+                                <img :src="'data:image/jpeg;base64,' + item.image_b64" class="rounded border border-slate-200 max-h-64 object-contain">
+                                <div class="text-sm text-slate-600 bg-slate-50 p-4 rounded">
+                                    <strong>AI Analysis:</strong><br>
+                                    {{ item.summary }}
+                                </div>
+                            </div>
+                        </div>
 
-    async def analyze_figure(self, image_path: str) -> Optional[FigureAnalysis]:
-        """
-        이미지 1장을 분석해서 FigureAnalysis dict로 반환.
-        실패 시 None.
-        """
-        if self.backend == "openai_compat":
-            return await self._analyze_openai_compat(image_path)
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
 
-        # 다른 backend (예: ollama, custom) 쓰고 싶으면 여기 분기 추가
-        raise NotImplementedError(f"Unsupported vision backend: {self.backend}")
+    <script>
+        const { createApp, ref, nextTick } = Vue;
 
-    async def _analyze_openai_compat(self, image_path: str) -> Optional[FigureAnalysis]:
-        try:
-            with open(image_path, "rb") as f:
-                img_bytes = f.read()
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        createApp({
+            setup() {
+                const files = ref([]);
+                const isAnalyzing = ref(false);
+                const result = ref(null);
 
-            prompt = self._figure_prompt()
+                const handleFileSelect = (e) => {
+                    files.value.push(...Array.from(e.target.files));
+                };
 
-            # OpenAI 호환 멀티모달 payload
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{img_b64}"
-                                },
-                            },
-                        ],
+                const handleDrop = (e) => {
+                    files.value.push(...Array.from(e.dataTransfer.files));
+                };
+
+                const removeFile = (index) => {
+                    files.value.splice(index, 1);
+                };
+
+                const renderMarkdown = (text) => {
+                    return marked.parse(text || '');
+                };
+
+                const analyze = async () => {
+                    if (files.value.length === 0) return;
+                    
+                    isAnalyzing.value = true;
+                    result.value = null;
+                    
+                    const formData = new FormData();
+                    files.value.forEach(f => formData.append('files', f));
+
+                    try {
+                        const response = await fetch('/api/analyze', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        const data = await response.json();
+                        result.value = data;
+
+                        // Wait for DOM update then draw charts
+                        await nextTick();
+                        drawCharts(data.results);
+                        
+                        // Re-initialize icons
+                        lucide.createIcons();
+
+                    } catch (e) {
+                        alert("분석 중 오류 발생: " + e);
+                    } finally {
+                        isAnalyzing.value = false;
                     }
-                ],
-                "temperature": 0.1,
+                };
+
+                const drawCharts = (results) => {
+                    results.forEach((item, idx) => {
+                        if (item.type === 'spectrum' && item.chart_data) {
+                            const trace = {
+                                x: item.chart_data.map(d => d.x),
+                                y: item.chart_data.map(d => d.y),
+                                mode: 'lines',
+                                line: {color: '#4f46e5'},
+                                name: 'Signal'
+                            };
+                            
+                            // Peaks
+                            const peaks = {
+                                x: item.peaks.map(p => p.x),
+                                y: item.peaks.map(p => p.y),
+                                mode: 'markers',
+                                marker: {color: 'red', size: 8},
+                                name: 'Peaks'
+                            };
+
+                            const layout = {
+                                margin: {t: 20, b: 40, l: 40, r: 20},
+                                showlegend: false,
+                                xaxis: {title: 'Wavelength/Index'},
+                                yaxis: {title: 'Intensity'}
+                            };
+
+                            Plotly.newPlot('chart-' + idx, [trace, peaks], layout);
+                        }
+                    });
+                };
+
+                // Initialize icons on mount
+                setTimeout(() => lucide.createIcons(), 100);
+
+                return {
+                    files, isAnalyzing, result,
+                    handleFileSelect, handleDrop, removeFile, analyze, renderMarkdown
+                };
             }
-
-            headers: Dict[str, str] = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                r = await client.post(f"{self.api_url}/v1/chat/completions", json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-            content = data["choices"][0]["message"]["content"]
-
-            # 모델이 JSON string으로 응답하도록 프롬프트를 강제했기 때문에, 여기서 파싱
-            return json.loads(content)
-
-        except Exception as e:
-            print(f"[WARN] Vision model call failed ({image_path}): {e}")
-            return None
+        }).mount('#app');
+    </script>
+</body>
+</html>
 
 
 
-
-research_report_server_all_in_one.py (혹은 메인 서버 파일) 상단에서:
-
+main.py
 
 import os
-from model_clients import TextModelClient, VisionModelClient
-
-# 예시: 환경변수에서 읽기 (없으면 기본값)
-TEXT_API_URL = os.getenv("TEXT_API_URL", "http://localhost:8000")
-TEXT_MODEL   = os.getenv("TEXT_MODEL_NAME", "gpt-oss:20b")
-TEXT_API_KEY = os.getenv("TEXT_API_KEY", "")
-
-VISION_API_URL = os.getenv("VISION_API_URL", "http://localhost:8000")
-VISION_MODEL   = os.getenv("VISION_MODEL_NAME", "qwen2.5-vl:7b")
-VISION_API_KEY = os.getenv("VISION_API_KEY", "")
-
-# 텍스트 모델 클라이언트 (기본: gpt-oss:20b)
-text_client = TextModelClient(
-    api_url=TEXT_API_URL,
-    model=TEXT_MODEL,
-    api_key=TEXT_API_KEY or None,
-    backend="openai_compat",
-)
-
-# 비전 모델 클라이언트 (기본: qwen2.5-vl:7b)
-vision_client = VisionModelClient(
-    api_url=VISION_API_URL,
-    model=VISION_MODEL,
-    api_key=VISION_API_KEY or None,
-    backend="openai_compat",
-)
-
-
-
-TEXT_MODEL_NAME=qwen3-vl:30b-a3b-instruct 이런 식으로 환경변수만 갈아끼우면 됨.
-	•	비전 모델을 Qwen3-VL로 바꾸고 싶으면:
-VISION_MODEL_NAME=qwen3-vl:30b-a3b-instruct
-
-즉, 코드는 그대로 두고 설정만 바꾸는 구조.
-
-
-
-
-
-
-3. 텍스트 리포트 생성 부분 바꾸기 (generate_report_text 예시)
-
-지금 generate_report_text(meta, parsed_files) 안에서
-직접 httpx로 LLM을 부르고 있을 텐데, 그 부분을 text_client로 바꾸면 돼.
-
-
-예를들어:
-# 예시: 기존에 있던 것 (대략)
-# async def generate_report_text(meta, parsed_files):
-#     ctx = build_context(meta, parsed_files)
-#     system_prompt = SYSTEM_PROMPT
-#     payload = {...}
-#     async with httpx.AsyncClient() as client:
-#         ...
-#     return content
-
-
-이렇게 바꾸는 느낌:
 import json
-
-SYSTEM_PROMPT = """
-당신은 재료/소자 분석 연구 리포트를 작성하는 전문 리포트 작성 어시스턴트입니다.
-(중략: 이미 쓰고 있던 SYSTEM 프롬프트 내용)
-"""
-
-async def generate_report_text(meta, parsed_files):
-    ctx = build_context(meta, parsed_files)  # meta + files + headings + tables + mm_summaries 등
-    user_content = json.dumps(ctx, ensure_ascii=False)
-
-    # text_client는 전역으로 만들어둔 TextModelClient 인스턴스
-    report_text = await text_client.chat_completion(
-        system_prompt=SYSTEM_PROMPT,
-        user_content=user_content,
-        temperature=0.3,
-        max_tokens=None,  # 필요하면 제한
-    )
-    return report_text
-
-
-이제 텍스트 LLM을 변경하고 싶으면 text_client 생성 시 model만 바꾸면 됨.
-
-
-4. 비전 해석 붙이는 부분 바꾸기 (enrich_items_with_mm)
-
-이전에는 Qwen 전용 함수를 썼다면,
-이제는 vision_client.analyze_figure(image_path)만 부르면 됨.
-
-from PIL import Image as PILImage
-import os
+import asyncio
+import base64
+import io
 from typing import List, Dict, Any
 
-async def enrich_items_with_mm(parsed_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    - parsed_files 안의 각 item에서 extracted_images를 찾아
-      적당한 이미지들만 골라 VisionModelClient로 해석.
-    - 결과는 item["mm_summaries"]에 누적.
-    """
-    if vision_client is None:
-        return parsed_files
-
-    tasks = []
-
-    for item in parsed_files:
-        imgs = item.get("extracted_images") or []
-        if not imgs:
-            continue
-
-        selected: List[str] = []
-
-        for path in imgs:
-            if not path or not os.path.exists(path):
-                continue
-
-            try:
-                with PILImage.open(path) as im:
-                    w, h = im.size
-                area = w * h
-                ratio = max(w, h) / max(1, min(w, h))
-            except Exception:
-                area = 0
-                ratio = 1
-
-            # 너무 작은 거나 길쭉한 배너는 로고/장식으로 보고 스킵
-            if area < 50_000 or ratio > 8:
-                continue
-
-            selected.append(path)
-            if len(selected) >= 6:  # 파일당 최대 6장 정도만
-                break
-
-        for path in selected:
-            tasks.append((item, path))
-
-    async def worker(itm: Dict[str, Any], img_path: str):
-        analysis = await vision_client.analyze_figure(img_path)
-        if not analysis:
-            return
-        mm_list = itm.setdefault("mm_summaries", [])
-        mm_list.append({
-            "image_path": img_path,
-            "analysis": analysis,
-        })
-
-    # 비동기로 병렬 처리
-    import asyncio
-    await asyncio.gather(*(worker(itm, p) for itm, p in tasks))
-    return parsed_files
-
-
-여기서도 Qwen이라는 단어가 한 번도 안 나와:
-	•	Vision 모델을 Qwen2.5-vl:7b → Qwen3-vl:30b 로 바꾸고 싶으면
-VISION_MODEL_NAME만 갈아끼우면 끝.
-
-⸻
-
-5. 전체 흐름 요약
-	1.	모델 클라이언트 모듈 (model_clients.py)에
-	•	TextModelClient
-	•	VisionModelClient
-구현
-	2.	서버 시작할 때:
-	•	text_client = TextModelClient(...)
-	•	vision_client = VisionModelClient(...)
-를 전역/DI로 만들어둠
-	3.	리포트 생성 플로우:
-	•	파일 파싱 → parsed_files
-	•	parsed_files = await enrich_items_with_mm(parsed_files)
-	•	report_text = await generate_report_text(meta, parsed_files)
-	•	render_pdf(report_text, parsed_files, ...)
-	4.	모델 교체가 필요하면:
-	•	.env나 설정에서
-	•	TEXT_MODEL_NAME
-	•	VISION_MODEL_NAME
-	•	(필요 시 URL/API_KEY)
-만 수정하면 됨.
-
-이 정도 구조면:
-	•	지금 말한
-	•	텍스트: gpt-oss:20b (또는 qwen3-vl:30b-a3b-instruct)
-	•	비전: qwen2.5-vl:7b 또는 qwen3-vl:30b-a3b-instruct
-	•	이후에 다른 멀티모달 모델 추가할 때도
-adapter 함수 한 군데만 손보면 되니까 꽤 오래 버틸 거야.
-
-이제 네 쪽 엔드포인트(URL, 경로)가 만약 /v1/chat/completions랑 조금 다르면
-그 부분만 같이 맞춰보면 돼.
-필요하면, 너가 실제로 쓰는 curl 예시 한 줄만 알려줘도
-그 형식에 딱 맞게 TextModelClient / VisionModelClient 내부를 구체적으로 맞춰 줄게.
-
-
-
-
-
-pip install python-docx
-# (선택) .doc까지 처리하고 싶으면
-pip install textract
-
-
-
-
-
-import os
-import io
-from typing import Dict, Any, List
-
-def parse_doc_like(raw: bytes, filename: str, tmp_dir: str) -> Dict[str, Any]:
-    """
-    .doc / .docx 문서를 텍스트 기반으로 파싱해서
-    리포트 컨텍스트에 넣기 좋은 형태로 반환.
-
-    반환 형식 예:
-    {
-      "type": "docx_doc",
-      "filename": "aaa.docx",
-      "text_chunks": ["문단1...", "문단2...", ...],
-    }
-    """
-    ext = os.path.splitext(filename.lower())[1]
-    base_type = "docx_doc"
-
-    text_chunks: List[str] = []
-
-    if ext == ".docx":
-        # python-docx 사용
-        try:
-            from docx import Document  # type: ignore
-        except ImportError:
-            print("[WARN] python-docx 미설치: docx 파싱 불가")
-            return {
-                "type": base_type,
-                "filename": filename,
-                "text_chunks": [],
-            }
-
-        doc = Document(io.BytesIO(raw))
-
-        # 1) 일반 문단
-        for p in doc.paragraphs:
-            txt = (p.text or "").strip()
-            if txt:
-                text_chunks.append(txt)
-
-        # 2) 표 안의 텍스트도 추가 (있으면)
-        for tbl in doc.tables:
-            for row in tbl.rows:
-                row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if row_text:
-                    text_chunks.append(" | ".join(row_text))
-
-    elif ext == ".doc":
-        base_type = "doc_doc"
-        # .doc는 python-docx 지원이 안되므로, textract 같은 걸로 텍스트만 추출 (옵션)
-        try:
-            import tempfile
-            import textract  # type: ignore
-
-            tmp_path = os.path.join(tmp_dir, filename)
-            with open(tmp_path, "wb") as f:
-                f.write(raw)
-
-            txt = textract.process(tmp_path).decode("utf-8", errors="ignore")
-            lines = [line.strip() for line in txt.splitlines() if line.strip()]
-            text_chunks.extend(lines)
-        except Exception as e:
-            print(f"[WARN] .doc 파싱 실패 (textract 필요): {e}")
-
-    else:
-        # 확장자 안 맞는 경우
-        return {
-            "type": "unknown_doc",
-            "filename": filename,
-            "text_chunks": [],
-        }
-
-    # 너무 잘게 쪼개지지 않게 일정 길이로 chunking
-    merged_chunks: List[str] = []
-    cur: List[str] = []
-    cur_len = 0
-    MAX_CHARS = 2000
-
-    for t in text_chunks:
-        if cur_len + len(t) > MAX_CHARS and cur:
-            merged_chunks.append("\n".join(cur))
-            cur = [t]
-            cur_len = len(t)
-        else:
-            cur.append(t)
-            cur_len += len(t)
-    if cur:
-        merged_chunks.append("\n".join(cur))
-
-    return {
-        "type": base_type,
-        "filename": filename,
-        "text_chunks": merged_chunks,
-    }
-
-
-
-
-
+from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import pandas as pd
-from typing import List, Tuple
-
-def split_dataframe_into_blocks(df: pd.DataFrame) -> List[Tuple[int, int, int, int]]:
-    """
-    DataFrame에서 '비어있지 않은 셀'들의 연결된 덩어리(connected component)를 찾아
-    각 덩어리의 bounding box (row_start, row_end, col_start, col_end)를 반환.
-
-    - 인접 정의: 상하좌우(4방향)
-    - 1~2줄 간격으로 떨어진 여러 테이블도 각기 다른 블록으로 인식 가능.
-    """
-    # 비어있는 셀은 False, 내용 있는 셀은 True
-    mask = df.notna() & (df.astype(str).apply(lambda s: s.str.strip()) != "")
-    mask = mask.fillna(False)
-
-    visited = pd.DataFrame(False, index=df.index, columns=df.columns)
-    blocks: List[Tuple[int, int, int, int]] = []
-
-    max_row, max_col = df.shape
-
-    # index, columns가 꼭 0,1,2,...가 아닐 수 있어서,
-    # 위치 기반으로 순회
-    for r in range(max_row):
-        for c in range(max_col):
-            if not mask.iat[r, c] or visited.iat[r, c]:
-                continue
-
-            # 새로운 블록 시작: BFS/DFS로 연결된 셀 탐색
-            stack = [(r, c)]
-            visited.iat[r, c] = True
-            r_min = r_max = r
-            c_min = c_max = c
-
-            while stack:
-                rr, cc = stack.pop()
-                r_min = min(r_min, rr)
-                r_max = max(r_max, rr)
-                c_min = min(c_min, cc)
-                c_max = max(c_max, cc)
-
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = rr + dr, cc + dc
-                    if 0 <= nr < max_row and 0 <= nc < max_col:
-                        if mask.iat[nr, nc] and not visited.iat[nr, nc]:
-                            visited.iat[nr, nc] = True
-                            stack.append((nr, nc))
-
-            # 너무 작은 (1셀짜리 등) 블록은 노이즈로 버리고 싶으면 여기서 필터링
-            if (r_max - r_min + 1) >= 2 or (c_max - c_min + 1) >= 2:
-                blocks.append((r_min, r_max, c_min, c_max))
-
-    return blocks
-
-
-
-
-
-
-
-def infer_table_from_block(df_block: pd.DataFrame) -> pd.DataFrame:
-    """
-    블록에서:
-    - 바깥쪽 완전 빈 행/열 제거
-    - 데이터 방향(세로/가로) 대략 추론
-    - 헤더 행(첫 행)을 컬럼명으로 사용하는 간단한 로직
-
-    필요하면 이 함수만 더 튜닝해서 헤더/유닛/샘플 이름 등 고급 추론 가능.
-    """
-
-    # 1) 바깥쪽 빈 행/열 제거
-    df_block = df_block.copy()
-
-    # 모두 NaN/공백인 행/열 제거
-    def _is_empty_series(s: pd.Series) -> bool:
-        return (~s.notna()).all() or (s.astype(str).str.strip() == "").all()
-
-    # 위쪽/아래쪽 빈 행
-    while df_block.shape[0] > 0 and _is_empty_series(df_block.iloc[0]):
-        df_block = df_block.iloc[1:]
-    while df_block.shape[0] > 0 and _is_empty_series(df_block.iloc[-1]):
-        df_block = df_block.iloc[:-1]
-
-    # 왼쪽/오른쪽 빈 열
-    while df_block.shape[1] > 0 and _is_empty_series(df_block.iloc[:, 0]):
-        df_block = df_block.iloc[:, 1:]
-    while df_block.shape[1] > 0 and _is_empty_series(df_block.iloc[:, -1]):
-        df_block = df_block.iloc[:, :-1]
-
-    if df_block.empty:
-        return df_block
-
-    # 2) 숫자 비율을 이용해 "행이 레코드"인지, "열이 레코드"인지 대충 판단
-    num_df = df_block.apply(pd.to_numeric, errors="coerce")
-    row_numeric_ratio = num_df.notna().sum(axis=1) / max(1, df_block.shape[1])
-    col_numeric_ratio = num_df.notna().sum(axis=0) / max(1, df_block.shape[0])
-
-    avg_row_ratio = row_numeric_ratio.mean()
-    avg_col_ratio = col_numeric_ratio.mean()
-
-    oriented = df_block
-
-    if avg_col_ratio > avg_row_ratio:
-        # 열 쪽에 숫자가 많이 몰려 있다 → 아마 가로로 누워있는 테이블일 확률 ↑
-        oriented = df_block.T
-
-    # 3) 헤더 행: 첫 번째 행을 헤더로 가정 (많은 실험 데이터가 이 패턴)
-    oriented = oriented.reset_index(drop=True)
-    header_row = oriented.iloc[0].fillna("").astype(str).str.strip()
-    data = oriented.iloc[1:].reset_index(drop=True)
-
-    # 컬럼명 비어있는 건 "col_0" 이런 식으로 보완
-    cols = []
-    for i, h in enumerate(header_row):
-        if h:
-            cols.append(h)
-        else:
-            cols.append(f"col_{i}")
-    data.columns = cols
-
-    return data
-
-
-
-
-
-import io
-from typing import Dict, Any, List
-
-def parse_csv_multi_blocks(raw: bytes, filename: str, encoding: str = "utf-8") -> Dict[str, Any]:
-    """
-    CSV를 읽되, 하나의 시트에 여러 개의 데이터 블록이 있을 수 있다고 가정하고
-    블록별로 테이블을 추출한다.
-
-    반환 예:
-    {
-      "type": "csv_result",
-      "filename": "...csv",
-      "blocks": [
-        {
-          "block_id": 1,
-          "table": <DataFrame>,
-        },
-        ...
-      ]
-    }
-    """
-    text = raw.decode(encoding, errors="ignore")
-    df = pd.read_csv(io.StringIO(text), header=None)  # header=None으로 날것 전체 읽기
-
-    blocks_info = split_dataframe_into_blocks(df)
-    blocks: List[Dict[str, Any]] = []
-
-    for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-        sub = df.iloc[r0:r1+1, c0:c1+1]
-        table = infer_table_from_block(sub)
-        if not table.empty:
-            blocks.append({
-                "block_id": idx,
-                "row_range": (r0, r1),
-                "col_range": (c0, c1),
-                "table": table,
-            })
-
-    return {
-        "type": "csv_result",
-        "filename": filename,
-        "blocks": blocks,
-    }
-
-
-
-
-
-
-
-import tempfile
-
-def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> Dict[str, Any]:
-    """
-    XLSX 파일을 파싱해서,
-    - 각 sheet에서 여러 개의 데이터 블록(NxM)을 찾아내고
-    - 각 블록을 infer_table_from_block으로 정리.
-
-    반환 예:
-    {
-      "type": "xlsx_result",
-      "filename": "aaa.xlsx",
-      "sheets": [
-        {
-          "sheet_name": "Sheet1",
-          "blocks": [
-            {
-              "block_id": 1,
-              "row_range": (r0, r1),
-              "col_range": (c0, c1),
-              "table": <DataFrame>,
-            },
-            ...
-          ]
-        },
-        ...
-      ]
-    }
-    """
-    # raw를 임시 파일로 저장
-    xlsx_path = os.path.join(tmp_dir, filename)
-    with open(xlsx_path, "wb") as f:
-        f.write(raw)
-
-    # 모든 시트를 다 읽음: dict(sheet_name -> DataFrame)
-    sheets_dict = pd.read_excel(xlsx_path, sheet_name=None, header=None, engine=None)
-
-    sheet_results: List[Dict[str, Any]] = []
-
-    for sheet_name, df in sheets_dict.items():
-        blocks_info = split_dataframe_into_blocks(df)
-        blocks: List[Dict[str, Any]] = []
-
-        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-            sub = df.iloc[r0:r1+1, c0:c1+1]
-            table = infer_table_from_block(sub)
-            if not table.empty:
-                blocks.append({
-                    "block_id": idx,
-                    "row_range": (r0, r1),
-                    "col_range": (c0, c1),
-                    "table": table,
-                })
-
-        sheet_results.append({
-            "sheet_name": sheet_name,
-            "blocks": blocks,
-        })
-
-    return {
-        "type": "xlsx_result",
-        "filename": filename,
-        "sheets": sheet_results,
-    }
-
-
-
-
-
-
-if name.lower().endswith(".pdf"):
-    parsed = parse_pdf_local(raw, name, tmp_dir)
-elif name.lower().endswith(".pptx"):
-    parsed = parse_pptx_local(raw, name, tmp_dir)
-elif name.lower().endswith(".csv"):
-    parsed = parse_csv_multi_blocks(raw, name)
-elif name.lower().endswith(".xlsx"):
-    parsed = parse_xlsx_multi_blocks(raw, name, tmp_dir)
-elif name.lower().endswith(".docx") or name.lower().endswith(".doc"):
-    parsed = parse_doc_like(raw, name, tmp_dir)
-...
-parsed_files.append(parsed)
-
-
-
-
-
-
-def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> Dict[str, Any]:
-    ...
-    sheet_results: List[Dict[str, Any]] = []
-    text_summaries: List[str] = []
-
-    for sheet_name, df in sheets_dict.items():
-        blocks_info = split_dataframe_into_blocks(df)
-        blocks: List[Dict[str, Any]] = []
-
-        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-            sub = df.iloc[r0:r1+1, c0:c1+1]
-            table = infer_table_from_block(sub)
-            if not table.empty:
-                blocks.append({
-                    "block_id": idx,
-                    "row_range": (r0, r1),
-                    "col_range": (c0, c1),
-                    "table": table,
-                })
-
-                # ★ LLM용 요약 텍스트도 같이 만든다 (첫 10행만)
-                preview = table.head(10)
-                txt = f"[XLSX sheet={sheet_name} block={idx}]\n"
-                txt += preview.to_csv(index=False)
-                text_summaries.append(txt)
-
-        sheet_results.append({
-            "sheet_name": sheet_name,
-            "blocks": blocks,
-        })
-
-    return {
-        "type": "xlsx_result",
-        "filename": filename,
-        "sheets": sheet_results,
-        "text_chunks": text_summaries,   # ★ 추가
-    }
-
-
-
-
-
-
-def parse_csv_multi_blocks(raw: bytes, filename: str, tmp_dir: str = "") -> dict:
-    """
-    CSV를 멀티블럭으로 파싱.
-    tmp_dir은 지금 당장 안 써도 되지만,
-    나중에 CSV에서도 플롯 이미지 저장할 때 필요해서 인자만 맞춰둠.
-    """
-    import io
-    import pandas as pd
-
-    text = raw.decode("utf-8", errors="ignore")
-    df = pd.read_csv(io.StringIO(text), header=None)
-
-    blocks_info = split_dataframe_into_blocks(df)
-    blocks = []
-    text_summaries = []
-    plots = []
-    first_plot = None
-
-    for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-        sub = df.iloc[r0:r1+1, c0:c1+1]
-        table = infer_table_from_block(sub)
-        if table.empty:
-            continue
-
-        blocks.append({
-            "block_id": idx,
-            "row_range": (r0, r1),
-            "col_range": (c0, c1),
-            "table": table,
-        })
-
-        preview = table.head(10)
-        txt = f"[CSV block={idx}]\n" + preview.to_csv(index=False)
-        text_summaries.append(txt)
-
-        # 필요하면 CSV도 플롯 생성 가능
-        if tmp_dir:
-            plot_path = try_make_spectrum_plot(
-                table,
-                f"{os.path.splitext(filename)[0]}_blk{idx}",
-                tmp_dir,
-            )
-            if plot_path:
-                plots.append(plot_path)
-                if first_plot is None:
-                    first_plot = plot_path
-
-    return {
-        "type": "csv_result",          # CSV든 XLSX든 내부 타입은 통일
-        "source_format": "csv",
-        "filename": filename,
-        "blocks": blocks,
-        "text_chunks": text_summaries,
-        "plots": plots,
-        "spectrum_plot": first_plot,
-    }
-
-
-
-
-
-def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> dict:
-    """
-    XLSX 파일을 멀티블럭으로 파싱.
-    CSV와 마찬가지로 type은 csv_result로 통일해서
-    나머지 파이프라인이 그대로 재사용되게 함.
-    """
-    import os
-    import pandas as pd
-
-    xlsx_path = os.path.join(tmp_dir, filename)
-    with open(xlsx_path, "wb") as f:
-        f.write(raw)
-
-    sheets_dict = pd.read_excel(xlsx_path, sheet_name=None, header=None)
-
-    sheet_results = []
-    text_summaries = []
-    plots = []
-    first_plot = None
-
-    for sheet_name, df in sheets_dict.items():
-        blocks_info = split_dataframe_into_blocks(df)
-        blocks = []
-
-        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-            sub = df.iloc[r0:r1+1, c0:c1+1]
-            table = infer_table_from_block(sub)
-            if table.empty:
-                continue
-
-            blocks.append({
-                "block_id": idx,
-                "row_range": (r0, r1),
-                "col_range": (c0, c1),
-                "table": table,
-            })
-
-            preview = table.head(10)
-            txt = f"[XLSX sheet={sheet_name} block={idx}]\n" + preview.to_csv(index=False)
-            text_summaries.append(txt)
-
-            # ★ 여기서 tmp_dir 사용해서 플롯 생성
-            plot_path = try_make_spectrum_plot(
-                table,
-                f"{os.path.splitext(filename)[0]}_sheet{sheet_name}_blk{idx}",
-                tmp_dir,
-            )
-            if plot_path:
-                plots.append(plot_path)
-                if first_plot is None:
-                    first_plot = plot_path
-
-        sheet_results.append({
-            "sheet_name": sheet_name,
-            "blocks": blocks,
-        })
-
-    return {
-        "type": "csv_result",          # 내부 타입은 csv_result로 통일
-        "source_format": "xlsx",
-        "filename": filename,
-        "sheets": sheet_results,
-        "text_chunks": text_summaries,
-        "plots": plots,
-        "spectrum_plot": first_plot,
-    }
-
-
-
-
-
-import os
-import pandas as pd
-
-def parse_uploaded_file(filename: str, raw: bytes, tmp_dir: str) -> dict | None:
-    """
-    업로드된 한 개 파일을 형식에 맞게 파싱해서 dict로 돌려준다.
-    - pdf, pptx, 이미지, csv, xlsx, doc/docx 등
-    - 실패하면 None
-    """
-    ext = filename.lower()
-
+import numpy as np
+from scipy.signal import find_peaks
+import cv2
+import ollama
+
+# --- 설정 및 모델 ---
+app = FastAPI(title="A6000 AI Analyst")
+
+# CORS 설정 (혹시 모를 외부 접속 대비)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 분석 엔진 (축약된 핵심 로직) ---
+
+async def analyze_spectrum(content: bytes, filename: str):
+    """스펙트럼 분석 (SciPy + LLM)"""
     try:
-        if ext.endswith(".pdf"):
-            print(f"[DEBUG] parse_pdf_local: {filename}")
-            return parse_pdf_local(raw, filename, tmp_dir)
+        # 1. 데이터 로드 (CSV/TXT 가정)
+        try:
+            df = pd.read_csv(io.BytesIO(content))
+        except:
+            df = pd.read_csv(io.BytesIO(content), delimiter='\t')
+            
+        # 데이터가 숫자가 아닌 경우 등 예외처리 필요하지만 데모를 위해 생략
+        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
+        x = df.iloc[:, 0].values if df.shape[1] > 1 else np.arange(len(y))
+        
+        # 2. 피크 검출
+        peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
+        peak_vals = [{"x": float(x[p]), "y": float(y[p])} for p in peaks]
+        
+        # 3. 차트용 데이터 (다운샘플링하여 전송량 감소)
+        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::5], y[::5])]
 
-        elif ext.endswith(".pptx"):
-            print(f"[DEBUG] parse_pptx_local: {filename}")
-            return parse_pptx_local(raw, filename, tmp_dir)
-
-        elif ext.endswith(".csv"):
-            print(f"[DEBUG] parse_csv_multi_blocks: {filename}")
-            return parse_csv_multi_blocks(raw, filename, tmp_dir)
-
-        elif ext.endswith(".xlsx"):
-            print(f"[DEBUG] parse_xlsx_multi_blocks: {filename}")
-            return parse_xlsx_multi_blocks(raw, filename, tmp_dir)
-
-        elif ext.endswith(".docx") or ext.endswith(".doc"):
-            print(f"[DEBUG] parse_doc_like: {filename}")
-            return parse_doc_like(raw, filename, tmp_dir)
-
-        elif ext.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")):
-            # 이미지 업로드용
-            path = os.path.join(tmp_dir, filename)
-            with open(path, "wb") as f:
-                f.write(raw)
-            print(f"[DEBUG] image_result: {filename}")
-            return {
-                "type": "image_result",
-                "filename": filename,
-                "path": path,
-            }
-
-        else:
-            print(f"[WARN] unknown file type: {filename}")
-            return {
-                "type": "unknown",
-                "filename": filename,
-            }
-
+        return {
+            "type": "spectrum",
+            "filename": filename,
+            "summary": f"Detected {len(peaks)} peaks.",
+            "chart_data": chart_data,
+            "peaks": peak_vals
+        }
     except Exception as e:
-        print(f"[ERROR] parse_uploaded_file 실패: {filename} - {e}")
-        return None
+        return {"type": "error", "filename": filename, "msg": str(e)}
 
+async def analyze_image(content: bytes, filename: str):
+    """이미지 분석 (Vision LLM)"""
+    try:
+        # Vision LLM (Llava or Qwen) 호출
+        # A6000 환경이므로 base64 변환 후 로컬 Ollama 호출
+        img_b64 = base64.b64encode(content).decode('utf-8')
+        
+        # 실제 환경에서는 'llava' 또는 'qwen2-vl' 모델명 사용
+        response = await asyncio.to_thread(
+            ollama.chat,
+            model="llava", 
+            messages=[{
+                'role': 'user',
+                'content': "Describe this scientific image in detail. Identify defects or key features.",
+                'images': [img_b64]
+            }]
+        )
+        
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": response['message']['content'],
+            "image_b64": img_b64 # 화면 표시용
+        }
+    except Exception as e:
+        # 모델이 없을 경우 대비한 Mock 응답
+        return {"type": "image", "filename": filename, "summary": f"Image analyzed (Mock: Ensure ollama is running). Error: {e}", "image_b64": img_b64}
 
+# --- 라우터 ---
 
+@app.post("/api/analyze")
+async def analyze_files(files: List[UploadFile] = File(...)):
+    """다중 파일 업로드 및 비동기 병렬 분석"""
+    tasks = []
+    for file in files:
+        content = await file.read()
+        fname = file.filename.lower()
+        
+        if fname.endswith(('.csv', '.txt', '.xlsx')):
+            tasks.append(analyze_spectrum(content, file.filename))
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif')):
+            tasks.append(analyze_image(content, file.filename))
+        # PDF/PPT 로직 추가 가능
+            
+    results = await asyncio.gather(*tasks)
+    
+    # 종합 리포트 생성 (Text LLM)
+    context = "\n".join([f"- {r.get('filename')}: {r.get('summary')}" for r in results if 'summary' in r])
+    
+    final_report = "종합 분석을 진행할 수 없습니다. (Ollama 연결 실패)"
+    try:
+        res = await asyncio.to_thread(
+            ollama.chat,
+            model="llama3",
+            messages=[{'role': 'user', 'content': f"Analyze these scientific findings into a report:\n{context}"}]
+        )
+        final_report = res['message']['content']
+    except:
+        pass
 
+    return {"results": results, "final_report": final_report}
 
+# ★ 핵심: 루트 경로 접속 시 HTML 파일 서빙
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    # 같은 폴더에 있는 index.html을 읽어서 반환
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return "index.html 파일을 찾을 수 없습니다."
 
-parsed_files: list[dict] = []
-
-print("DEBUG === start parsing uploads ===")
-for up in files:  # 여기서 'files'는 FastAPI UploadFile 리스트라고 가정
-    raw = await up.read()
-    name = up.filename
-    print(f"  [DEBUG upload] {name}, size={len(raw)} bytes")
-
-    parsed = parse_uploaded_file(name, raw, tmp_dir)
-    if parsed:
-        print(f"  [DEBUG parsed] {parsed.get('filename')} -> type={parsed.get('type')} source={parsed.get('source_format')}")
-        parsed_files.append(parsed)
-    else:
-        print(f"  [DEBUG parsed] {name} -> None (parse 실패)")
-
-print("DEBUG === parsed_files length:", len(parsed_files))
-
-
-
-
-
-
-
-
-
-
-
-import io
-
-def parse_csv_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> dict:
-    text = raw.decode("utf-8", errors="ignore")
-    df = pd.read_csv(io.StringIO(text), header=None)
-
-    blocks_info = split_dataframe_into_blocks(df)
-    blocks = []
-    text_summaries = []
-    plots = []
-    first_plot = None
-
-    for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-        sub = df.iloc[r0:r1+1, c0:c1+1]
-        table = infer_table_from_block(sub)
-        if table.empty:
-            continue
-
-        blocks.append({
-            "block_id": idx,
-            "row_range": (r0, r1),
-            "col_range": (c0, c1),
-            "table": table,
-        })
-
-        preview = table.head(10)
-        txt = f"[CSV block={idx}]\n" + preview.to_csv(index=False)
-        text_summaries.append(txt)
-
-        if tmp_dir:
-            plot_path = try_make_spectrum_plot(
-                table,
-                f"{os.path.splitext(filename)[0]}_blk{idx}",
-                tmp_dir,
-            )
-            if plot_path:
-                plots.append(plot_path)
-                if first_plot is None:
-                    first_plot = plot_path
-
-    return {
-        "type": "csv_result",
-        "source_format": "csv",
-        "filename": filename,
-        "blocks": blocks,
-        "text_chunks": text_summaries,
-        "plots": plots,
-        "spectrum_plot": first_plot,
-    }
-
-
-
-
-
-
-
-
-
-def parse_xlsx_multi_blocks(raw: bytes, filename: str, tmp_dir: str) -> dict:
-    xlsx_path = os.path.join(tmp_dir, filename)
-    with open(xlsx_path, "wb") as f:
-        f.write(raw)
-
-    sheets_dict = pd.read_excel(xlsx_path, sheet_name=None, header=None)
-
-    sheet_results = []
-    text_summaries = []
-    plots = []
-    first_plot = None
-
-    for sheet_name, df in sheets_dict.items():
-        blocks_info = split_dataframe_into_blocks(df)
-        blocks = []
-
-        for idx, (r0, r1, c0, c1) in enumerate(blocks_info, start=1):
-            sub = df.iloc[r0:r1+1, c0:c1+1]
-            table = infer_table_from_block(sub)
-            if table.empty:
-                continue
-
-            blocks.append({
-                "block_id": idx,
-                "row_range": (r0, r1),
-                "col_range": (c0, c1),
-                "table": table,
-            })
-
-            preview = table.head(10)
-            txt = f"[XLSX sheet={sheet_name} block={idx}]\n" + preview.to_csv(index=False)
-            text_summaries.append(txt)
-
-            plot_path = try_make_spectrum_plot(
-                table,
-                f"{os.path.splitext(filename)[0]}_sheet{sheet_name}_blk{idx}",
-                tmp_dir,
-            )
-            if plot_path:
-                plots.append(plot_path)
-                if first_plot is None:
-                    first_plot = plot_path
-
-        sheet_results.append({
-            "sheet_name": sheet_name,
-            "blocks": blocks,
-        })
-
-    return {
-        "type": "csv_result",          # csv/xlsx 내부 타입 통일
-        "source_format": "xlsx",
-        "filename": filename,
-        "sheets": sheet_results,
-        "text_chunks": text_summaries,
-        "plots": plots,
-        "spectrum_plot": first_plot,
-    }
-
-
-
-
-
-
-print("DEBUG after parsing:")
-for f in parsed_files:
-    print(
-        f"  - {f['filename']}: "
-        f"type={f.get('type')}, "
-        f"source={f.get('source_format')}, "
-        f"text_chunks={len(f.get('text_chunks') or [])}, "
-        f"spectrum_plot={f.get('spectrum_plot')}, "
-        f"plots={f.get('plots')}"
-    )
-
-parsed_files = await enrich_items_with_mm(parsed_files)
-
-print("DEBUG after enrich:")
-for f in parsed_files:
-    print(
-        f"  - {f['filename']}: "
-        f"type={f.get('type')}, "
-        f"source={f.get('source_format')}, "
-        f"text_chunks={len(f.get('text_chunks') or [])}, "
-        f"spectrum_plot={f.get('spectrum_plot')}, "
-        f"plots={f.get('plots')}"
-    )
-
-report_text = await generate_report_text(meta, parsed_files)
-pdf_bytes = render_pdf(report_text, parsed_files, tmp_dir)
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    import uvicorn
+    # A6000 서버 IP로 접속 가능하게 host='0.0.0.0' 설정
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
