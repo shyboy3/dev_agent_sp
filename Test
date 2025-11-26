@@ -491,5 +491,61 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
+# ... (위쪽 import 부분은 그대로 유지) ...
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print(f"🚀 Starting A6000 Analysis Server (Ollama Mode)")
+    print(f"🎯 Vision Model: {VISION_MODEL}")
+    print(f"🎯 Text Model:   {TEXT_MODEL}")
+    
+    # 연결 테스트 및 모델 확인 로직 (안전하게 수정됨)
+    try:
+        print(f"📡 Connecting to Ollama at {OLLAMA_HOST}...")
+        
+        # 1. 리스트 가져오기
+        response = ollama_client.list()
+        
+        # 2. 모델 리스트 추출 (구조 변화에 대응)
+        # response가 dict라면 'models' 키를 찾고, 아니면 response 자체를 리스트로 가정
+        raw_models = response.get('models', []) if isinstance(response, dict) else response
+
+        # 3. 설치된 모델 이름 추출 (name 키가 없으면 model 키를 사용)
+        installed_models = []
+        for m in raw_models:
+            # m이 딕셔너리인 경우
+            if isinstance(m, dict):
+                # 'name'이 있으면 그걸 쓰고, 없으면 'model'을 씀
+                m_name = m.get('name') or m.get('model')
+            else:
+                # m이 객체(Object)인 경우 속성으로 접근
+                m_name = getattr(m, 'name', None) or getattr(m, 'model', None)
+            
+            if m_name:
+                installed_models.append(m_name)
+        
+        print(f"📋 Installed Models: {installed_models}")
+
+        # 4. 모델 존재 여부 체크
+        # 정확히 일치하지 않아도 부분 일치하면 통과 (태그 버전 차이 등 방지)
+        is_vision_ready = any(VISION_MODEL in m for m in installed_models)
+        
+        if not is_vision_ready:
+            print(f"⚠️ Warning: Vision model '{VISION_MODEL}' might not be pulled yet.")
+            print(f"   (Detected models: {installed_models})")
+            print(f"   If execution fails, run: ollama pull {VISION_MODEL}")
+        else:
+            print(f"✅ Vision Model '{VISION_MODEL}' is ready.")
+            
+    except Exception as e:
+        # 에러가 나도 서버가 꺼지지 않도록 경고만 출력하고 넘어감
+        print(f"⚠️ Warning: Check Ollama Connection (Error: {e})")
+        print("   Proceeding anyway... (Server will try to connect on demand)")
+    
+    yield
+    print("👋 Shutting down server...")
+
+# ... (아래쪽 app = FastAPI(...) 부터는 그대로 유지) ...
+
 
 
