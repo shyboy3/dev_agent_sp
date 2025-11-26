@@ -548,4 +548,710 @@ async def lifespan(app: FastAPI):
 # ... (아래쪽 app = FastAPI(...) 부터는 그대로 유지) ...
 
 
+프로페셔널 코드
+
+import os
+import io
+import asyncio
+import base64
+import json
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import pandas as pd
+import numpy as np
+from scipy.signal import find_peaks
+from ollama import Client 
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# --- 0. 사용자 환경 설정 ---
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
+
+# 모델 설정 (보유하신 모델명으로 정확히 기입)
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# --- 1. 유틸리티 함수 ---
+
+def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+    """
+    엑셀 시트 내에서 빈 행/열로 구분된 데이터 블록(Island)들을 찾아내는 함수
+    """
+    blocks = []
+    if df.empty:
+        return blocks
+
+    # 1. 빈 행(all NaN) 기준으로 나눔
+    # isnull().all(axis=1) -> 행 전체가 비었으면 True
+    # diff() != 0 -> 상태가 변하는 지점(데이터 <-> 빈공간) 찾기
+    mask = df.isnull().all(axis=1)
+    # 데이터가 있는 행들의 그룹을 찾음
+    data_rows = df[~mask]
+    
+    if data_rows.empty:
+        return blocks
+
+    # 연속된 인덱스를 그룹화하여 블록 추출
+    # (인덱스 차이가 1보다 크면 블록이 끊긴 것)
+    groups = (data_rows.index.to_series().diff() > 1).cumsum()
+    
+    for _, group in data_rows.groupby(groups):
+        # 2. 각 행 블록 내에서 빈 열(all NaN) 제거 (Trim)
+        block = group.dropna(axis=1, how='all')
+        if not block.empty and block.shape[0] > 1 and block.shape[1] > 1:
+            blocks.append(block)
+            
+    return blocks
+
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    """Ollama Vision 모델 호출"""
+    try:
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
+        )
+        return response['message']['content']
+    except Exception as e:
+        return f"[Vision Error] {e}"
+
+# --- 2. 파서 엔진 (Parsers) ---
+
+async def parse_excel_advanced(content: bytes, filename: str):
+    """멀티 시트, 멀티 블록 엑셀 파싱"""
+    results = []
+    try:
+        # 모든 시트 로드
+        xls = pd.ExcelFile(io.BytesIO(content))
+        
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            
+            # 스마트 블록 감지
+            blocks = detect_excel_blocks(df)
+            
+            for i, block in enumerate(blocks):
+                # 블록의 첫 행을 헤더로 가정하고 정리
+                # 실제 데이터 분석 (여기서는 간단히 수치형 데이터만 추출하여 차트화)
+                # 복잡한 로직 대신, LLM에게 Raw Text를 줍니다.
+                
+                # DataFrame to String
+                block_str = block.to_csv(index=False, header=False)
+                
+                # 차트용 데이터 추출 (가능하다면)
+                chart_data = []
+                try:
+                    # 숫자만 있는 컬럼 찾기
+                    numeric_block = block.apply(pd.to_numeric, errors='coerce')
+                    valid_cols = numeric_block.dropna(axis=1, how='all')
+                    if not valid_cols.empty and valid_cols.shape[0] > 2:
+                        # 첫번째 컬럼 X, 두번째 컬럼 Y 가정 (간이 로직)
+                        x = valid_cols.iloc[:, 0].fillna(0).values
+                        y = valid_cols.iloc[:, 1].fillna(0).values if valid_cols.shape[1] > 1 else x
+                        # 샘플링
+                        step = max(1, len(x) // 100)
+                        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
+                except:
+                    pass
+
+                results.append({
+                    "type": "excel_block",
+                    "filename": f"{filename} (Sheet: {sheet_name}, Block {i+1})",
+                    "summary": f"**Data Block {i+1} in {sheet_name}**\nRaw Data Preview:\n{block_str[:500]}...",
+                    "raw_data": block_str[:2000], # LLM Context용
+                    "chart_data": chart_data
+                })
+                
+    except Exception as e:
+        return [{"type": "error", "filename": filename, "msg": str(e)}]
+        
+    return results
+
+async def parse_ppt_advanced(content: bytes, filename: str):
+    """PPT 텍스트 및 이미지 추출"""
+    slides_data = []
+    try:
+        prs = Presentation(io.BytesIO(content))
+        
+        full_text_summary = ""
+        
+        for i, slide in enumerate(prs.slides):
+            slide_text = []
+            slide_images = []
+            
+            # Shape 순회
+            for shape in slide.shapes:
+                # 1. 텍스트 추출
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_text.append(shape.text)
+                
+                # 2. 이미지 추출
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    image_blob = shape.image.blob
+                    # Vision LLM 분석
+                    desc = await analyze_vision_ollama(image_blob, "Describe this chart or image in the presentation slide.")
+                    slide_images.append(desc)
+
+            # 슬라이드 요약
+            combined_text = "\n".join(slide_text)
+            combined_images = "\n".join([f"[Image Analysis]: {img}" for img in slide_images])
+            
+            slide_content = f"### Slide {i+1}\n**Text:**\n{combined_text}\n\n**Visuals:**\n{combined_images}\n"
+            full_text_summary += slide_content
+            
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+    return {
+        "type": "ppt",
+        "filename": filename,
+        "summary": f"**PPT Presentation Analysis**\n{full_text_summary}",
+        "raw_context": full_text_summary
+    }
+
+async def parse_pdf_full(content: bytes, filename: str):
+    """PDF 전체 페이지 파싱"""
+    try:
+        # 페이지 제한 없이 변환 (메모리 주의: 너무 크면 나눠서 해야 함)
+        # 300dpi로 변환
+        images = convert_from_bytes(content, dpi=200, fmt='jpeg')
+        
+        full_text = ""
+        preview_image_b64 = None
+
+        print(f"📄 PDF Processing: {filename} ({len(images)} pages)")
+
+        for i, img in enumerate(images):
+            # 썸네일 (첫장)
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            img_bytes = buffered.getvalue()
+            if i == 0:
+                preview_image_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            # Vision Analysis
+            page_desc = await analyze_vision_ollama(
+                img_bytes, 
+                "Transcribe this page into Markdown. Preserve tables and headers."
+            )
+            full_text += f"\n--- Page {i+1} ---\n{page_desc}\n"
+
+        return {
+            "type": "image", # UI 표시는 이미지 타입 활용
+            "filename": filename,
+            "summary": f"**PDF Full Analysis**\n{full_text}",
+            "image_b64": preview_image_b64,
+            "raw_context": full_text
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
+
+async def parse_spectrum(content: bytes, filename: str):
+    """스펙트럼 CSV/TXT 파싱 (기존 로직)"""
+    try:
+        try:
+            df = pd.read_csv(io.BytesIO(content))
+        except:
+            df = pd.read_csv(io.BytesIO(content), delimiter='\t')
+            
+        x = df.iloc[:, 0].values
+        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
+        peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
+        
+        step = max(1, len(x) // 500)
+        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
+        
+        return {
+            "type": "spectrum",
+            "filename": filename,
+            "summary": f"Spectrum Data: {len(peaks)} peaks detected.",
+            "chart_data": chart_data,
+            "raw_context": f"Spectrum File {filename}. Peaks at indices: {peaks}. Max intensity: {np.max(y)}"
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_image_file(content: bytes, filename: str):
+    """일반 이미지 (TIF, PNG 등)"""
+    try:
+        # TIF 등 호환성을 위해 PIL로 열어서 JPEG로 변환 후 전송
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        img_bytes = buffered.getvalue()
+        
+        desc = await analyze_vision_ollama(img_bytes, "Analyze this scientific image. Focus on defects, patterns, and anomalies.")
+        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+        
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": f"**Image Analysis**\n{desc}",
+            "image_b64": img_b64,
+            "raw_context": f"Image File {filename} Analysis: {desc}"
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+# --- 3. 메인 라우터 ---
+
+app = FastAPI(title="Professional Analyst")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.post("/api/analyze")
+async def analyze_orchestrator(
+    files: List[UploadFile] = File(...),
+    custom_prompt: Optional[str] = Form(""),
+    language: str = Form("korean") # 'korean' or 'english'
+):
+    print(f"🚀 Analyzing {len(files)} files. Language: {language}")
+    
+    tasks = []
+    
+    for file in files:
+        content = await file.read()
+        fname = file.filename.lower()
+        
+        if fname.endswith(('.xlsx', '.xls')):
+            # 엑셀은 비동기 래퍼가 필요하나 여기선 await 바로 호출 (복잡도 감소)
+            # 결과가 리스트(여러 블록)로 옴
+            excel_results = await parse_excel_advanced(content, file.filename)
+            # 리스트를 풀어서 결과에 넣기 위해 임시 저장
+            for res in excel_results:
+                # Task로 감싸는게 좋으나, 구조상 결과값 직접 처리
+                pass 
+            # (구조 통일을 위해 아래 gather에서는 제외하고 별도 처리 필요하지만, 
+            #  여기서는 간단히 tasks에 람다로 넣거나 직접 처리)
+            #  -> 개선: parse_excel_advanced 자체를 async로 만들었으므로
+            #     Excel은 예외적으로 여기서 바로 처리해서 results 리스트에 넣는 방식 사용
+            pass 
+
+        elif fname.endswith(('.ppt', '.pptx')):
+            tasks.append(parse_ppt_advanced(content, file.filename))
+            
+        elif fname.endswith('.pdf'):
+            tasks.append(parse_pdf_full(content, file.filename))
+            
+        elif fname.endswith(('.csv', '.txt')):
+            tasks.append(parse_spectrum(content, file.filename))
+            
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            tasks.append(parse_image_file(content, file.filename))
+
+    # 1. 엑셀 외 파일들 병렬 처리
+    results = await asyncio.gather(*tasks)
+    results = list(results) # 튜플 -> 리스트
+    
+    # 2. 엑셀 파일 처리 (파일 포인터를 다시 읽어야 하므로 위 루프에서 읽은 content 사용 필요)
+    #    -> 위 루프 구조상 content가 소실되므로, 실제 구현에선 파일을 메모리에 읽어두고 분기해야 함.
+    #    -> **수정된 로직**: 파일을 먼저 다 읽어서 메모리에 두고 분기.
+    
+    # (코드 간소화를 위해 재작성 - 실제 실행 로직)
+    final_results = []
+    
+    # 파일을 다시 순회하며 처리 (메모리에 content가 있으므로 가능)
+    # 위 tasks 루프를 대체합니다.
+    files_content = []
+    for file in files:
+        await file.seek(0)
+        files_content.append({"name": file.filename, "content": await file.read()})
+    
+    async_tasks = []
+    for f in files_content:
+        fname = f["name"].lower()
+        content = f["content"]
+        
+        if fname.endswith(('.xlsx', '.xls')):
+            # 엑셀은 결과가 리스트로 나옴 -> 별도 처리
+            blocks = await parse_excel_advanced(content, f["name"])
+            final_results.extend(blocks)
+        elif fname.endswith(('.ppt', '.pptx')):
+            async_tasks.append(parse_ppt_advanced(content, f["name"]))
+        elif fname.endswith('.pdf'):
+            async_tasks.append(parse_pdf_full(content, f["name"]))
+        elif fname.endswith(('.csv', '.txt')):
+            async_tasks.append(parse_spectrum(content, f["name"]))
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            async_tasks.append(parse_image_file(content, f["name"]))
+
+    # 나머지 비동기 작업 실행
+    other_results = await asyncio.gather(*async_tasks)
+    final_results.extend(list(other_results))
+    
+    # --- 종합 리포트 생성 (Synthesis) ---
+    
+    # 에러 제외하고 컨텍스트 수집
+    valid_data = [r for r in final_results if r.get("type") != "error"]
+    
+    context_text = ""
+    for item in valid_data:
+        # raw_context가 있으면 그걸 쓰고, 없으면 summary 사용
+        text_content = item.get("raw_context", item.get("summary", ""))
+        context_text += f"\n=== Source File: {item['filename']} ===\n{text_content[:5000]}\n" # 너무 길면 자름
+
+    # 언어 설정
+    lang_instruction = "Write the report in **Korean**." if language == 'korean' else "Write the report in **English**."
+    
+    system_prompt = f"""
+    You are a Senior Data Scientist. Synthesize the following multi-modal analysis results into a comprehensive research report.
+    
+    [Instructions]
+    1. {lang_instruction}
+    2. Use Markdown tables to summarize numerical data or comparisons.
+    3. Interpret the relationship between different files (e.g., Image defects vs Spectrum peaks).
+    4. Consider the user's additional request: "{custom_prompt}"
+    5. The report structure should include: Executive Summary, Detailed Analysis (per data source), Integrated Discussion, and Conclusion.
+    """
+    
+    final_report = "분석된 데이터가 없습니다."
+    
+    if context_text:
+        try:
+            print("📝 Generating Final Report...")
+            res = await asyncio.to_thread(
+                ollama_client.chat,
+                model=TEXT_MODEL,
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': f"Here is the raw analysis data:\n{context_text}"}
+                ]
+            )
+            final_report = res['message']['content']
+        except Exception as e:
+            final_report = f"Report Generation Failed: {e}"
+
+    return {
+        "results": final_results,
+        "final_report": final_report
+    }
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return "<h1>index.html not found</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+프로페셔널 프론트 엔드
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced AI Analyst Pro</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- PDF Export Lib -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .prose table { width: 100%; border-collapse: collapse; margin: 1em 0; }
+        .prose th, .prose td { border: 1px solid #e2e8f0; padding: 8px; text-align: left; }
+        .prose th { background-color: #f8fafc; font-weight: 600; }
+        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #4f46e5; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+    <div id="app" class="min-h-screen p-6">
+        
+        <!-- Header -->
+        <header class="max-w-7xl mx-auto mb-8 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="bg-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-200">
+                    <i data-lucide="layers" class="w-8 h-8 text-white"></i>
+                </div>
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-900 tracking-tight">AI Multi-modal Analyst Pro</h1>
+                    <p class="text-sm text-slate-500">Excel Blocks • PPT • PDF • Image • Spectrum Synthesis</p>
+                </div>
+            </div>
+            <div class="flex gap-2">
+                <span class="px-3 py-1 bg-white border border-slate-200 rounded-full text-xs font-semibold text-slate-600 shadow-sm flex items-center gap-2">
+                    <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span> Online
+                </span>
+            </div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
+            
+            <!-- Left Panel: Controls (Col 4) -->
+            <div class="lg:col-span-4 space-y-6">
+                
+                <!-- 1. Upload Zone -->
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+                    <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-slate-800">
+                        <i data-lucide="upload-cloud" class="w-5 h-5 text-indigo-500"></i> Files
+                    </h2>
+                    
+                    <div 
+                        class="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center hover:border-indigo-400 hover:bg-indigo-50/30 transition-all cursor-pointer group"
+                        @dragover.prevent
+                        @drop.prevent="handleDrop"
+                        @click="$refs.fileInput.click()"
+                    >
+                        <input type="file" ref="fileInput" multiple class="hidden" @change="handleFileSelect">
+                        <div class="bg-indigo-50 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
+                            <i data-lucide="plus" class="w-6 h-6 text-indigo-600"></i>
+                        </div>
+                        <p class="font-semibold text-slate-700">Click or Drag files here</p>
+                        <p class="text-xs text-slate-400 mt-1">Supports XLSX, PPTX, PDF, CSV, Images</p>
+                    </div>
+
+                    <!-- File List -->
+                    <div v-if="files.length > 0" class="mt-4 space-y-2">
+                        <div v-for="(file, idx) in files" :key="idx" class="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-100 text-sm">
+                            <div class="flex items-center gap-3 overflow-hidden">
+                                <i :data-lucide="getFileIcon(file.name)" class="w-4 h-4 text-slate-400 flex-shrink-0"></i>
+                                <span class="truncate">{{ file.name }}</span>
+                            </div>
+                            <button @click.stop="removeFile(idx)" class="text-slate-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. Analysis Options -->
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+                    <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-slate-800">
+                        <i data-lucide="sliders" class="w-5 h-5 text-indigo-500"></i> Options
+                    </h2>
+                    
+                    <!-- Language -->
+                    <div class="mb-5">
+                        <label class="block text-xs font-semibold text-slate-500 uppercase mb-2">Report Language</label>
+                        <div class="flex bg-slate-100 p-1 rounded-lg">
+                            <button 
+                                @click="language = 'korean'"
+                                :class="{'bg-white shadow-sm text-indigo-600': language === 'korean', 'text-slate-500': language !== 'korean'}"
+                                class="flex-1 py-1.5 text-sm font-medium rounded-md transition-all"
+                            >한글 (Korean)</button>
+                            <button 
+                                @click="language = 'english'"
+                                :class="{'bg-white shadow-sm text-indigo-600': language === 'english', 'text-slate-500': language !== 'english'}"
+                                class="flex-1 py-1.5 text-sm font-medium rounded-md transition-all"
+                            >English</button>
+                        </div>
+                    </div>
+
+                    <!-- Custom Prompt -->
+                    <div class="mb-5">
+                        <label class="block text-xs font-semibold text-slate-500 uppercase mb-2">Additional Instructions</label>
+                        <textarea 
+                            v-model="customPrompt" 
+                            class="w-full p-3 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none resize-none"
+                            rows="3"
+                            placeholder="예: '3페이지 표를 중점적으로 분석해줘', '결론을 먼저 요약해줘'..."
+                        ></textarea>
+                    </div>
+
+                    <!-- Action Button -->
+                    <button 
+                        @click="analyze" 
+                        :disabled="files.length === 0 || isAnalyzing"
+                        class="w-full py-3.5 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white rounded-xl font-bold shadow-lg shadow-indigo-200 flex justify-center items-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none"
+                    >
+                        <div v-if="isAnalyzing" class="loader"></div>
+                        <span v-else>Generate Analysis Report</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Right Panel: Report (Col 8) -->
+            <div class="lg:col-span-8">
+                
+                <!-- Placeholder -->
+                <div v-if="!result && !isAnalyzing" class="h-full min-h-[500px] bg-white rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center justify-center text-slate-300">
+                    <i data-lucide="file-bar-chart-2" class="w-24 h-24 mb-6 opacity-20"></i>
+                    <p class="text-lg font-medium text-slate-400">Ready to Analyze</p>
+                    <p class="text-sm mt-2">Upload files and configure options to start.</p>
+                </div>
+
+                <!-- Loading State -->
+                <div v-if="isAnalyzing" class="h-full min-h-[500px] bg-white rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center justify-center p-12 text-center">
+                    <div class="w-16 h-16 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin mb-6"></div>
+                    <h3 class="text-xl font-bold text-slate-800">Processing Data...</h3>
+                    <p class="text-slate-500 mt-2 max-w-md">Parsing complex Excel blocks, scanning PDF/PPT pages, and synthesizing insights with LLM. This may take a moment.</p>
+                </div>
+
+                <!-- Report View -->
+                <div v-if="result" class="space-y-6 animate-fade-in-up">
+                    
+                    <!-- Toolbar -->
+                    <div class="flex justify-end gap-2">
+                        <button @click="downloadPDF" class="px-4 py-2 bg-slate-800 text-white text-sm font-medium rounded-lg hover:bg-slate-900 flex items-center gap-2 shadow-md transition-all">
+                            <i data-lucide="download"></i> Save as PDF
+                        </button>
+                    </div>
+
+                    <!-- Report Content (Print Target) -->
+                    <div id="report-content" class="bg-white p-10 rounded-2xl shadow-sm border border-slate-100">
+                        
+                        <!-- Header for PDF -->
+                        <div class="border-b border-slate-200 pb-6 mb-8">
+                            <h1 class="text-3xl font-bold text-slate-900 mb-2">Comprehensive Analysis Report</h1>
+                            <p class="text-slate-500 text-sm">Generated by AI Analyst Pro • {{ new Date().toLocaleDateString() }}</p>
+                        </div>
+
+                        <!-- 1. LLM Final Synthesis -->
+                        <section class="mb-12">
+                            <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center gap-2">
+                                <i data-lucide="sparkles"></i> Executive Synthesis
+                            </h2>
+                            <div class="prose prose-slate prose-lg max-w-none text-slate-700 leading-relaxed" v-html="renderMarkdown(result.final_report)"></div>
+                        </section>
+
+                        <!-- 2. Individual Source Data -->
+                        <section>
+                            <h2 class="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2 border-t pt-8">
+                                <i data-lucide="database"></i> Source Data Details
+                            </h2>
+
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-8 p-6 bg-slate-50 rounded-xl border border-slate-100 break-inside-avoid">
+                                
+                                <!-- Header -->
+                                <div class="flex items-center gap-2 mb-4">
+                                    <span class="px-2 py-1 bg-white border border-slate-200 rounded text-xs font-bold uppercase text-slate-500">{{ item.type }}</span>
+                                    <h3 class="font-bold text-slate-700">{{ item.filename }}</h3>
+                                </div>
+
+                                <!-- Content based on Type -->
+                                
+                                <!-- A. Spectrum / Excel Chart -->
+                                <div v-if="item.chart_data && item.chart_data.length > 0" class="mb-4">
+                                    <div :id="'chart-' + idx" class="w-full h-64 bg-white rounded border border-slate-200"></div>
+                                </div>
+
+                                <!-- B. Image / PDF Preview -->
+                                <div v-if="item.image_b64" class="mb-4">
+                                    <img :src="'data:image/jpeg;base64,' + item.image_b64" class="max-h-80 rounded border border-slate-200 shadow-sm mx-auto">
+                                </div>
+
+                                <!-- Summary Text -->
+                                <div class="text-sm text-slate-600 bg-white p-4 rounded border border-slate-200">
+                                    <div class="prose prose-sm max-w-none" v-html="renderMarkdown(item.summary)"></div>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const { createApp, ref, nextTick } = Vue;
+
+        createApp({
+            setup() {
+                const files = ref([]);
+                const isAnalyzing = ref(false);
+                const result = ref(null);
+                const customPrompt = ref("");
+                const language = ref("korean");
+
+                const handleFileSelect = (e) => files.value.push(...Array.from(e.target.files));
+                const handleDrop = (e) => files.value.push(...Array.from(e.dataTransfer.files));
+                const removeFile = (i) => files.value.splice(i, 1);
+
+                const getFileIcon = (name) => {
+                    if (name.endsWith('.pdf')) return 'file-text';
+                    if (name.match(/\.(xlsx|xls|csv)$/)) return 'sheet';
+                    if (name.match(/\.(ppt|pptx)$/)) return 'presentation';
+                    if (name.match(/\.(png|jpg|jpeg|tif|tiff)$/)) return 'image';
+                    return 'file';
+                }
+
+                const renderMarkdown = (text) => marked.parse(text || '');
+
+                const analyze = async () => {
+                    isAnalyzing.value = true;
+                    result.value = null;
+                    
+                    const formData = new FormData();
+                    files.value.forEach(f => formData.append('files', f));
+                    formData.append('custom_prompt', customPrompt.value);
+                    formData.append('language', language.value);
+
+                    try {
+                        const res = await fetch('/api/analyze', { method: 'POST', body: formData });
+                        const data = await res.json();
+                        result.value = data;
+                        
+                        await nextTick();
+                        drawCharts(data.results);
+                        lucide.createIcons();
+                    } catch (e) {
+                        alert("Error: " + e);
+                    } finally {
+                        isAnalyzing.value = false;
+                    }
+                };
+
+                const drawCharts = (results) => {
+                    results.forEach((item, idx) => {
+                        if (item.chart_data && item.chart_data.length > 0) {
+                            const trace = {
+                                x: item.chart_data.map(d => d.x),
+                                y: item.chart_data.map(d => d.y),
+                                mode: 'lines',
+                                line: { color: '#4f46e5', width: 2 },
+                                type: 'scatter'
+                            };
+                            const layout = {
+                                margin: { t: 10, b: 30, l: 40, r: 10 },
+                                xaxis: { zeroline: false },
+                                yaxis: { zeroline: false },
+                                paper_bgcolor: 'rgba(0,0,0,0)',
+                                plot_bgcolor: 'rgba(0,0,0,0)'
+                            };
+                            Plotly.newPlot('chart-' + idx, [trace], layout, {displayModeBar: false});
+                        }
+                    });
+                };
+
+                const downloadPDF = () => {
+                    const element = document.getElementById('report-content');
+                    const opt = {
+                        margin: 10,
+                        filename: 'AI_Analysis_Report.pdf',
+                        image: { type: 'jpeg', quality: 0.98 },
+                        html2canvas: { scale: 2 },
+                        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+                    };
+                    html2pdf().set(opt).from(element).save();
+                };
+
+                setTimeout(() => lucide.createIcons(), 100);
+
+                return {
+                    files, isAnalyzing, result, customPrompt, language,
+                    handleFileSelect, handleDrop, removeFile, analyze, renderMarkdown, getFileIcon, downloadPDF
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
+
 
