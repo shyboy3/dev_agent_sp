@@ -6,6 +6,509 @@ import base64
 import json
 import re
 from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+# ==========================================
+# [1] 네트워크/보안 설정 (필수)
+# ==========================================
+# 회사 보안망(McAfee 등)이 로컬 통신(127.0.0.1)을 가로채지 못하게 강제 설정
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import pandas as pd
+import numpy as np
+
+# 과학 연산 및 이미지 처리 라이브러리
+from scipy.signal import find_peaks, savgol_filter, peak_widths
+from scipy.optimize import curve_fit
+from scipy.ndimage import label, find_objects, gaussian_filter
+from skimage.feature import blob_log  # 원자(Blob) 검출용
+import cv2
+
+from ollama import Client 
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# ==========================================
+# [2] 모델 및 서버 설정
+# ==========================================
+# 사용자 환경에 맞는 포트 및 모델명 설정
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
+
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# ==========================================
+# [3] V6 핵심: AI 적응형 프로세서 (Science Core)
+# ==========================================
+class AdaptiveProcessor:
+    
+    @staticmethod
+    def gaussian(x, amp, cen, wid):
+        return amp * np.exp(-(x-cen)**2 / (2*wid**2))
+
+    @staticmethod
+    def fit_peaks(x, y, peaks):
+        """피크 위치에 가우시안 피팅 수행"""
+        fitted_params = []
+        for p in peaks:
+            try:
+                # 초기값 추정 (Amplitude, Center, Width)
+                p0 = [y[p], x[p], 1.0]
+                window = 20
+                start, end = max(0, p-window), min(len(x), p+window)
+                if len(x[start:end]) > 3: # 데이터가 충분할 때만
+                    popt, _ = curve_fit(AdaptiveProcessor.gaussian, x[start:end], y[start:end], p0=p0, maxfev=1000)
+                    fitted_params.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
+            except:
+                pass
+        return fitted_params
+
+    @staticmethod
+    def process_spectrum(x, y, mode, goal):
+        """
+        스펙트럼 전처리 (Mode: None, Auto, AI-Adaptive)
+        """
+        log = []
+        y_proc = y.copy()
+        features = {}
+
+        # 1. Mode: None (전처리 없음)
+        if mode == "None":
+            peaks, _ = find_peaks(y, height=np.max(y)*0.05)
+            return x, y, {"peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], "log": ["Raw Data"]}
+
+        # 2. 파라미터 결정 (AI-Adaptive or Default)
+        window_length = 11
+        polyorder = 3
+        do_fitting = False
+        
+        if mode == "AI-Adaptive" and goal:
+            goal_lower = goal.lower()
+            if "노이즈" in goal_lower or "noise" in goal_lower:
+                window_length = 21 # 스무딩 강화
+                log.append("AI: Detected noise reduction goal -> Strong smoothing.")
+            if "피팅" in goal_lower or "fit" in goal_lower or "gaussian" in goal_lower:
+                do_fitting = True
+                log.append("AI: Detected fitting goal -> Gaussian fitting enabled.")
+            if "raw" in goal_lower or "날것" in goal_lower:
+                window_length = 0
+        
+        # 3. 신호 처리 수행
+        # Smoothing
+        if window_length > 3 and len(y_proc) > window_length:
+            y_proc = savgol_filter(y_proc, window_length, polyorder)
+            log.append("Applied Savitzky-Golay Filter.")
+        
+        # Baseline Correction (Simple)
+        baseline = np.percentile(y_proc, 5)
+        y_proc = y_proc - baseline
+        y_proc[y_proc < 0] = 0
+
+        # Peak Finding
+        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+        
+        # Fitting
+        fits = []
+        if do_fitting and len(peaks) > 0:
+            fits = AdaptiveProcessor.fit_peaks(x, y_proc, peaks)
+            features["fits"] = fits
+
+        # 결과 정리
+        peak_info = [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks]
+        features["peaks"] = peak_info
+        features["log"] = log
+        
+        return x, y_proc, features
+
+    @staticmethod
+    def process_image(img_bytes, mode, goal, equipment):
+        """
+        이미지 전처리 (원자 검출, 입자 분석, 노이즈 제거)
+        """
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None: return None, {}
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        stats = {}
+        processed_img = img.copy()
+        
+        if mode == "None":
+            _, buffer = cv2.imencode('.jpg', img)
+            return base64.b64encode(buffer).decode('utf-8'), {"note": "Raw Image"}
+
+        # AI 파라미터 결정
+        detect_atoms = False
+        detect_particles = False
+        denoise_strength = 3
+        
+        goal_lower = (goal or "").lower()
+        
+        # 목표 또는 장비 타입에 따른 로직 분기
+        if mode == "AI-Adaptive":
+            if "원자" in goal_lower or "atom" in goal_lower: detect_atoms = True
+            if "입자" in goal_lower or "particle" in goal_lower: detect_particles = True
+            if "노이즈" in goal_lower: denoise_strength = 9
+        
+        if equipment in ["STEM", "TEM"] and mode == "Auto": detect_atoms = True
+        if equipment in ["SEM", "Optical"] and mode == "Auto": detect_particles = True
+
+        # 1. Denoising
+        gray_blur = cv2.GaussianBlur(gray, (denoise_strength, denoise_strength), 0)
+
+        # 2. Atomic Analysis (Blob Detection - LoG)
+        if detect_atoms:
+            # 원자 검출 (scikit-image)
+            blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, num_sigma=10, threshold=0.1)
+            for blob in blobs:
+                y, x, r = blob
+                # 원자 위치에 빨간 원 그리기
+                cv2.circle(processed_img, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
+            stats["atom_count"] = len(blobs)
+            stats["method"] = "LoG (Atomic Blob Detection)"
+        
+        # 3. Particle Analysis (Watershed / Contours)
+        elif detect_particles:
+             _, thresh = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+             kernel = np.ones((3,3), np.uint8)
+             opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+             contours, _ = cv2.findContours(opening, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+             
+             # 입자 경계선 그리기 (초록색)
+             cv2.drawContours(processed_img, contours, -1, (0, 255, 0), 2)
+             
+             stats["particle_count"] = len(contours)
+             areas = [cv2.contourArea(c) for c in contours]
+             if areas: stats["avg_area"] = float(np.mean(areas))
+             stats["method"] = "Contour/Watershed"
+
+        _, buffer = cv2.imencode('.jpg', processed_img)
+        return base64.b64encode(buffer).decode('utf-8'), stats
+
+# ==========================================
+# [4] 헬퍼 함수 (Excel Island, Vision API)
+# ==========================================
+
+def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+    """엑셀 아일랜드(독립된 표) 감지"""
+    blocks = []
+    if df.empty: return blocks
+    mask = ~df.isnull().to_numpy()
+    structure = [[0,1,0], [1,1,1], [0,1,0]] # 십자가 연결 구조
+    labeled_array, num_features = label(mask, structure=structure)
+    slices = find_objects(labeled_array)
+    
+    for slice_obj in slices:
+        block = df.iloc[slice_obj]
+        # 최소 크기 필터링 (3행 2열 이상)
+        if block.shape[0] >= 3 and block.shape[1] >= 2:
+            blocks.append(block.reset_index(drop=True))
+    return blocks
+
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    """Vision LLM 호출 및 보안망 에러 필터링"""
+    try:
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
+        )
+        content = response['message']['content']
+        # 보안망 HTML 응답 감지
+        if "<script" in content or "mwg-internal" in content:
+            return "[Error: Firewall/Proxy blocked the AI connection.]"
+        return content
+    except Exception as e:
+        return f"[Vision AI Error: {e}]"
+
+# ==========================================
+# [5] 파서 (Parsers) - V4, V5, V6 통합
+# ==========================================
+
+async def parse_excel_v5(content: bytes, filename: str, equipment: str, mode: str, goal: str):
+    """엑셀 파싱 + V6 적응형 처리"""
+    results = []
+    try:
+        xls = pd.ExcelFile(io.BytesIO(content))
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            blocks = detect_excel_blocks(df)
+            
+            for i, block in enumerate(blocks):
+                chart_data = []
+                peaks_info = []
+                fits_info = []
+                
+                try:
+                    # 숫자 데이터만 추출
+                    num_block = block.apply(pd.to_numeric, errors='coerce').dropna(how='all', axis=0).dropna(how='all', axis=1)
+                    if not num_block.empty and num_block.shape[0] > 5:
+                        x = num_block.iloc[:, 0].fillna(0).values
+                        y = num_block.iloc[:, 1].fillna(0).values if num_block.shape[1] > 1 else x
+                        
+                        # [V6] 적응형 처리
+                        x_proc, y_proc, feats = AdaptiveProcessor.process_spectrum(x, y, mode, goal)
+                        peaks_info = feats.get('peaks', [])
+                        fits_info = feats.get('fits', [])
+                        
+                        step = max(1, len(x_proc) // 150)
+                        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x_proc[::step], y_proc[::step])]
+                except:
+                    pass
+
+                raw_txt = block.to_csv(index=False, header=False)[:1000]
+                peak_str = ", ".join([f"{p['x']:.1f}" for p in peaks_info[:5]])
+                
+                results.append({
+                    "type": "excel_block",
+                    "filename": f"{filename} ({sheet_name}-{i+1})",
+                    "summary": f"Block Analysis ({equipment}): {len(peaks_info)} peaks detected.",
+                    "raw_context": f"Source: {equipment}\nPeaks Found: {peak_str}\nRaw Sample:\n{raw_txt}",
+                    "chart_data": chart_data,
+                    "fits": fits_info
+                })
+    except Exception as e:
+        return [{"type": "error", "filename": filename, "msg": str(e)}]
+    return results
+
+async def parse_image_v5(content: bytes, filename: str, lang: str, equipment: str, mode: str, goal: str):
+    """이미지 파싱 + V6 원자/입자 분석"""
+    try:
+        # 1. V6 프로세서로 이미지 전처리 및 통계 추출
+        img_b64, stats = AdaptiveProcessor.process_image(content, mode, goal, equipment)
+        
+        # 2. Vision LLM 해석
+        lang_inst = "Korean" if lang == 'korean' else "English"
+        prompt = f"""
+        Analyze this {equipment} image in {lang_inst}.
+        User Goal: {goal}.
+        CV Algorithm Stats: {stats} (e.g., Atom/Particle count).
+        Explain the scientific significance based on these stats.
+        """
+        desc = await analyze_vision_ollama(content, prompt) # 원본 이미지를 LLM에 전달
+        
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": desc,
+            "image_b64": img_b64, # 전처리된(오버레이된) 이미지 반환
+            "raw_context": f"Image ({equipment}): {desc}\nStats: {stats}"
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_spectrum_v5(content: bytes, filename: str, equipment: str, mode: str, goal: str):
+    """CSV 스펙트럼 파싱 + V6 적응형 처리"""
+    try:
+        try: df = pd.read_csv(io.BytesIO(content))
+        except: df = pd.read_csv(io.BytesIO(content), delimiter='\t')
+        
+        x = df.iloc[:, 0].values
+        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
+        
+        x_proc, y_proc, feats = AdaptiveProcessor.process_spectrum(x, y, mode, goal)
+        peaks = feats.get('peaks', [])
+        
+        step = max(1, len(x_proc) // 200)
+        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x_proc[::step], y_proc[::step])]
+        
+        return {
+            "type": "spectrum",
+            "filename": filename,
+            "summary": f"Spectrum ({equipment}): {len(peaks)} peaks.",
+            "chart_data": chart_data,
+            "raw_context": f"Spectrum Peaks: {len(peaks)} found. Stats: {feats.get('log')}"
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_ppt_v4(content: bytes, filename: str, lang: str):
+    """PPT 파싱 (이미지 추출 포함)"""
+    try:
+        prs = Presentation(io.BytesIO(content))
+        slides_data = []
+        full_context = ""
+        lang_inst = "Korean" if lang == 'korean' else "English"
+
+        for i, slide in enumerate(prs.slides):
+            slide_text = []
+            extracted_images = []
+            
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_text.append(shape.text)
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        image_blob = shape.image.blob
+                        img_b64 = base64.b64encode(image_blob).decode('utf-8')
+                        prompt = f"Analyze image in {lang_inst}."
+                        desc = await analyze_vision_ollama(image_blob, prompt)
+                        extracted_images.append({"b64": img_b64, "desc": desc})
+                    except: pass
+
+            txt = "\n".join(slide_text)
+            img_desc = "\n".join([f"[Img]: {img['desc']}" for img in extracted_images])
+            full_context += f"### Slide {i+1}\nText: {txt}\nVisuals: {img_desc}\n"
+            
+            slides_data.append({"slide_num": i+1, "text": txt, "images": extracted_images})
+            
+        return {
+            "type": "ppt",
+            "filename": filename,
+            "summary": f"PPT ({len(prs.slides)} slides)",
+            "raw_context": full_context,
+            "slides": slides_data
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_pdf_v4(content: bytes, filename: str, lang: str):
+    """PDF 파싱 (페이지별)"""
+    try:
+        images = convert_from_bytes(content, dpi=150, fmt='jpeg')
+        pages_data = []
+        full_context = ""
+        lang_inst = "Korean" if lang == 'korean' else "English"
+
+        for i, img in enumerate(images):
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            img_bytes = buffered.getvalue()
+            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            prompt = f"Analyze page {i+1} in {lang_inst}. No LaTeX."
+            page_desc = await analyze_vision_ollama(img_bytes, prompt)
+            
+            full_context += f"\n--- Page {i+1} ---\n{page_desc}\n"
+            pages_data.append({"page_num": i+1, "image_b64": img_b64, "desc": page_desc})
+
+        return {
+            "type": "pdf",
+            "filename": filename,
+            "summary": f"PDF ({len(images)} pages)",
+            "raw_context": full_context,
+            "pages": pages_data
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
+
+
+# ==========================================
+# [6] 메인 라우터 및 오케스트레이션
+# ==========================================
+app = FastAPI(title="Analyst V6 Full Integrated")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.post("/api/analyze")
+async def analyze_orchestrator(
+    files: List[UploadFile] = File(...),
+    custom_prompt: Optional[str] = Form(""),
+    goal: Optional[str] = Form(""),
+    preprocess_mode: str = Form("Auto"),
+    language: str = Form("korean"),
+    equipment: str = Form("General")
+):
+    print(f"🚀 V6 Analysis Start. Files: {len(files)}, Mode: {preprocess_mode}, Eq: {equipment}")
+    
+    # 파일 메모리 로드
+    file_data_list = []
+    for file in files:
+        file_data_list.append({"name": file.filename, "content": await file.read()})
+    
+    tasks = []
+    final_results = []
+    
+    # 1. 파일별 처리
+    for f in file_data_list:
+        fname = f["name"].lower()
+        content = f["content"]
+        
+        if fname.endswith(('.xlsx', '.xls')):
+            # 엑셀은 즉시 실행 (블록 리스트 반환)
+            blocks = await parse_excel_v5(content, f["name"], equipment, preprocess_mode, goal)
+            final_results.extend(blocks)
+            
+        elif fname.endswith(('.ppt', '.pptx')):
+            tasks.append(parse_ppt_v4(content, f["name"], language))
+            
+        elif fname.endswith('.pdf'):
+            tasks.append(parse_pdf_v4(content, f["name"], language))
+            
+        elif fname.endswith(('.csv', '.txt')):
+            tasks.append(parse_spectrum_v5(content, f["name"], equipment, preprocess_mode, goal))
+            
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            tasks.append(parse_image_v5(content, f["name"], language, equipment, preprocess_mode, goal))
+
+    # 2. 비동기 작업 병렬 실행
+    if tasks:
+        other_results = await asyncio.gather(*tasks)
+        final_results.extend(list(other_results))
+    
+    # 3. 종합 리포트 생성
+    valid_data = [r for r in final_results if r.get("type") != "error"]
+    context_text = ""
+    for item in valid_data:
+        raw = item.get("raw_context", "")
+        if "mwg-internal" not in raw:
+            context_text += f"\n=== Source: {item['filename']} ===\n{raw[:2500]}\n" # 컨텍스트 길이 조절
+
+    lang_inst = "Korean" if language == 'korean' else "English"
+    system_prompt = f"""
+    You are a Senior Scientist. Write report in **{lang_inst}**.
+    User Goal: "{goal}".
+    Do NOT generate code. Analyze scientific meaning.
+    """
+    
+    final_report = "분석 실패"
+    if context_text:
+        try:
+            print("📝 Synthesizing Final Report...")
+            res = await asyncio.to_thread(
+                ollama_client.chat,
+                model=TEXT_MODEL,
+                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': context_text}],
+                options={"num_ctx": 8192}
+            )
+            final_report = res['message']['content']
+        except Exception as e:
+            final_report = f"Report Generation Error: {e}"
+
+    return {"results": final_results, "final_report": final_report}
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"): return FileResponse("index.html")
+    return "<h1>index.html not found</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    # 0.0.0.0으로 열어야 127.0.0.1 문제 회피 가능
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
+
+import os
+import io
+import asyncio
+import base64
+import json
+import re
+from typing import List, Dict, Any, Optional
 
 # [필수] 보안망 우회
 os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
