@@ -1254,4 +1254,281 @@ if __name__ == "__main__":
 </body>
 </html>
 
+수정된 웹 페이지.
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced AI Analyst Pro (Fixed)</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        /* 테이블 스타일링 */
+        .prose table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.9em; }
+        .prose th, .prose td { border: 1px solid #e2e8f0; padding: 8px 12px; text-align: left; }
+        .prose th { background-color: #f1f5f9; font-weight: 700; color: #334155; }
+        .prose tr:nth-child(even) { background-color: #f8fafc; }
+        /* 로딩 스피너 */
+        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #4f46e5; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+    <div id="app" class="min-h-screen p-6">
+        
+        <!-- Header -->
+        <header class="max-w-7xl mx-auto mb-8 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="bg-indigo-600 p-2.5 rounded-xl shadow-lg shadow-indigo-200">
+                    <i data-lucide="layers" class="w-8 h-8 text-white"></i>
+                </div>
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-900 tracking-tight">AI Multi-modal Analyst Pro</h1>
+                    <p class="text-sm text-slate-500">Fixed Image Rendering • Secure Mode</p>
+                </div>
+            </div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
+            
+            <!-- Left Panel: Controls -->
+            <div class="lg:col-span-4 space-y-6">
+                <!-- 1. Upload Zone -->
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+                    <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-slate-800">
+                        <i data-lucide="upload-cloud" class="w-5 h-5 text-indigo-500"></i> Files
+                    </h2>
+                    
+                    <div 
+                        class="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center hover:border-indigo-400 hover:bg-indigo-50/30 transition-all cursor-pointer group"
+                        @dragover.prevent
+                        @drop.prevent="handleDrop"
+                        @click="$refs.fileInput.click()"
+                    >
+                        <input type="file" ref="fileInput" multiple class="hidden" @change="handleFileSelect">
+                        <div class="bg-indigo-50 w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
+                            <i data-lucide="plus" class="w-6 h-6 text-indigo-600"></i>
+                        </div>
+                        <p class="font-semibold text-slate-700">Click or Drag files here</p>
+                        <p class="text-xs text-slate-400 mt-1">XLSX, PPTX, PDF, CSV, Images</p>
+                    </div>
+
+                    <div v-if="files.length > 0" class="mt-4 space-y-2">
+                        <div v-for="(file, idx) in files" :key="idx" class="flex items-center justify-between p-3 bg-slate-50 rounded-lg border border-slate-100 text-sm">
+                            <span class="truncate max-w-[200px]">{{ file.name }}</span>
+                            <button @click.stop="removeFile(idx)" class="text-slate-400 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. Options -->
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+                    <h2 class="text-lg font-bold mb-4 flex items-center gap-2 text-slate-800">
+                        <i data-lucide="sliders" class="w-5 h-5 text-indigo-500"></i> Analysis Options
+                    </h2>
+                    
+                    <!-- Language -->
+                    <div class="mb-5">
+                        <label class="block text-xs font-semibold text-slate-500 uppercase mb-2">Report Language</label>
+                        <div class="flex bg-slate-100 p-1 rounded-lg">
+                            <button @click="language = 'korean'" :class="language === 'korean' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500'" class="flex-1 py-1.5 text-sm font-medium rounded-md transition-all">한글</button>
+                            <button @click="language = 'english'" :class="language === 'english' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-500'" class="flex-1 py-1.5 text-sm font-medium rounded-md transition-all">English</button>
+                        </div>
+                    </div>
+
+                    <!-- Custom Prompt -->
+                    <div class="mb-5">
+                        <label class="block text-xs font-semibold text-slate-500 uppercase mb-2">Instructions</label>
+                        <textarea v-model="customPrompt" class="w-full p-3 bg-slate-50 border border-slate-200 rounded-lg text-sm resize-none focus:outline-indigo-500" rows="3" placeholder="예: 결론 위주로 요약해줘"></textarea>
+                    </div>
+
+                    <button @click="analyze" :disabled="files.length === 0 || isAnalyzing" class="w-full py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold shadow-lg shadow-indigo-200 flex justify-center items-center gap-2 transition-all disabled:opacity-50">
+                        <div v-if="isAnalyzing" class="loader"></div>
+                        <span v-else>Generate Report</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Right Panel: Report -->
+            <div class="lg:col-span-8">
+                
+                <!-- Placeholder -->
+                <div v-if="!result && !isAnalyzing" class="h-full min-h-[500px] bg-white rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center justify-center text-slate-300">
+                    <i data-lucide="file-bar-chart-2" class="w-24 h-24 mb-6 opacity-20"></i>
+                    <p class="text-lg font-medium text-slate-400">Ready to Analyze</p>
+                </div>
+
+                <!-- Loading -->
+                <div v-if="isAnalyzing" class="h-full min-h-[500px] bg-white rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center justify-center p-12 text-center">
+                    <div class="w-16 h-16 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin mb-6"></div>
+                    <h3 class="text-xl font-bold text-slate-800">Processing...</h3>
+                    <p class="text-slate-500 mt-2">Parsing Excel Blocks, Scanning PDF/PPT, Generating Charts...</p>
+                </div>
+
+                <!-- Result View -->
+                <div v-if="result" class="space-y-6 animate-fade-in-up">
+                    <div class="flex justify-end gap-2">
+                        <button @click="downloadPDF" class="px-4 py-2 bg-slate-800 text-white text-sm font-medium rounded-lg hover:bg-slate-900 flex items-center gap-2 shadow-md">
+                            <i data-lucide="download"></i> Save as PDF
+                        </button>
+                    </div>
+
+                    <div id="report-content" class="bg-white p-10 rounded-2xl shadow-sm border border-slate-100">
+                        <!-- Header -->
+                        <div class="border-b border-slate-200 pb-6 mb-8">
+                            <h1 class="text-3xl font-bold text-slate-900 mb-2">Comprehensive Analysis Report</h1>
+                            <p class="text-slate-500 text-sm">Generated by AI Analyst Pro • {{ new Date().toLocaleDateString() }}</p>
+                        </div>
+
+                        <!-- 1. Executive Summary (Text) -->
+                        <section class="mb-12">
+                            <h2 class="text-xl font-bold text-indigo-700 mb-4 flex items-center gap-2">
+                                <i data-lucide="sparkles"></i> Executive Synthesis
+                            </h2>
+                            <!-- AI Text Output -->
+                            <div class="prose prose-slate prose-lg max-w-none text-slate-700 leading-relaxed" v-html="renderMarkdown(result.final_report)"></div>
+                        </section>
+
+                        <!-- 2. Data Visualizations & Evidence (Real Images/Charts) -->
+                        <section>
+                            <h2 class="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2 border-t pt-8">
+                                <i data-lucide="images"></i> Visual Evidence & Data
+                            </h2>
+
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-8 p-6 bg-slate-50 rounded-xl border border-slate-100 break-inside-avoid">
+                                <div class="flex items-center gap-2 mb-4">
+                                    <span class="px-2 py-1 bg-white border border-slate-200 rounded text-xs font-bold uppercase text-slate-500">{{ item.type }}</span>
+                                    <h3 class="font-bold text-slate-700">{{ item.filename }}</h3>
+                                </div>
+
+                                <!-- A. Plotly Charts (Spectrum / Excel) -->
+                                <div v-if="item.chart_data && item.chart_data.length > 0" class="mb-4 bg-white p-2 rounded border border-slate-200">
+                                    <h4 class="text-xs font-bold text-slate-400 uppercase mb-2 ml-2">Data Plot</h4>
+                                    <div :id="'chart-' + idx" class="w-full h-64"></div>
+                                </div>
+
+                                <!-- B. Extracted Images (PDF Page / PPT Slide / Raw Image) -->
+                                <div v-if="item.image_b64" class="mb-4">
+                                    <h4 class="text-xs font-bold text-slate-400 uppercase mb-2">Source Preview</h4>
+                                    <!-- Base64 Image Rendering -->
+                                    <img :src="'data:image/jpeg;base64,' + item.image_b64" 
+                                         class="max-h-96 rounded border border-slate-200 shadow-sm mx-auto object-contain bg-white"
+                                         @error="handleImageError">
+                                </div>
+
+                                <!-- Summary Text -->
+                                <div class="text-sm text-slate-600 bg-white p-4 rounded border border-slate-200 mt-3">
+                                    <div class="prose prose-sm max-w-none" v-html="renderMarkdown(item.summary)"></div>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const { createApp, ref, nextTick } = Vue;
+
+        createApp({
+            setup() {
+                const files = ref([]);
+                const isAnalyzing = ref(false);
+                const result = ref(null);
+                const customPrompt = ref("");
+                const language = ref("korean");
+
+                // --- 1. Markdown 설정 (중요: 이미지 렌더링 차단) ---
+                const renderer = new marked.Renderer();
+                // AI가 생성한 텍스트 내의 이미지는 보안 문제(mwg-internal)를 일으키므로 빈 문자열로 대체
+                renderer.image = function(href, title, text) {
+                    return ''; 
+                };
+                marked.use({ renderer });
+
+                const handleFileSelect = (e) => files.value.push(...Array.from(e.target.files));
+                const handleDrop = (e) => files.value.push(...Array.from(e.dataTransfer.files));
+                const removeFile = (i) => files.value.splice(i, 1);
+                const handleImageError = (e) => { e.target.style.display = 'none'; }; // 깨진 이미지 숨김
+
+                const renderMarkdown = (text) => marked.parse(text || '');
+
+                const analyze = async () => {
+                    isAnalyzing.value = true;
+                    result.value = null;
+                    const formData = new FormData();
+                    files.value.forEach(f => formData.append('files', f));
+                    formData.append('custom_prompt', customPrompt.value);
+                    formData.append('language', language.value);
+
+                    try {
+                        const res = await fetch('/api/analyze', { method: 'POST', body: formData });
+                        const data = await res.json();
+                        result.value = data;
+                        await nextTick();
+                        drawCharts(data.results);
+                        lucide.createIcons();
+                    } catch (e) {
+                        alert("Error: " + e);
+                    } finally {
+                        isAnalyzing.value = false;
+                    }
+                };
+
+                const drawCharts = (results) => {
+                    results.forEach((item, idx) => {
+                        if (item.chart_data && item.chart_data.length > 0) {
+                            const trace = {
+                                x: item.chart_data.map(d => d.x),
+                                y: item.chart_data.map(d => d.y),
+                                mode: 'lines',
+                                line: { color: '#4f46e5', width: 2 }
+                            };
+                            const layout = {
+                                margin: { t: 20, b: 30, l: 40, r: 20 },
+                                xaxis: { title: 'Index / Wavelength' },
+                                yaxis: { title: 'Value' },
+                                showlegend: false
+                            };
+                            Plotly.newPlot('chart-' + idx, [trace], layout, {displayModeBar: false});
+                        }
+                    });
+                };
+
+                const downloadPDF = () => {
+                    const element = document.getElementById('report-content');
+                    const opt = {
+                        margin: 10,
+                        filename: 'AI_Report.pdf',
+                        image: { type: 'jpeg', quality: 0.98 },
+                        html2canvas: { scale: 2 },
+                        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+                    };
+                    html2pdf().set(opt).from(element).save();
+                };
+
+                setTimeout(() => lucide.createIcons(), 100);
+
+                return {
+                    files, isAnalyzing, result, customPrompt, language,
+                    handleFileSelect, handleDrop, removeFile, analyze, renderMarkdown, downloadPDF, handleImageError
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
+
+
 
