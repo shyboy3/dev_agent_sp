@@ -1,41 +1,50 @@
-V8코드
-
 import os
 import io
 import asyncio
 import base64
 import json
+import re
 from typing import List, Dict, Any, Optional
 
-# [필수] 보안망 우회
+# ==========================================
+# [1] 네트워크/보안 설정 (필수)
+# ==========================================
+# 회사 보안망(McAfee 등)이 로컬 통신(127.0.0.1)을 가로채지 못하게 강제 설정
 os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
 if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
 if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+
 import pandas as pd
 import numpy as np
 
-# 과학 연산 & 이미지 처리
-from scipy.signal import find_peaks, savgol_filter
+# 과학 연산 및 이미지 처리 라이브러리
+from scipy.signal import find_peaks, savgol_filter, peak_widths
 from scipy.optimize import curve_fit
-from scipy.ndimage import label
+from scipy.ndimage import label, find_objects, gaussian_filter
 from skimage.feature import blob_log
 import cv2
 
 from ollama import Client 
+from PIL import Image
 from pdf2image import convert_from_bytes
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-# --- 설정 ---
+# ==========================================
+# [2] 설정
+# ==========================================
 OLLAMA_HOST = "http://127.0.0.1:11434"
 ollama_client = Client(host=OLLAMA_HOST)
+
 VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
 TEXT_MODEL = "llama3:70b"
 
-# --- V8 과학 처리 엔진 ---
+# ==========================================
+# [3] V8 과학 처리 엔진 (Science Core)
+# ==========================================
 
 class ScienceProcessorV8:
     
@@ -43,50 +52,46 @@ class ScienceProcessorV8:
     def detect_footer_boundary(img_array):
         """
         [V8 핵심] 스마트 정보바 감지 알고리즘
-        단순 퍼센트가 아니라, 이미지 하단의 '경계선'을 찾아냅니다.
+        이미지 하단의 '경계선'을 찾아내어 데이터 영역과 정보 영역을 분리합니다.
         """
         h, w = img_array.shape[:2]
         
-        # 1. 하단 25% 영역만 ROI(Region of Interest)로 설정 (속도 및 정확도 향상)
+        # 하단 25% 영역만 탐색 (속도/정확도 향상)
         search_ratio = 0.25
         search_h = int(h * search_ratio)
         roi = img_array[h-search_h:, :]
         
-        # 2. 그레이스케일 및 엣지 검출
+        # 엣지 검출
         if len(roi.shape) == 3:
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         else:
             gray = roi
             
-        # 3. 수평 엣지 강조 (Sobel Filter Y방향) -> 경계선 찾기
-        # Canny보다 Sobel이 수평선 검출에 유리할 수 있음
+        # 수평 엣지 강조 (Sobel Y)
         sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         abs_sobel = np.absolute(sobel_y)
         edges = np.uint8(abs_sobel)
         
-        # 4. 수평 투영 (행 단위 합계)
-        # 가로줄 하나가 전체적으로 엣지라면(직선), 합계가 매우 높음
+        # 수평 투영 (Horizontal Projection)
         row_sums = np.sum(edges, axis=1)
         
-        # 5. 가장 강력한 엣지 찾기 (경계선 후보)
-        # 노이즈 방지를 위해 일정 임계값 이상이어야 함
+        # 가장 강력한 수평선 찾기
         max_val = np.max(row_sums)
-        if max_val < (w * 50): # 엣지가 너무 약하면(정보바가 없으면)
-            return None # 정보바 없음 판단
+        if max_val < (w * 30): # 엣지가 너무 약하면 정보바 없음
+            return None
             
         split_idx_roi = np.argmax(row_sums)
         
-        # 6. 위치 보정 (ROI 기준이므로 전체 좌표로 변환)
-        # 너무 맨 밑바닥(하단 2% 이내)이면 무시 (테두리일 수 있음)
+        # 너무 바닥이면 무시
         if split_idx_roi > search_h * 0.95:
             return None
             
         real_split_y = (h - search_h) + split_idx_roi
-        
         return real_split_y
 
     @staticmethod
     def simple_baseline(y):
+        # Moving Minimum + Smoothing으로 베이스라인 추정
         window = max(5, len(y)//10)
         baseline = pd.Series(y).rolling(window=window, center=True).min().fillna(method='bfill').fillna(method='ffill').values
         if len(baseline) > 51:
@@ -98,23 +103,30 @@ class ScienceProcessorV8:
         log = []
         y_raw = y.copy()
         
+        # 1. Mode: None
         if mode == "None":
             peaks, _ = find_peaks(y, height=np.max(y)*0.05)
-            return {"x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y),
-                    "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], "log": ["Raw Data"]}
+            return {
+                "x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y),
+                "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks],
+                "log": ["Preprocessing Skipped"]
+            }
 
-        # AI Adaptive Params
+        # 2. Params
         window = 15
         if mode == "AI-Adaptive" and "noise" in goal.lower(): window = 31
         
-        # Process
+        # 3. Processing
         base = ScienceProcessorV8.simple_baseline(y)
         y_corr = np.maximum(y - base, 0)
         y_proc = savgol_filter(y_corr, window, 3) if len(y_corr) > window else y_corr
         peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
 
-        return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base,
-                "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], "log": log}
+        return {
+            "x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base,
+            "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks],
+            "log": log
+        }
 
     @staticmethod
     def process_image(img_bytes, equipment, mode, goal):
@@ -127,28 +139,28 @@ class ScienceProcessorV8:
         body_img = img_raw
         has_footer = False
         
-        # 현미경 장비일 경우에만 스마트 감지 시도
+        # 현미경 장비일 경우 스마트 감지 시도
         if equipment in ["SEM", "TEM", "STEM", "FIB", "AFM"]:
             split_y = ScienceProcessorV8.detect_footer_boundary(img_raw)
             if split_y:
-                body_img = img_raw[:split_y, :]   # 상단: 데이터
-                footer_img = img_raw[split_y:, :] # 하단: 정보(메타데이터)
+                body_img = img_raw[:split_y, :]   # 상단 데이터
+                footer_img = img_raw[split_y:, :] # 하단 정보바
                 has_footer = True
         
         # 인코딩 (Body)
         _, buf_body = cv2.imencode('.jpg', body_img)
         b64_body = base64.b64encode(buf_body).decode('utf-8')
         
-        # 인코딩 (Footer - 메타데이터 추출용)
+        # 인코딩 (Footer)
         b64_footer = None
         if has_footer:
             _, buf_footer = cv2.imencode('.jpg', footer_img)
             b64_footer = base64.b64encode(buf_footer).decode('utf-8')
 
-        # Mode: None -> 처리된(잘린) 이미지만 반환하고 끝
+        # Mode: None -> 처리 없이 반환 (Crop은 된 상태)
         if mode == "None":
             return {
-                "raw_b64": b64_body, # 잘린 이미지를 Raw로 간주
+                "raw_b64": b64_body, 
                 "proc_b64": b64_body,
                 "footer_b64": b64_footer,
                 "stats": {"info": "Smart Cropped (Raw)"}
@@ -194,89 +206,184 @@ class ScienceProcessorV8:
             "stats": stats
         }
 
-# --- 헬퍼 ---
-def detect_excel_blocks(df):
-    # (이전 코드와 동일)
+# ==========================================
+# [4] 헬퍼 함수 (Excel, Vision API)
+# ==========================================
+
+def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+    """엑셀 아일랜드 감지 (상하좌우 분리)"""
     blocks = []
     if df.empty: return blocks
     mask = ~df.isnull().to_numpy()
-    from scipy.ndimage import label, find_objects
-    labeled, n = label(mask, structure=[[0,1,0],[1,1,1],[0,1,0]])
-    for sl in find_objects(labeled):
-        b = df.iloc[sl]
-        if b.shape[0]>=3 and b.shape[1]>=2: blocks.append(b.reset_index(drop=True))
+    structure = [[0,1,0], [1,1,1], [0,1,0]]
+    labeled_array, num_features = label(mask, structure=structure)
+    slices = find_objects(labeled_array)
+    for slice_obj in slices:
+        block = df.iloc[slice_obj]
+        if block.shape[0] >= 3 and block.shape[1] >= 2:
+            blocks.append(block.reset_index(drop=True))
     return blocks
 
 async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    """Vision API 호출 및 보안망 에러 필터링"""
     try:
-        b64 = base64.b64encode(image_bytes).decode('utf-8')
-        res = await asyncio.to_thread(ollama_client.chat, model=VISION_MODEL, messages=[{'role':'user','content':prompt,'images':[b64]}])
-        c = res['message']['content']
-        if "<script" in c: return "[Error]"
-        return c
-    except Exception as e: return str(e)
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
+        )
+        content = response['message']['content']
+        if "<script" in content or "mwg-internal" in content: 
+            return "[Error: Firewall blocked connection]"
+        return content
+    except Exception as e: 
+        return f"[Vision Error: {e}]"
 
-# --- 라우터 ---
-app = FastAPI(title="Analyst V8")
+# ==========================================
+# [5] 메인 라우터 (Orchestrator)
+# ==========================================
+app = FastAPI(title="Analyst V8 Full")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.post("/api/analyze")
 async def analyze_orchestrator(
     files: List[UploadFile] = File(...),
-    file_configs: str = Form(...) 
+    file_configs: str = Form(...) # JSON String
 ):
     configs = json.loads(file_configs)
     print(f"🚀 V8 Processing {len(configs)} files")
     
     tasks = []
+    final_results = []
     file_map = {f.filename: await f.read() for f in files}
     
     for filename, config in configs.items():
         if filename not in file_map: continue
         content = file_map[filename]
+        
         eq = config.get("equipment", "General")
         goal = config.get("goal", "")
         mode = config.get("mode", "Auto")
+        fname_lower = filename.lower()
         
-        # 1. Document (Skip processing)
-        if eq == "Document" or filename.lower().endswith(('.pdf','.ppt','.pptx')):
-            # (V7.5의 문서 처리 로직 동일 - 생략 없이 구현 필요)
-            # 여기서는 지면상 스펙트럼/이미지에 집중
-            pass 
+        # [A] Document (Literature) Path - 전처리 건너뜀
+        if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
+            async def process_doc(c, n, e):
+                # PDF
+                if n.lower().endswith('.pdf'):
+                    images = convert_from_bytes(c, dpi=150, fmt='jpeg')[:10]
+                    full_txt = ""
+                    pages = []
+                    for idx, img in enumerate(images):
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG")
+                        # OCR/Summary
+                        desc = await analyze_vision_ollama(buf.getvalue(), "Summarize this page content.")
+                        full_txt += f"\nPage {idx+1}: {desc}"
+                        # B64 for display
+                        b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                        pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
+                    return {"type": "pdf", "filename": n, "summary": "PDF Document", "raw_context": full_txt, "pages": pages, "equipment": "Literature"}
+                
+                # PPT
+                elif n.lower().endswith(('.ppt', '.pptx')):
+                    prs = Presentation(io.BytesIO(c))
+                    slides = []
+                    full_txt = ""
+                    for i, slide in enumerate(prs.slides):
+                        txt = ""
+                        for s in slide.shapes:
+                            if hasattr(s, "text"): txt += s.text + "\n"
+                        
+                        # PPT 이미지 추출
+                        imgs = []
+                        for s in slide.shapes:
+                            if s.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                                try:
+                                    iblob = s.image.blob
+                                    ib64 = base64.b64encode(iblob).decode('utf-8')
+                                    idesc = await analyze_vision_ollama(iblob, "Describe image.")
+                                    imgs.append({"b64": ib64, "desc": idesc})
+                                except: pass
+                        
+                        full_txt += f"Slide {i+1}: {txt}\n"
+                        slides.append({"slide_num": i+1, "text": txt, "images": imgs})
+                    return {"type": "ppt", "filename": n, "summary": "PPT Document", "raw_context": full_txt, "slides": slides, "equipment": "Literature"}
+                else:
+                    return {"type": "doc", "filename": n, "summary": "Doc", "equipment": "Literature"}
 
-        # 2. Spectrum (Excel)
-        elif filename.lower().endswith(('.xlsx', '.xls')):
-            async def proc_xls(c, n, e, g, m):
-                # (V7.5 로직 동일)
-                pass
-            # (실제 구현 시 V7.5 코드 복사)
-            pass
+            tasks.append(process_doc(content, filename, eq))
+            continue
 
-        # 3. Image (V8 Dual-Pass Logic)
-        elif filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+        # [B] Raw Data Path - 전처리 수행
+        
+        # 1. Excel Spectrum
+        if fname_lower.endswith(('.xlsx', '.xls')):
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                    blocks = detect_excel_blocks(df)
+                    for i, block in enumerate(blocks):
+                        try:
+                            num_block = block.apply(pd.to_numeric, errors='coerce').dropna(how='all').dropna(how='all', axis=1)
+                            if not num_block.empty and num_block.shape[0] > 5:
+                                x = num_block.iloc[:, 0].fillna(0).values
+                                y = num_block.iloc[:, 1].fillna(0).values
+                                
+                                # V8 Spectrum Process
+                                res = ScienceProcessorV8.process_spectrum(x, y, mode, goal)
+                                
+                                # Chart Data
+                                step = max(1, len(x)//100)
+                                chart_data = []
+                                for idx in range(0, len(x), step):
+                                    chart_data.append({
+                                        "x": float(res["x"][idx]),
+                                        "y_raw": float(res["y_raw"][idx]),
+                                        "y_proc": float(res["y_proc"][idx]),
+                                        "y_base": float(res["y_base"][idx])
+                                    })
+                                
+                                raw_txt = block.to_csv(index=False, header=False)[:500]
+                                final_results.append({
+                                    "type": "spectrum",
+                                    "filename": f"{filename} ({sheet_name}-{i+1})",
+                                    "equipment": eq,
+                                    "summary": f"Peaks: {len(res['peaks'])}",
+                                    "raw_context": f"Eq: {eq}. Peaks: {res['peaks']}\nRaw:\n{raw_txt}",
+                                    "chart_data": chart_data,
+                                    "log": res["log"]
+                                })
+                        except: pass
+            except Exception as e:
+                final_results.append({"type": "error", "filename": filename, "msg": str(e)})
+
+        # 2. Image Analysis (Dual-Pass)
+        elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
             async def process_img_v8(c, n, e, g, m):
                 try:
                     # Step 1: Smart Split & CV Process
                     vis_res = ScienceProcessorV8.process_image(c, e, m, g)
                     
-                    # Step 2: Metadata Extraction (OCR on Footer)
-                    metadata_text = ""
+                    # Step 2: Metadata Extraction (Footer OCR)
+                    meta_text = ""
                     if vis_res.get("footer_b64"):
-                        footer_bytes = base64.b64decode(vis_res["footer_b64"])
-                        meta_prompt = "Read the scale bar, magnification, voltage (HV), and date from this info bar. Output as text."
-                        metadata_text = await analyze_vision_ollama(footer_bytes, meta_prompt)
+                        ft_bytes = base64.b64decode(vis_res["footer_b64"])
+                        meta_prompt = "Read text (Scale bar, HV, Mag) from this image info bar."
+                        meta_text = await analyze_vision_ollama(ft_bytes, meta_prompt)
                     
                     # Step 3: Main Analysis (Body + Metadata)
                     body_bytes = base64.b64decode(vis_res["proc_b64"])
-                    
                     lang_inst = "Korean"
+                    
                     prompt = f"""
                     Analyze this {e} image in {lang_inst}.
                     User Goal: {g}.
                     CV Stats: {vis_res['stats']}.
-                    [Microscope Metadata]: {metadata_text}
-                    
-                    Use the metadata (Scale, HV) to interpret the features size and quality accurately.
+                    [Metadata from Info Bar]: {meta_text}
+                    Use the metadata to interpret size/scale if available.
                     """
                     desc = await analyze_vision_ollama(body_bytes, prompt)
                     
@@ -285,10 +392,10 @@ async def analyze_orchestrator(
                         "filename": n,
                         "equipment": e,
                         "summary": desc,
-                        "raw_context": f"Image Analysis: {desc}\nMetadata Found: {metadata_text}\nStats: {vis_res['stats']}",
+                        "raw_context": f"Image: {desc}\nMetadata: {meta_text}\nStats: {vis_res['stats']}",
                         "raw_b64": vis_res["raw_b64"],
-                        "proc_b64": vis_res["proc_b64"], # Crop & Overlayed
-                        "footer_b64": vis_res.get("footer_b64"), # UI에 보여줄 수도 있음
+                        "proc_b64": vis_res["proc_b64"], # Crop & Overlay
+                        "footer_b64": vis_res.get("footer_b64"),
                         "stats": vis_res["stats"]
                     }
                 except Exception as ex:
@@ -296,532 +403,42 @@ async def analyze_orchestrator(
             
             tasks.append(process_img_v8(content, filename, eq, goal, mode))
 
-    # ... (나머지 gather 및 synthesis 로직 V7.5와 동일)
+    # Execute Async Tasks
     if tasks:
-        res_list = await asyncio.gather(*tasks)
-        # ... Synthesis Code ...
-        return {"results": list(res_list), "final_report": "Done"} # (약식 반환)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-2. 프론트엔드 (HTML): index.html (V8)
-결과 화면에서 **"Extracted Metadata"**를 별도로 보여주도록 수정합니다.
-<!-- V8 결과 카드 (Image 부분) -->
-<div v-if="item.raw_b64" class="bg-white p-2 rounded border mb-3">
-    <div class="flex gap-2 mb-2 text-xs">
-        <button @click="item.view='proc'" :class="item.view!=='raw'?'font-bold text-sky-600':''">Processed Body</button>
-        <span class="text-slate-300">|</span>
-        <button @click="item.view='raw'" :class="item.view==='raw'?'font-bold text-sky-600':''">Cropped Body</button>
-        <span class="text-slate-300" v-if="item.footer_b64">|</span>
-        <button v-if="item.footer_b64" @click="item.view='footer'" :class="item.view==='footer'?'font-bold text-sky-600':''">Info Bar</button>
-    </div>
+        results = await asyncio.gather(*tasks)
+        final_results.extend(list(results))
+        
+    # Synthesis Report
+    data_context = ""
+    lit_context = ""
     
-    <!-- 메인 이미지 -->
-    <img v-if="item.view!=='footer'" :src="'data:image/jpeg;base64,' + (item.view==='raw' ? item.raw_b64 : item.proc_b64)" class="max-h-80 mx-auto object-contain bg-black">
-    
-    <!-- 푸터(정보바) 이미지 -->
-    <img v-if="item.view==='footer'" :src="'data:image/jpeg;base64,' + item.footer_b64" class="max-h-20 mx-auto object-contain border mt-4">
-
-    <!-- 통계 및 메타데이터 -->
-    <div class="mt-2 p-2 bg-slate-50 rounded text-xs text-slate-600">
-        <p v-if="item.stats"><strong>Stats:</strong> {{ item.stats }}</p>
-        <!-- Metadata 내용이 raw_context에 포함되어 있음 -->
-    </div>
-</div>
-
-
-
-
-
-
-에이전트 모드 신규 코드
-import os
-import io
-import asyncio
-import base64
-import json
-import re
-from typing import List, Dict, Any, Optional
-from contextlib import asynccontextmanager
-
-# ==========================================
-# [1] 네트워크/보안 설정 (필수)
-# ==========================================
-# 회사 보안망(McAfee 등)이 로컬 통신(127.0.0.1)을 가로채지 못하게 강제 설정
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
-if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
-if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
-
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-import pandas as pd
-import numpy as np
-
-# 과학 연산 및 이미지 처리 라이브러리
-from scipy.signal import find_peaks, savgol_filter, peak_widths
-from scipy.optimize import curve_fit
-from scipy.ndimage import label, find_objects, gaussian_filter
-from skimage.feature import blob_log  # 원자(Blob) 검출용
-import cv2
-
-from ollama import Client 
-from PIL import Image
-from pdf2image import convert_from_bytes
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# ==========================================
-# [2] 모델 및 서버 설정
-# ==========================================
-# 사용자 환경에 맞는 포트 및 모델명 설정
-OLLAMA_HOST = "http://127.0.0.1:11434"
-ollama_client = Client(host=OLLAMA_HOST)
-
-VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
-TEXT_MODEL = "llama3:70b"
-
-# ==========================================
-# [3] V6 핵심: AI 적응형 프로세서 (Science Core)
-# ==========================================
-class AdaptiveProcessor:
-    
-    @staticmethod
-    def gaussian(x, amp, cen, wid):
-        return amp * np.exp(-(x-cen)**2 / (2*wid**2))
-
-    @staticmethod
-    def fit_peaks(x, y, peaks):
-        """피크 위치에 가우시안 피팅 수행"""
-        fitted_params = []
-        for p in peaks:
-            try:
-                # 초기값 추정 (Amplitude, Center, Width)
-                p0 = [y[p], x[p], 1.0]
-                window = 20
-                start, end = max(0, p-window), min(len(x), p+window)
-                if len(x[start:end]) > 3: # 데이터가 충분할 때만
-                    popt, _ = curve_fit(AdaptiveProcessor.gaussian, x[start:end], y[start:end], p0=p0, maxfev=1000)
-                    fitted_params.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
-            except:
-                pass
-        return fitted_params
-
-    @staticmethod
-    def process_spectrum(x, y, mode, goal):
-        """
-        스펙트럼 전처리 (Mode: None, Auto, AI-Adaptive)
-        """
-        log = []
-        y_proc = y.copy()
-        features = {}
-
-        # 1. Mode: None (전처리 없음)
-        if mode == "None":
-            peaks, _ = find_peaks(y, height=np.max(y)*0.05)
-            return x, y, {"peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], "log": ["Raw Data"]}
-
-        # 2. 파라미터 결정 (AI-Adaptive or Default)
-        window_length = 11
-        polyorder = 3
-        do_fitting = False
-        
-        if mode == "AI-Adaptive" and goal:
-            goal_lower = goal.lower()
-            if "노이즈" in goal_lower or "noise" in goal_lower:
-                window_length = 21 # 스무딩 강화
-                log.append("AI: Detected noise reduction goal -> Strong smoothing.")
-            if "피팅" in goal_lower or "fit" in goal_lower or "gaussian" in goal_lower:
-                do_fitting = True
-                log.append("AI: Detected fitting goal -> Gaussian fitting enabled.")
-            if "raw" in goal_lower or "날것" in goal_lower:
-                window_length = 0
-        
-        # 3. 신호 처리 수행
-        # Smoothing
-        if window_length > 3 and len(y_proc) > window_length:
-            y_proc = savgol_filter(y_proc, window_length, polyorder)
-            log.append("Applied Savitzky-Golay Filter.")
-        
-        # Baseline Correction (Simple)
-        baseline = np.percentile(y_proc, 5)
-        y_proc = y_proc - baseline
-        y_proc[y_proc < 0] = 0
-
-        # Peak Finding
-        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
-        
-        # Fitting
-        fits = []
-        if do_fitting and len(peaks) > 0:
-            fits = AdaptiveProcessor.fit_peaks(x, y_proc, peaks)
-            features["fits"] = fits
-
-        # 결과 정리
-        peak_info = [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks]
-        features["peaks"] = peak_info
-        features["log"] = log
-        
-        return x, y_proc, features
-
-    @staticmethod
-    def process_image(img_bytes, mode, goal, equipment):
-        """
-        이미지 전처리 (원자 검출, 입자 분석, 노이즈 제거)
-        """
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None: return None, {}
-        
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        stats = {}
-        processed_img = img.copy()
-        
-        if mode == "None":
-            _, buffer = cv2.imencode('.jpg', img)
-            return base64.b64encode(buffer).decode('utf-8'), {"note": "Raw Image"}
-
-        # AI 파라미터 결정
-        detect_atoms = False
-        detect_particles = False
-        denoise_strength = 3
-        
-        goal_lower = (goal or "").lower()
-        
-        # 목표 또는 장비 타입에 따른 로직 분기
-        if mode == "AI-Adaptive":
-            if "원자" in goal_lower or "atom" in goal_lower: detect_atoms = True
-            if "입자" in goal_lower or "particle" in goal_lower: detect_particles = True
-            if "노이즈" in goal_lower: denoise_strength = 9
-        
-        if equipment in ["STEM", "TEM"] and mode == "Auto": detect_atoms = True
-        if equipment in ["SEM", "Optical"] and mode == "Auto": detect_particles = True
-
-        # 1. Denoising
-        gray_blur = cv2.GaussianBlur(gray, (denoise_strength, denoise_strength), 0)
-
-        # 2. Atomic Analysis (Blob Detection - LoG)
-        if detect_atoms:
-            # 원자 검출 (scikit-image)
-            blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, num_sigma=10, threshold=0.1)
-            for blob in blobs:
-                y, x, r = blob
-                # 원자 위치에 빨간 원 그리기
-                cv2.circle(processed_img, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
-            stats["atom_count"] = len(blobs)
-            stats["method"] = "LoG (Atomic Blob Detection)"
-        
-        # 3. Particle Analysis (Watershed / Contours)
-        elif detect_particles:
-             _, thresh = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-             kernel = np.ones((3,3), np.uint8)
-             opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-             contours, _ = cv2.findContours(opening, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-             
-             # 입자 경계선 그리기 (초록색)
-             cv2.drawContours(processed_img, contours, -1, (0, 255, 0), 2)
-             
-             stats["particle_count"] = len(contours)
-             areas = [cv2.contourArea(c) for c in contours]
-             if areas: stats["avg_area"] = float(np.mean(areas))
-             stats["method"] = "Contour/Watershed"
-
-        _, buffer = cv2.imencode('.jpg', processed_img)
-        return base64.b64encode(buffer).decode('utf-8'), stats
-
-# ==========================================
-# [4] 헬퍼 함수 (Excel Island, Vision API)
-# ==========================================
-
-def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
-    """엑셀 아일랜드(독립된 표) 감지"""
-    blocks = []
-    if df.empty: return blocks
-    mask = ~df.isnull().to_numpy()
-    structure = [[0,1,0], [1,1,1], [0,1,0]] # 십자가 연결 구조
-    labeled_array, num_features = label(mask, structure=structure)
-    slices = find_objects(labeled_array)
-    
-    for slice_obj in slices:
-        block = df.iloc[slice_obj]
-        # 최소 크기 필터링 (3행 2열 이상)
-        if block.shape[0] >= 3 and block.shape[1] >= 2:
-            blocks.append(block.reset_index(drop=True))
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    """Vision LLM 호출 및 보안망 에러 필터링"""
-    try:
-        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        response = await asyncio.to_thread(
-            ollama_client.chat,
-            model=VISION_MODEL,
-            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
-        )
-        content = response['message']['content']
-        # 보안망 HTML 응답 감지
-        if "<script" in content or "mwg-internal" in content:
-            return "[Error: Firewall/Proxy blocked the AI connection.]"
-        return content
-    except Exception as e:
-        return f"[Vision AI Error: {e}]"
-
-# ==========================================
-# [5] 파서 (Parsers) - V4, V5, V6 통합
-# ==========================================
-
-async def parse_excel_v5(content: bytes, filename: str, equipment: str, mode: str, goal: str):
-    """엑셀 파싱 + V6 적응형 처리"""
-    results = []
-    try:
-        xls = pd.ExcelFile(io.BytesIO(content))
-        for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-            blocks = detect_excel_blocks(df)
+    for r in final_results:
+        if r.get("type") != "error":
+            block = f"\n=== File: {r['filename']} ===\n{r.get('raw_context')[:3000]}\n"
+            if r.get("equipment") in ["Literature", "Document"]:
+                lit_context += block
+            else:
+                data_context += block
             
-            for i, block in enumerate(blocks):
-                chart_data = []
-                peaks_info = []
-                fits_info = []
-                
-                try:
-                    # 숫자 데이터만 추출
-                    num_block = block.apply(pd.to_numeric, errors='coerce').dropna(how='all', axis=0).dropna(how='all', axis=1)
-                    if not num_block.empty and num_block.shape[0] > 5:
-                        x = num_block.iloc[:, 0].fillna(0).values
-                        y = num_block.iloc[:, 1].fillna(0).values if num_block.shape[1] > 1 else x
-                        
-                        # [V6] 적응형 처리
-                        x_proc, y_proc, feats = AdaptiveProcessor.process_spectrum(x, y, mode, goal)
-                        peaks_info = feats.get('peaks', [])
-                        fits_info = feats.get('fits', [])
-                        
-                        step = max(1, len(x_proc) // 150)
-                        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x_proc[::step], y_proc[::step])]
-                except:
-                    pass
-
-                raw_txt = block.to_csv(index=False, header=False)[:1000]
-                peak_str = ", ".join([f"{p['x']:.1f}" for p in peaks_info[:5]])
-                
-                results.append({
-                    "type": "excel_block",
-                    "filename": f"{filename} ({sheet_name}-{i+1})",
-                    "summary": f"Block Analysis ({equipment}): {len(peaks_info)} peaks detected.",
-                    "raw_context": f"Source: {equipment}\nPeaks Found: {peak_str}\nRaw Sample:\n{raw_txt}",
-                    "chart_data": chart_data,
-                    "fits": fits_info
-                })
-    except Exception as e:
-        return [{"type": "error", "filename": filename, "msg": str(e)}]
-    return results
-
-async def parse_image_v5(content: bytes, filename: str, lang: str, equipment: str, mode: str, goal: str):
-    """이미지 파싱 + V6 원자/입자 분석"""
-    try:
-        # 1. V6 프로세서로 이미지 전처리 및 통계 추출
-        img_b64, stats = AdaptiveProcessor.process_image(content, mode, goal, equipment)
-        
-        # 2. Vision LLM 해석
-        lang_inst = "Korean" if lang == 'korean' else "English"
-        prompt = f"""
-        Analyze this {equipment} image in {lang_inst}.
-        User Goal: {goal}.
-        CV Algorithm Stats: {stats} (e.g., Atom/Particle count).
-        Explain the scientific significance based on these stats.
-        """
-        desc = await analyze_vision_ollama(content, prompt) # 원본 이미지를 LLM에 전달
-        
-        return {
-            "type": "image",
-            "filename": filename,
-            "summary": desc,
-            "image_b64": img_b64, # 전처리된(오버레이된) 이미지 반환
-            "raw_context": f"Image ({equipment}): {desc}\nStats: {stats}"
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_spectrum_v5(content: bytes, filename: str, equipment: str, mode: str, goal: str):
-    """CSV 스펙트럼 파싱 + V6 적응형 처리"""
-    try:
-        try: df = pd.read_csv(io.BytesIO(content))
-        except: df = pd.read_csv(io.BytesIO(content), delimiter='\t')
-        
-        x = df.iloc[:, 0].values
-        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
-        
-        x_proc, y_proc, feats = AdaptiveProcessor.process_spectrum(x, y, mode, goal)
-        peaks = feats.get('peaks', [])
-        
-        step = max(1, len(x_proc) // 200)
-        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x_proc[::step], y_proc[::step])]
-        
-        return {
-            "type": "spectrum",
-            "filename": filename,
-            "summary": f"Spectrum ({equipment}): {len(peaks)} peaks.",
-            "chart_data": chart_data,
-            "raw_context": f"Spectrum Peaks: {len(peaks)} found. Stats: {feats.get('log')}"
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_ppt_v4(content: bytes, filename: str, lang: str):
-    """PPT 파싱 (이미지 추출 포함)"""
-    try:
-        prs = Presentation(io.BytesIO(content))
-        slides_data = []
-        full_context = ""
-        lang_inst = "Korean" if lang == 'korean' else "English"
-
-        for i, slide in enumerate(prs.slides):
-            slide_text = []
-            extracted_images = []
-            
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    slide_text.append(shape.text)
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    try:
-                        image_blob = shape.image.blob
-                        img_b64 = base64.b64encode(image_blob).decode('utf-8')
-                        prompt = f"Analyze image in {lang_inst}."
-                        desc = await analyze_vision_ollama(image_blob, prompt)
-                        extracted_images.append({"b64": img_b64, "desc": desc})
-                    except: pass
-
-            txt = "\n".join(slide_text)
-            img_desc = "\n".join([f"[Img]: {img['desc']}" for img in extracted_images])
-            full_context += f"### Slide {i+1}\nText: {txt}\nVisuals: {img_desc}\n"
-            
-            slides_data.append({"slide_num": i+1, "text": txt, "images": extracted_images})
-            
-        return {
-            "type": "ppt",
-            "filename": filename,
-            "summary": f"PPT ({len(prs.slides)} slides)",
-            "raw_context": full_context,
-            "slides": slides_data
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_pdf_v4(content: bytes, filename: str, lang: str):
-    """PDF 파싱 (페이지별)"""
-    try:
-        images = convert_from_bytes(content, dpi=150, fmt='jpeg')
-        pages_data = []
-        full_context = ""
-        lang_inst = "Korean" if lang == 'korean' else "English"
-
-        for i, img in enumerate(images):
-            buffered = io.BytesIO()
-            img.save(buffered, format="JPEG")
-            img_bytes = buffered.getvalue()
-            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-            
-            prompt = f"Analyze page {i+1} in {lang_inst}. No LaTeX."
-            page_desc = await analyze_vision_ollama(img_bytes, prompt)
-            
-            full_context += f"\n--- Page {i+1} ---\n{page_desc}\n"
-            pages_data.append({"page_num": i+1, "image_b64": img_b64, "desc": page_desc})
-
-        return {
-            "type": "pdf",
-            "filename": filename,
-            "summary": f"PDF ({len(images)} pages)",
-            "raw_context": full_context,
-            "pages": pages_data
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
-
-
-# ==========================================
-# [6] 메인 라우터 및 오케스트레이션
-# ==========================================
-app = FastAPI(title="Analyst V6 Full Integrated")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(
-    files: List[UploadFile] = File(...),
-    custom_prompt: Optional[str] = Form(""),
-    goal: Optional[str] = Form(""),
-    preprocess_mode: str = Form("Auto"),
-    language: str = Form("korean"),
-    equipment: str = Form("General")
-):
-    print(f"🚀 V6 Analysis Start. Files: {len(files)}, Mode: {preprocess_mode}, Eq: {equipment}")
-    
-    # 파일 메모리 로드
-    file_data_list = []
-    for file in files:
-        file_data_list.append({"name": file.filename, "content": await file.read()})
-    
-    tasks = []
-    final_results = []
-    
-    # 1. 파일별 처리
-    for f in file_data_list:
-        fname = f["name"].lower()
-        content = f["content"]
-        
-        if fname.endswith(('.xlsx', '.xls')):
-            # 엑셀은 즉시 실행 (블록 리스트 반환)
-            blocks = await parse_excel_v5(content, f["name"], equipment, preprocess_mode, goal)
-            final_results.extend(blocks)
-            
-        elif fname.endswith(('.ppt', '.pptx')):
-            tasks.append(parse_ppt_v4(content, f["name"], language))
-            
-        elif fname.endswith('.pdf'):
-            tasks.append(parse_pdf_v4(content, f["name"], language))
-            
-        elif fname.endswith(('.csv', '.txt')):
-            tasks.append(parse_spectrum_v5(content, f["name"], equipment, preprocess_mode, goal))
-            
-        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
-            tasks.append(parse_image_v5(content, f["name"], language, equipment, preprocess_mode, goal))
-
-    # 2. 비동기 작업 병렬 실행
-    if tasks:
-        other_results = await asyncio.gather(*tasks)
-        final_results.extend(list(other_results))
-    
-    # 3. 종합 리포트 생성
-    valid_data = [r for r in final_results if r.get("type") != "error"]
-    context_text = ""
-    for item in valid_data:
-        raw = item.get("raw_context", "")
-        if "mwg-internal" not in raw:
-            context_text += f"\n=== Source: {item['filename']} ===\n{raw[:2500]}\n" # 컨텍스트 길이 조절
-
-    lang_inst = "Korean" if language == 'korean' else "English"
-    system_prompt = f"""
-    You are a Senior Scientist. Write report in **{lang_inst}**.
-    User Goal: "{goal}".
-    Do NOT generate code. Analyze scientific meaning.
+    system_prompt = """
+    You are a Senior Scientist. 
+    Integrate 'Experimental Data' with 'Reference Literature'.
+    Write in Korean. Use Markdown tables.
     """
+    final_input = f"--- Data ---\n{data_context}\n\n--- Literature ---\n{lit_context}"
     
-    final_report = "분석 실패"
-    if context_text:
+    final_report = "Synthesis Failed"
+    if data_context or lit_context:
         try:
-            print("📝 Synthesizing Final Report...")
             res = await asyncio.to_thread(
                 ollama_client.chat,
                 model=TEXT_MODEL,
-                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': context_text}],
-                options={"num_ctx": 8192}
+                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': final_input}]
             )
             final_report = res['message']['content']
         except Exception as e:
-            final_report = f"Report Generation Error: {e}"
-
+            final_report = str(e)
+            
     return {"results": final_results, "final_report": final_report}
 
 @app.get("/", response_class=HTMLResponse)
@@ -831,7 +448,6 @@ async def serve_index():
 
 if __name__ == "__main__":
     import uvicorn
-    # 0.0.0.0으로 열어야 127.0.0.1 문제 회피 가능
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
@@ -839,434 +455,167 @@ if __name__ == "__main__":
 
 
 
-
-import os
-import io
-import asyncio
-import base64
-import json
-import re
-from typing import List, Dict, Any, Optional
-
-# [필수] 보안망 우회
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
-if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
-if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
-
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import numpy as np
-
-# 과학 연산 & 이미지 처리
-from scipy.signal import find_peaks, savgol_filter, peak_widths
-from scipy.optimize import curve_fit
-from scipy.ndimage import label, find_objects
-import cv2
-from skimage.feature import blob_log # 원자 검출용 (Laplacian of Gaussian)
-from ollama import Client 
-from PIL import Image
-from pdf2image import convert_from_bytes
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# --- 설정 ---
-OLLAMA_HOST = "http://127.0.0.1:11434"
-ollama_client = Client(host=OLLAMA_HOST)
-VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
-TEXT_MODEL = "llama3:70b"
-
-# --- [V6 핵심] AI 적응형 프로세서 ---
-
-class AdaptiveProcessor:
-    
-    @staticmethod
-    def gaussian(x, amp, cen, wid):
-        return amp * np.exp(-(x-cen)**2 / (2*wid**2))
-
-    @staticmethod
-    def fit_peaks(x, y, peaks):
-        """피크 위치에 가우시안 피팅 수행"""
-        fitted_params = []
-        for p in peaks:
-            try:
-                # 초기값 추정 (Amplitude, Center, Width)
-                p0 = [y[p], x[p], 1.0]
-                # 주변 데이터만 잘라서 피팅 (속도 향상)
-                window = 20
-                start, end = max(0, p-window), min(len(x), p+window)
-                popt, _ = curve_fit(AdaptiveProcessor.gaussian, x[start:end], y[start:end], p0=p0, maxfev=1000)
-                fitted_params.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
-            except:
-                pass
-        return fitted_params
-
-    @staticmethod
-    def process_spectrum(x, y, mode, goal):
-        """
-        Mode: None, Auto, AI-Adaptive
-        Goal: 사용자 입력 (예: '노이즈 제거해줘', '피팅해줘')
-        """
-        log = []
-        y_proc = y.copy()
-        features = {}
-
-        # 1. Mode: None (전처리 없음)
-        if mode == "None":
-            peaks, _ = find_peaks(y, height=np.max(y)*0.1)
-            return x, y, {"peaks": peaks, "note": "Raw Data Used"}
-
-        # 2. 파라미터 결정 (AI or Default)
-        window_length = 11
-        polyorder = 3
-        do_fitting = False
-        
-        if mode == "AI-Adaptive" and goal:
-            # 간단한 키워드 매칭으로 파라미터 조정 (속도를 위해 LLM 호출 대신 로직 처리)
-            # (더 고도화하려면 여기서 LLM에게 JSON 설정을 받아올 수 있음)
-            if "노이즈" in goal or "noise" in goal.lower():
-                window_length = 21 # 스무딩 강화
-                log.append("AI: Detected noise reduction goal -> Increased smoothing window.")
-            if "피팅" in goal or "fit" in goal.lower() or "gaussian" in goal.lower():
-                do_fitting = True
-                log.append("AI: Detected fitting goal -> Enabled Gaussian fitting.")
-            if "날것" in goal or "raw" in goal.lower():
-                window_length = 0 # 스무딩 끔
-
-        # 3. 신호 처리 수행
-        # Smoothing
-        if window_length > 3:
-            y_proc = savgol_filter(y_proc, window_length, polyorder)
-        
-        # Baseline Correction
-        baseline = np.percentile(y_proc, 5)
-        y_proc = y_proc - baseline
-        y_proc[y_proc < 0] = 0
-
-        # Peak Finding
-        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
-        
-        # Fitting (AI 결정)
-        fits = []
-        if do_fitting and len(peaks) > 0:
-            fits = AdaptiveProcessor.fit_peaks(x, y_proc, peaks)
-            features["fits"] = fits
-
-        # 결과 정리
-        peak_info = [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks]
-        features["peaks"] = peak_info
-        features["log"] = log
-        
-        return x, y_proc, features
-
-    @staticmethod
-    def process_image(img_bytes, mode, goal, equipment):
-        """
-        원자 영상(STEM) 처리 및 적응형 필터링
-        """
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        stats = {}
-        processed_img = img.copy()
-        
-        if mode == "None":
-            _, buffer = cv2.imencode('.jpg', img)
-            return base64.b64encode(buffer).decode('utf-8'), {"note": "Raw Image"}
-
-        # --- AI 판단 로직 ---
-        detect_atoms = False
-        denoise_strength = 5
-        
-        if mode == "AI-Adaptive":
-            if "원자" in goal or "atom" in goal.lower() or "STEM" in equipment:
-                detect_atoms = True
-            if "노이즈" in goal or "clean" in goal.lower():
-                denoise_strength = 9
-        elif equipment in ["STEM", "TEM"]: # Auto Mode 기본값
-            detect_atoms = True
-
-        # 1. Denoising
-        gray_blur = cv2.GaussianBlur(gray, (denoise_strength, denoise_strength), 0)
-
-        # 2. Atomic Analysis (Blob Detection)
-        if detect_atoms:
-            # scikit-image의 blob_log (Laplacian of Gaussian) 사용 - 원자 검출에 탁월
-            # min_sigma, max_sigma는 원자의 대략적 크기 픽셀 반경
-            blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, num_sigma=10, threshold=0.1)
-            
-            # 시각화 (빨간 원 그리기)
-            for blob in blobs:
-                y, x, r = blob
-                cv2.circle(processed_img, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
-            
-            stats["atom_count"] = len(blobs)
-            stats["method"] = "LoG (Laplacian of Gaussian)"
-        
-        # 3. General Particle Analysis (Watershed) - SEM 등
-        elif equipment in ["SEM", "Optical"]:
-             _, thresh = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-             cv2.drawContours(processed_img, contours, -1, (0, 255, 0), 1)
-             stats["particle_count"] = len(contours)
-             stats["method"] = "Otsu Thresholding"
-
-        _, buffer = cv2.imencode('.jpg', processed_img)
-        return base64.b64encode(buffer).decode('utf-8'), stats
-
-# --- [재사용] 엑셀 아일랜드 감지 ---
-def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
-    blocks = []
-    if df.empty: return blocks
-    mask = ~df.isnull().to_numpy()
-    structure = [[0,1,0], [1,1,1], [0,1,0]]
-    labeled_array, num_features = label(mask, structure=structure)
-    slices = find_objects(labeled_array)
-    for slice_obj in slices:
-        block = df.iloc[slice_obj]
-        if block.shape[0] >= 3 and block.shape[1] >= 2:
-            blocks.append(block.reset_index(drop=True))
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    try:
-        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        response = await asyncio.to_thread(
-            ollama_client.chat,
-            model=VISION_MODEL,
-            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
-        )
-        content = response['message']['content']
-        if "<script" in content or "mwg-internal" in content: return "[Error: Firewall Blocked]"
-        return content
-    except Exception as e: return f"[Vision Error: {e}]"
-
-# --- 메인 라우터 ---
-app = FastAPI(title="Analyst V6 Adaptive")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(
-    files: List[UploadFile] = File(...),
-    custom_prompt: Optional[str] = Form(""),
-    goal: Optional[str] = Form(""),       # 사용자 분석 목표 (예: "원자 세줘")
-    preprocess_mode: str = Form("Auto"),  # None, Auto, AI-Adaptive
-    language: str = Form("korean"),
-    equipment: str = Form("General")
-):
-    print(f"🚀 V6 Request. Mode: {preprocess_mode}, Goal: {goal}, Eq: {equipment}")
-    
-    file_data_list = []
-    for file in files:
-        file_data_list.append({"name": file.filename, "content": await file.read()})
-    
-    final_results = []
-    tasks = []
-
-    # 1. 엑셀 처리
-    for f in file_data_list:
-        fname = f["name"].lower()
-        content = f["content"]
-        
-        if fname.endswith(('.xlsx', '.xls')):
-            try:
-                xls = pd.ExcelFile(io.BytesIO(content))
-                for sheet_name in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-                    blocks = detect_excel_blocks(df)
-                    for i, block in enumerate(blocks):
-                        chart_data = []
-                        peaks_info = []
-                        fits_info = []
-                        
-                        # 숫자 추출 및 처리
-                        try:
-                            num_block = block.apply(pd.to_numeric, errors='coerce').dropna(how='all', axis=0).dropna(how='all', axis=1)
-                            if not num_block.empty and num_block.shape[0] > 5:
-                                x = num_block.iloc[:, 0].fillna(0).values
-                                y = num_block.iloc[:, 1].fillna(0).values if num_block.shape[1] > 1 else x
-                                
-                                # [V6] Adaptive Processing 호출
-                                x_proc, y_proc, feats = AdaptiveProcessor.process_spectrum(x, y, preprocess_mode, goal)
-                                peaks_info = feats.get('peaks', [])
-                                fits_info = feats.get('fits', [])
-                                
-                                step = max(1, len(x_proc) // 150)
-                                chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x_proc[::step], y_proc[::step])]
-                        except: pass
-
-                        raw_txt = block.to_csv(index=False, header=False)[:1000]
-                        peak_str = ", ".join([f"{p['x']:.1f}" for p in peaks_info[:5]])
-                        
-                        final_results.append({
-                            "type": "excel_block",
-                            "filename": f"{f['name']} ({sheet_name}-{i+1})",
-                            "summary": f"Peaks found: {len(peaks_info)}. Fits: {len(fits_info)}",
-                            "raw_context": f"Data: {equipment}\nPeaks: {peak_str}\nRaw:\n{raw_txt}",
-                            "chart_data": chart_data,
-                            "fits": fits_info
-                        })
-            except Exception as e:
-                final_results.append({"type": "error", "filename": f["name"], "msg": str(e)})
-
-        # 2. 이미지 처리
-        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
-            try:
-                img_b64, stats = AdaptiveProcessor.process_image(content, preprocess_mode, goal, equipment)
-                
-                # Vision LLM 해석
-                lang_inst = "Korean" if language == 'korean' else "English"
-                prompt = f"Analyze this {equipment} image in {lang_inst}. Goal: {goal}. CV Stats: {stats}"
-                desc = await analyze_vision_ollama(content, prompt)
-                
-                final_results.append({
-                    "type": "image",
-                    "filename": f["name"],
-                    "summary": desc,
-                    "image_b64": img_b64,
-                    "raw_context": f"Image Analysis ({equipment}): {desc}\nCV Stats: {stats}"
-                })
-            except Exception as e:
-                final_results.append({"type": "error", "filename": f["name"], "msg": str(e)})
-                
-        # 3. PDF/PPT/CSV (기존 V4 로직 사용 - 여기선 생략했으나 실제 코드엔 포함되어야 함)
-        # ... (이전 코드의 tasks.append 로직 그대로 사용)
-
-    # (간소화를 위해 다른 타입 스킵, 실제로는 여기에 gather 로직 필요)
-
-    # 종합 리포트
-    context_text = ""
-    for item in final_results:
-        if item.get("type") != "error":
-            raw = item.get("raw_context", "")
-            if "mwg-internal" not in raw:
-                context_text += f"\n=== Source: {item['filename']} ===\n{raw[:2000]}\n"
-
-    lang_inst = "Korean" if language == 'korean' else "English"
-    system_prompt = f"""
-    You are a Senior Scientist. Write report in **{lang_inst}**.
-    Focus on the user's goal: "{goal}".
-    Do NOT generate code.
-    """
-    
-    final_report = "분석 실패"
-    if context_text:
-        try:
-            res = await asyncio.to_thread(
-                ollama_client.chat,
-                model=TEXT_MODEL,
-                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': context_text}]
-            )
-            final_report = res['message']['content']
-        except Exception as e:
-            final_report = f"Error: {e}"
-
-    return {"results": final_results, "final_report": final_report}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-에이전트 모드 신규 웹페이지
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>AI Science Lab V6</title>
+    <title>AI Research Center V8</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-    <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap'); body { font-family: 'Inter', sans-serif; } .prose { max-width: none; overflow-wrap: break-word; } .loader { border: 3px solid #f3f3f3; border-top: 3px solid #db2777; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .prose table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        .prose th, .prose td { border: 1px solid #cbd5e1; padding: 8px; font-size: 0.9rem; }
+        .prose th { background-color: #f1f5f9; }
+        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #0ea5e9; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
 </head>
-<body class="bg-slate-50 text-slate-800">
+<body class="bg-slate-100 text-slate-800">
     <div id="app" class="min-h-screen p-6">
-        <header class="max-w-7xl mx-auto mb-8 flex items-center gap-3">
-            <div class="bg-pink-600 p-2.5 rounded-xl shadow-lg"><i data-lucide="atom" class="w-8 h-8 text-white"></i></div>
-            <div><h1 class="text-2xl font-bold text-slate-900">AI Science Lab V6</h1><p class="text-sm text-slate-500">Adaptive Preprocessing • Atomic Analysis</p></div>
+        <header class="max-w-7xl mx-auto mb-6 flex items-center gap-3">
+            <div class="bg-sky-600 p-2 rounded-lg shadow"><i data-lucide="microscope" class="w-6 h-6 text-white"></i></div>
+            <div><h1 class="text-2xl font-bold">AI Research Center V8</h1><p class="text-xs text-slate-500">Smart Cropping • Metadata OCR • Dual-Pass Analysis</p></div>
         </header>
 
-        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
-            <!-- Controls -->
-            <div class="lg:col-span-4 space-y-6">
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-                    <h2 class="font-bold mb-4">1. Configuration</h2>
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+            
+            <!-- Staging Area -->
+            <div class="lg:col-span-4 space-y-4">
+                <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                    <h2 class="font-bold mb-3 flex items-center gap-2"><i data-lucide="files" class="w-4 h-4"></i> Data Staging</h2>
                     
-                    <div class="mb-4">
-                        <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Preprocessing Mode</label>
-                        <select v-model="preprocessMode" class="w-full p-2 bg-slate-50 border rounded text-sm">
-                            <option value="Auto">Auto (Equipment Default)</option>
-                            <option value="None">None (Raw Data)</option>
-                            <option value="AI-Adaptive">AI-Adaptive (Goal Driven)</option>
-                        </select>
+                    <div class="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-sky-50 cursor-pointer" @click="$refs.f.click()">
+                        <input type="file" ref="f" multiple class="hidden" @change="addFiles">
+                        <p class="text-sm font-semibold text-slate-600">Add Files</p>
                     </div>
 
-                    <div class="mb-4" v-if="preprocessMode === 'AI-Adaptive'">
-                        <label class="block text-xs font-bold text-pink-500 uppercase mb-1">Analysis Goal (AI Target)</label>
-                        <input type="text" v-model="goal" class="w-full p-2 border-2 border-pink-100 rounded focus:border-pink-500 text-sm" placeholder="e.g., Count atoms, Remove noise, Fit Gaussian">
+                    <div v-if="stagedFiles.length" class="mt-4 space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+                        <div v-for="(item, i) in stagedFiles" :key="i" class="p-3 bg-slate-50 border rounded-lg text-sm">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="font-bold truncate w-2/3" :title="item.file.name">{{ item.file.name }}</span>
+                                <button @click="removeFile(i)" class="text-red-400 hover:text-red-600"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                            
+                            <!-- Configs -->
+                            <div class="grid grid-cols-1 gap-2">
+                                <select v-model="item.equipment" class="w-full p-1.5 border rounded text-xs bg-white font-semibold text-sky-700">
+                                    <optgroup label="Literature">
+                                        <option value="Document">Document (PDF/PPT)</option>
+                                    </optgroup>
+                                    <optgroup label="Spectroscopy">
+                                        <option value="XRD">XRD</option>
+                                        <option value="EDS">EDS</option>
+                                        <option value="Raman">Raman</option>
+                                    </optgroup>
+                                    <optgroup label="Microscopy">
+                                        <option value="SEM">SEM (Smart Crop)</option>
+                                        <option value="TEM">TEM (Smart Crop)</option>
+                                        <option value="STEM">STEM</option>
+                                        <option value="AFM">AFM</option>
+                                    </optgroup>
+                                </select>
+
+                                <!-- Mode Select (Disabled for Documents) -->
+                                <select v-if="item.equipment !== 'Document'" v-model="item.mode" class="w-full p-1.5 border rounded text-xs bg-white text-indigo-700">
+                                    <option value="Auto">✨ Auto Process</option>
+                                    <option value="None">🚫 None (Raw)</option>
+                                    <option value="AI-Adaptive">🧠 AI-Adaptive</option>
+                                </select>
+                                <div v-else class="text-[10px] text-slate-400 text-center italic">Processing skipped</div>
+
+                                <input v-if="item.equipment !== 'Document'" v-model="item.goal" type="text" placeholder="Goal (e.g. Count atoms)" class="w-full p-1.5 border rounded text-xs">
+                            </div>
+                        </div>
                     </div>
 
-                    <div class="mb-4">
-                        <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Equipment</label>
-                        <select v-model="equipment" class="w-full p-2 bg-slate-50 border rounded text-sm">
-                            <option value="STEM">STEM / TEM (Atomic)</option>
-                            <option value="SEM">SEM (Particles)</option>
-                            <option value="Spectrum">Spectrum (General)</option>
-                        </select>
-                    </div>
-
-                    <div class="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center cursor-pointer hover:bg-pink-50 hover:border-pink-300" @click="$refs.f.click()">
-                        <input type="file" ref="f" multiple class="hidden" @change="hF">
-                        <p class="font-semibold text-slate-600">Upload Data</p>
-                    </div>
-                    <div v-if="files.length" class="mt-2 text-xs text-slate-500">{{ files.length }} files selected</div>
-                </div>
-
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-                    <button @click="analyze" :disabled="isAnalyzing" class="w-full py-3 bg-pink-600 text-white rounded-xl font-bold flex justify-center gap-2 shadow-lg shadow-pink-200">
+                    <button @click="analyze" :disabled="isAnalyzing || stagedFiles.length===0" class="w-full mt-4 py-3 bg-sky-600 text-white rounded-lg font-bold flex justify-center gap-2 shadow hover:bg-sky-700 disabled:opacity-50">
                         <div v-if="isAnalyzing" class="loader"></div>
-                        <span>Run V6 Analysis</span>
+                        <span>Generate Synthesis Report</span>
                     </button>
                 </div>
             </div>
 
-            <!-- Results -->
+            <!-- Report Area -->
             <div class="lg:col-span-8">
-                <div v-if="result" class="space-y-6 animate-fade-in-up">
-                    <div id="report-content" class="bg-white p-10 rounded-2xl shadow-sm border border-slate-100">
-                        <div class="flex justify-between items-center mb-6">
-                            <h1 class="text-3xl font-bold">Analysis Report</h1>
-                            <span class="px-3 py-1 bg-pink-100 text-pink-700 rounded-full text-xs font-bold">{{ result.mode }} Mode</span>
+                <div v-if="result" class="space-y-6 animate-fade-in">
+                    <div id="report-view" class="bg-white p-8 rounded-xl shadow-sm border border-slate-200">
+                        <div class="flex justify-between items-end border-b pb-4 mb-6">
+                            <div>
+                                <h1 class="text-2xl font-bold text-slate-900">Comprehensive Report</h1>
+                                <p class="text-xs text-slate-500">{{ new Date().toLocaleString() }}</p>
+                            </div>
+                            <button @click="dlPDF" class="px-3 py-1.5 bg-slate-800 text-white text-xs rounded">PDF Export</button>
                         </div>
 
+                        <!-- Synthesis -->
                         <section class="mb-10">
-                            <h2 class="text-xl font-bold text-pink-700 mb-4 pb-2 border-b">Synthesis</h2>
-                            <div class="prose text-slate-700" v-html="md(result.final_report)"></div>
+                            <h2 class="text-lg font-bold text-sky-700 mb-3 border-b pb-1">1. Executive Synthesis</h2>
+                            <div class="prose prose-sm text-slate-700 max-w-none" v-html="md(result.final_report)"></div>
                         </section>
 
+                        <!-- Details -->
                         <section>
-                            <h2 class="text-xl font-bold text-slate-800 mb-6 pb-2 border-b">Visual Data</h2>
-                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-10 break-inside-avoid">
-                                <h3 class="font-bold text-lg mb-2">{{ item.filename }}</h3>
-
-                                <!-- Chart -->
-                                <div v-if="item.chart_data" class="bg-slate-50 p-4 rounded border mb-4">
-                                    <div :id="'chart-' + idx" class="w-full h-64 bg-white"></div>
-                                    <p v-if="item.fits && item.fits.length" class="text-xs text-green-600 mt-2 font-mono">
-                                        Gaussian Fits detected: {{ item.fits.length }} (Check graph)
-                                    </p>
+                            <h2 class="text-lg font-bold text-slate-800 mb-5 border-b pb-1">2. Data Evidence</h2>
+                            
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-8 p-4 bg-slate-50 rounded-lg border break-inside-avoid">
+                                <div class="flex items-center gap-2 mb-3">
+                                    <span class="px-2 py-0.5 bg-white border rounded text-[10px] font-bold uppercase text-slate-500">{{ item.equipment }}</span>
+                                    <h3 class="font-bold text-sm">{{ item.filename }}</h3>
                                 </div>
 
-                                <!-- Image -->
-                                <div v-if="item.image_b64" class="text-center mb-4 bg-slate-50 p-4 rounded border">
-                                    <img :src="'data:image/jpeg;base64,' + item.image_b64" class="max-h-96 mx-auto rounded shadow-sm bg-black">
+                                <!-- Spectrum Chart -->
+                                <div v-if="item.chart_data" class="bg-white p-2 rounded border mb-3">
+                                    <div :id="'chart-'+idx" class="w-full h-60"></div>
+                                    <div class="text-[10px] text-slate-400 mt-1 flex gap-2 justify-center">
+                                        <span class="flex items-center gap-1"><span class="w-2 h-2 bg-gray-300 rounded-full"></span>Raw</span>
+                                        <span class="flex items-center gap-1"><span class="w-2 h-2 bg-sky-500 rounded-full"></span>Proc</span>
+                                        <span class="flex items-center gap-1"><span class="w-2 h-2 bg-orange-400 rounded-full"></span>Base</span>
+                                    </div>
                                 </div>
 
-                                <div class="text-sm prose" v-html="md(item.summary)"></div>
+                                <!-- Image Viewer (Raw / Proc / Info Bar) -->
+                                <div v-if="item.raw_b64" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 mb-2 text-xs justify-center">
+                                        <button @click="item.view='proc'" :class="item.view!=='raw'?'font-bold text-sky-600':''">Processed Body</button>
+                                        <span class="text-slate-300">|</span>
+                                        <button @click="item.view='raw'" :class="item.view==='raw'?'font-bold text-sky-600':''">Original</button>
+                                        <span class="text-slate-300" v-if="item.footer_b64">|</span>
+                                        <button v-if="item.footer_b64" @click="item.view='footer'" :class="item.view==='footer'?'font-bold text-sky-600':''">Info Bar (OCR)</button>
+                                    </div>
+                                    
+                                    <!-- Main Image -->
+                                    <img v-if="item.view!=='footer'" :src="'data:image/jpeg;base64,' + (item.view==='raw' ? item.raw_b64 : item.proc_b64)" class="max-h-80 mx-auto object-contain bg-black">
+                                    
+                                    <!-- Footer Image -->
+                                    <img v-if="item.view==='footer'" :src="'data:image/jpeg;base64,' + item.footer_b64" class="max-h-24 mx-auto object-contain border mt-2">
+
+                                    <p class="text-[10px] text-slate-400 mt-2 text-center" v-if="item.stats">Stats: {{ item.stats }}</p>
+                                </div>
+
+                                <!-- Docs -->
+                                <div v-if="item.pages" class="grid grid-cols-1 gap-4">
+                                    <div v-for="p in item.pages" :key="p.page_num" class="flex gap-3 bg-white p-3 rounded border">
+                                        <img :src="'data:image/jpeg;base64,'+p.image_b64" class="w-24 object-contain border">
+                                        <div class="text-xs prose" v-html="md(p.desc)"></div>
+                                    </div>
+                                </div>
+                                <div v-if="item.slides" class="space-y-2">
+                                    <div v-for="s in item.slides" :key="s.slide_num" class="bg-white p-3 rounded border">
+                                        <div class="font-bold text-xs mb-1 text-sky-600">Slide {{s.slide_num}}</div>
+                                        <div class="text-xs prose">{{ s.text }}</div>
+                                        <div v-if="s.images.length" class="grid grid-cols-3 gap-2 mt-2">
+                                            <img v-for="(im,imx) in s.images" :key="imx" :src="'data:image/jpeg;base64,'+im.b64" class="border">
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="text-xs text-slate-600 mt-2 prose" v-html="md(item.summary)"></div>
                             </div>
                         </section>
                     </div>
@@ -1278,1031 +627,59 @@ if __name__ == "__main__":
         const { createApp, ref, nextTick } = Vue;
         createApp({
             setup() {
-                const files = ref([]);
+                const stagedFiles = ref([]);
                 const isAnalyzing = ref(false);
                 const result = ref(null);
-                const preprocessMode = ref("Auto");
-                const goal = ref("");
-                const equipment = ref("STEM");
-
+                const renderer = new marked.Renderer();
+                renderer.image = () => '';
+                marked.use({ renderer });
                 const md = (t) => marked.parse(t||'');
-                const hF = (e) => files.value.push(...e.target.files);
+
+                const addFiles = (e) => {
+                    Array.from(e.target.files).forEach(f => {
+                        let eq = 'General';
+                        if(f.name.match(/\.(pdf|ppt|pptx)$/i)) eq = 'Document';
+                        stagedFiles.value.push({ file: f, equipment: eq, goal: '', mode: 'Auto', view: 'proc' });
+                    });
+                    e.target.value = ''; 
+                };
+                const removeFile = (i) => stagedFiles.value.splice(i, 1);
 
                 const analyze = async () => {
                     isAnalyzing.value = true;
                     const fd = new FormData();
-                    files.value.forEach(f => fd.append('files', f));
-                    fd.append('preprocess_mode', preprocessMode.value);
-                    fd.append('goal', goal.value);
-                    fd.append('equipment', equipment.value);
+                    const configs = {};
+                    stagedFiles.value.forEach(item => {
+                        fd.append('files', item.file);
+                        configs[item.file.name] = { equipment: item.equipment, goal: item.goal, mode: item.mode };
+                    });
+                    fd.append('file_configs', JSON.stringify(configs));
 
                     try {
                         const res = await fetch('/api/analyze', { method: 'POST', body: fd });
                         const data = await res.json();
-                        result.value = { ...data, mode: preprocessMode.value };
+                        result.value = data;
                         await nextTick();
                         
-                        // Draw Charts
-                        data.results.forEach((item, idx) => {
-                            if (item.chart_data) {
-                                const trace = {
-                                    x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y),
-                                    mode: 'lines', name: 'Data', line: {color: '#db2777'}
-                                };
-                                Plotly.newPlot('chart-'+idx, [trace], {margin:{t:10,b:30,l:40,r:10}}, {displayModeBar:false});
+                        data.results.forEach((item, i) => {
+                            if(item.chart_data) {
+                                const raw = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_raw), mode:'lines', name:'Raw', line:{color:'#cbd5e1', width:1} };
+                                const proc = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_proc), mode:'lines', name:'Proc', line:{color:'#0ea5e9', width:2} };
+                                const base = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_base), mode:'lines', name:'Base', line:{color:'#fb923c', width:1, dash:'dot'} };
+                                Plotly.newPlot('chart-'+i, [raw, base, proc], {margin:{t:10,b:30,l:40,r:10}, showlegend:false}, {displayModeBar:false});
                             }
                         });
                         lucide.createIcons();
                     } catch(e) { alert(e); } 
                     finally { isAnalyzing.value = false; }
                 };
-                setTimeout(() => lucide.createIcons(), 100);
-                return { files, isAnalyzing, result, preprocessMode, goal, equipment, hF, analyze, md };
-            }
-        }).mount('#app');
-    </script>
-</body>
-</html>
 
-
-
-
-
-
-
-신규 코드
-
-import os
-import io
-import asyncio
-import base64
-import json
-import re
-from typing import List, Dict, Any, Optional
-from contextlib import asynccontextmanager
-
-# --- [필수] 프록시 강제 해제 ---
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
-if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
-if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
-# ------------------------------
-
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-import pandas as pd
-import numpy as np
-from scipy.signal import find_peaks
-from scipy.ndimage import label, find_objects # ★ 핵심 추가: 아일랜드 감지용
-from ollama import Client 
-from PIL import Image
-from pdf2image import convert_from_bytes
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# --- 설정 ---
-OLLAMA_HOST = "http://127.0.0.1:11434" 
-ollama_client = Client(host=OLLAMA_HOST)
-
-VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
-TEXT_MODEL = "llama3:70b"
-
-# --- [핵심] 엑셀 섬(Island) 감지 알고리즘 ---
-
-def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
-    """
-    컴퓨터 비전의 'Connected Components Labeling'을 사용하여
-    상하좌우로 떨어진 모든 데이터 블록을 독립적으로 감지합니다.
-    """
-    blocks = []
-    if df.empty: return blocks
-
-    # 1. 데이터가 있는 곳을 True, 없는 곳을 False로 마스킹
-    #    (헤더나 인덱스 처리를 위해 일단 전체를 봄)
-    mask = ~df.isnull().to_numpy() # numpy 배열로 변환
-    
-    # 2. 연결된 요소 라벨링 (대각선 연결도 포함하려면 structure=[[1,1,1],[1,1,1],[1,1,1]])
-    #    여기서는 상하좌우 연결만 인정 (십자가 구조)
-    structure = [[0,1,0], [1,1,1], [0,1,0]]
-    labeled_array, num_features = label(mask, structure=structure)
-    
-    if num_features == 0:
-        return blocks
-
-    # 3. 각 라벨(섬)별로 bounding box 추출
-    slices = find_objects(labeled_array)
-    
-    for i, slice_obj in enumerate(slices):
-        # slice_obj는 (row_slice, col_slice) 튜플임
-        # 원본 데이터프레임에서 해당 영역만 잘라냄
-        block = df.iloc[slice_obj]
-        
-        # 4. 너무 작은 블록(노이즈) 제거 (예: 2x2 미만)
-        if block.shape[0] >= 2 and block.shape[1] >= 2:
-            # 인덱스 초기화 (깔끔하게 처리하기 위함)
-            blocks.append(block.reset_index(drop=True))
-            
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    """Vision 모델 호출"""
-    try:
-        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        response = await asyncio.to_thread(
-            ollama_client.chat,
-            model=VISION_MODEL,
-            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
-        )
-        content = response['message']['content']
-        if "<script" in content or "mwg-internal" in content:
-            return "[Error: Blocked by Firewall]"
-        return content
-    except Exception as e:
-        return f"[Vision Error: {e}]"
-
-# --- 파서 (Parsers) ---
-
-async def parse_excel_v5(content: bytes, filename: str, lang: str):
-    """엑셀 파싱 (개선된 블록 감지 적용)"""
-    results = []
-    try:
-        xls = pd.ExcelFile(io.BytesIO(content))
-        
-        for sheet_name in xls.sheet_names:
-            # 헤더 없이 원본 그대로 읽음
-            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-            
-            # ★ 개선된 감지 로직 호출
-            blocks = detect_excel_blocks(df)
-            
-            print(f"📊 Sheet '{sheet_name}': Detected {len(blocks)} blocks.") # 디버깅용 로그
-
-            for i, block in enumerate(blocks):
-                # 차트 데이터 추출 시도
-                chart_data = []
-                try:
-                    # 블록 내에서 숫자로만 구성된 가장 큰 영역 찾기
-                    # (헤더나 텍스트 컬럼을 제외하기 위함)
-                    num_block = block.apply(pd.to_numeric, errors='coerce')
-                    num_block = num_block.dropna(how='all', axis=0).dropna(how='all', axis=1)
-                    
-                    if not num_block.empty and num_block.shape[0] > 2:
-                        # 첫번째 숫자 컬럼 = X, 두번째 숫자 컬럼 = Y
-                        x = num_block.iloc[:, 0].fillna(0).values
-                        y = num_block.iloc[:, 1].fillna(0).values if num_block.shape[1] > 1 else x
-                        
-                        # 데이터 포인트가 너무 많으면 샘플링
-                        step = max(1, len(x) // 100)
-                        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x[::step], y[::step])]
-                except:
-                    pass
-
-                # LLM에게 줄 텍스트 (앞부분 2000자)
-                raw_csv = block.to_csv(index=False, header=False)[:2000]
-                
-                results.append({
-                    "type": "excel_block",
-                    "filename": f"{filename} ({sheet_name} - Block {i+1})",
-                    "summary": f"Data Block {i+1} found in sheet '{sheet_name}'. Contains {block.shape[0]} rows x {block.shape[1]} columns.",
-                    "raw_context": f"Excel Data Block {i+1} ({sheet_name}):\n{raw_csv}",
-                    "chart_data": chart_data,
-                    "image_b64": None
-                })
-                
-    except Exception as e:
-        return [{"type": "error", "filename": filename, "msg": str(e)}]
-    return results
-
-async def parse_ppt_v4(content: bytes, filename: str, lang: str):
-    """PPTX 파싱"""
-    try:
-        prs = Presentation(io.BytesIO(content))
-        slides_data = []
-        full_context = ""
-        lang_inst = "Korean" if lang == 'korean' else "English"
-
-        for i, slide in enumerate(prs.slides):
-            slide_text = []
-            extracted_images = []
-            
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    slide_text.append(shape.text)
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    try:
-                        image_blob = shape.image.blob
-                        img_b64 = base64.b64encode(image_blob).decode('utf-8')
-                        prompt = f"Analyze this image in {lang_inst}. Explain scientific details."
-                        desc = await analyze_vision_ollama(image_blob, prompt)
-                        extracted_images.append({"b64": img_b64, "desc": desc})
-                    except: pass
-
-            combined_txt = "\n".join(slide_text)
-            img_desc_combined = "\n".join([f"[Image]: {img['desc']}" for img in extracted_images])
-            full_context += f"### Slide {i+1}\nText: {combined_txt}\nVisuals: {img_desc_combined}\n"
-            
-            slides_data.append({
-                "slide_num": i+1,
-                "text": combined_txt,
-                "images": extracted_images
-            })
-            
-        return {
-            "type": "ppt",
-            "filename": filename,
-            "summary": f"**PPT Analysis ({len(prs.slides)} slides)**",
-            "raw_context": full_context,
-            "slides": slides_data
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_pdf_v4(content: bytes, filename: str, lang: str):
-    """PDF 파싱"""
-    try:
-        images = convert_from_bytes(content, dpi=150, fmt='jpeg')
-        pages_data = []
-        full_context = ""
-        lang_inst = "Korean" if lang == 'korean' else "English"
-        
-        print(f"📄 PDF: {filename} ({len(images)} pages)")
-
-        for i, img in enumerate(images):
-            buffered = io.BytesIO()
-            img.save(buffered, format="JPEG")
-            img_bytes = buffered.getvalue()
-            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-            
-            prompt = f"""
-            Analyze page {i+1} in {lang_inst}.
-            1. Summarize content.
-            2. Describe figures/tables clearly.
-            3. No LaTeX. Plain text only.
-            """
-            print(f"   - Page {i+1} Vision Analysis...")
-            page_desc = await analyze_vision_ollama(img_bytes, prompt)
-            
-            full_context += f"\n--- Page {i+1} ---\n{page_desc}\n"
-            pages_data.append({"page_num": i+1, "image_b64": img_b64, "desc": page_desc})
-
-        return {
-            "type": "pdf",
-            "filename": filename,
-            "summary": f"**PDF Analysis ({len(images)} pages)**",
-            "raw_context": full_context,
-            "pages": pages_data
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
-
-async def parse_image_v4(content: bytes, filename: str, lang: str):
-    try:
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        img_bytes = buffered.getvalue()
-        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-        
-        lang_inst = "Korean" if lang == 'korean' else "English"
-        desc = await analyze_vision_ollama(img_bytes, f"Analyze in {lang_inst}. Focus on scientific details.")
-        
-        return {
-            "type": "image",
-            "filename": filename,
-            "summary": desc,
-            "image_b64": img_b64,
-            "raw_context": desc
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_spectrum(content: bytes, filename: str):
-    try:
-        try: df = pd.read_csv(io.BytesIO(content))
-        except: df = pd.read_csv(io.BytesIO(content), delimiter='\t')
-        x = df.iloc[:, 0].values
-        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
-        peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
-        step = max(1, len(x) // 500)
-        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
-        return {
-            "type": "spectrum",
-            "filename": filename,
-            "summary": f"Spectrum: {len(peaks)} peaks.",
-            "chart_data": chart_data,
-            "raw_context": f"Spectrum Peaks: {peaks}, Max: {np.max(y)}"
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-# --- 메인 라우터 ---
-app = FastAPI(title="Analyst V5")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(
-    files: List[UploadFile] = File(...),
-    custom_prompt: Optional[str] = Form(""),
-    language: str = Form("korean")
-):
-    print(f"🚀 Processing Request. Lang: {language}")
-    
-    file_data_list = []
-    for file in files:
-        file_data_list.append({"name": file.filename, "content": await file.read()})
-    
-    tasks = []
-    final_results = []
-    
-    for f in file_data_list:
-        fname = f["name"].lower()
-        content = f["content"]
-        
-        if fname.endswith(('.xlsx', '.xls')):
-            # 엑셀은 즉시 처리
-            blocks = await parse_excel_v5(content, f["name"], language)
-            final_results.extend(blocks)
-        elif fname.endswith(('.ppt', '.pptx')):
-            tasks.append(parse_ppt_v4(content, f["name"], language))
-        elif fname.endswith('.pdf'):
-            tasks.append(parse_pdf_v4(content, f["name"], language))
-        elif fname.endswith(('.csv', '.txt')):
-            tasks.append(parse_spectrum(content, f["name"]))
-        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
-            tasks.append(parse_image_v4(content, f["name"], language))
-
-    other_results = await asyncio.gather(*tasks)
-    final_results.extend(list(other_results))
-    
-    # 종합 리포트
-    valid_data = [r for r in final_results if r.get("type") != "error"]
-    context_text = ""
-    for item in valid_data:
-        raw = item.get("raw_context", "")
-        if "mwg-internal" not in raw:
-            context_text += f"\n=== Source: {item['filename']} ===\n{raw[:5000]}\n"
-
-    lang_inst = "Korean" if language == 'korean' else "English"
-    system_prompt = f"You are a Senior Scientist. Write the report in **{lang_inst}**. User Request: {custom_prompt}"
-    
-    final_report = "분석 실패"
-    if context_text:
-        try:
-            print("📝 Synthesizing Report...")
-            res = await asyncio.to_thread(
-                ollama_client.chat,
-                model=TEXT_MODEL,
-                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': context_text}]
-            )
-            final_report = res['message']['content']
-        except Exception as e:
-            final_report = f"Error: {e}"
-
-    return {"results": final_results, "final_report": final_report}
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    if os.path.exists("index.html"): return FileResponse("index.html")
-    return "<h1>index.html not found</h1>"
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
-
-
-import os
-import io
-import asyncio
-import base64
-import json
-import re
-from typing import List, Dict, Any, Optional
-from contextlib import asynccontextmanager
-
-# --- [필수] 프록시 강제 해제 (보안망 우회) ---
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
-if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
-if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
-# ---------------------------------------------
-
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-import pandas as pd
-import numpy as np
-from scipy.signal import find_peaks
-from ollama import Client 
-from PIL import Image
-from pdf2image import convert_from_bytes
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# --- 설정 ---
-OLLAMA_HOST = "http://127.0.0.1:11434" 
-ollama_client = Client(host=OLLAMA_HOST)
-
-# 모델 (보유하신 모델명 확인)
-VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
-TEXT_MODEL = "llama3:70b"
-
-# --- 유틸리티 ---
-
-def clean_latex(text: str) -> str:
-    """간단한 LaTeX 태그 제거 (가독성 향상)"""
-    # $...$ 제거하고 내부 텍스트만 남기거나, 특수문자 완화
-    # 여기서는 복잡한 변환보다, LLM에게 Plain Text를 요청하는 것이 우선임.
-    return text
-
-def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
-    """엑셀 블록 감지 로직 개선"""
-    blocks = []
-    if df.empty: return blocks
-    
-    # 데이터가 있는 행/열만 남기기 (전체 공백 제거)
-    df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
-    
-    if df.empty: return blocks
-
-    # 인덱스 리셋하여 연속성 확인
-    df = df.reset_index(drop=True)
-    
-    # 간단하게: 3행 이상 연속된 빈 행이 있으면 분리
-    # (복잡한 로직 대신, 확실한 데이터 덩어리를 찾음)
-    
-    # 1. 일단 전체를 하나의 블록으로 보되, 
-    # 데이터 타입이 섞여있거나 헤더가 중간에 나오면 쪼개는 방식은 복잡하므로
-    # 현재는 전체 시트를 하나의 유효 블록으로 처리하되, 
-    # 너무 듬성듬성한 경우(Island)를 위해 클러스터링을 해야 함.
-    
-    # 여기서는 '빈 행'을 기준으로 단순 분리 (가장 효과적)
-    is_empty = df.isnull().all(axis=1)
-    groups = (is_empty != is_empty.shift()).cumsum()
-    
-    for _, group in df.groupby(groups):
-        if not group.isnull().all().all(): # 데이터가 있는 그룹만
-            # 2x2 이상인 경우만 블록으로 인정
-            if group.shape[0] >= 2 and group.shape[1] >= 2:
-                blocks.append(group)
-                
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    """Vision 모델 호출"""
-    try:
-        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        response = await asyncio.to_thread(
-            ollama_client.chat,
-            model=VISION_MODEL,
-            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
-        )
-        content = response['message']['content']
-        
-        # 보안망 에러 필터링
-        if "<script" in content or "mwg-internal" in content:
-            return "[Error: Image Blocked by Firewall]"
-        return content
-    except Exception as e:
-        return f"[Vision Error: {e}]"
-
-# --- 파서 (Parsers) ---
-
-async def parse_excel_v4(content: bytes, filename: str, lang: str):
-    """엑셀 파싱 (모든 블록 반환)"""
-    results = []
-    try:
-        xls = pd.ExcelFile(io.BytesIO(content))
-        for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-            blocks = detect_excel_blocks(df)
-            
-            if not blocks: # 블록 감지 실패 시 전체를 하나로 시도
-                blocks = [df]
-
-            for i, block in enumerate(blocks):
-                # 차트 데이터 추출 시도
-                chart_data = []
-                try:
-                    # 숫자 컬럼만 추출
-                    num_df = block.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all')
-                    if not num_df.empty and num_df.shape[0] > 1:
-                        x = num_df.iloc[:, 0].fillna(0).values
-                        y = num_df.iloc[:, 1].fillna(0).values if num_df.shape[1] > 1 else x
-                        # 샘플링
-                        step = max(1, len(x) // 100)
-                        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x[::step], y[::step])]
-                except:
-                    pass
-
-                # 데이터 미리보기 (텍스트)
-                raw_csv = block.to_csv(index=False, header=False)[:1000]
-                
-                results.append({
-                    "type": "excel_block",
-                    "filename": f"{filename} ({sheet_name} - Block {i+1})",
-                    "summary": f"Data extracted from {sheet_name}, Block {i+1}.",
-                    "raw_context": f"Excel Data ({sheet_name}):\n{raw_csv}",
-                    "chart_data": chart_data,
-                    "image_b64": None # 엑셀은 이미지가 없음
-                })
-    except Exception as e:
-        return [{"type": "error", "filename": filename, "msg": str(e)}]
-    return results
-
-async def parse_ppt_v4(content: bytes, filename: str, lang: str):
-    """PPTX 파싱 (이미지 추출 포함)"""
-    try:
-        prs = Presentation(io.BytesIO(content))
-        slides_data = []
-        full_context = ""
-        
-        lang_instruction = "Korean" if lang == 'korean' else "English"
-
-        for i, slide in enumerate(prs.slides):
-            slide_text = []
-            extracted_images = []
-            
-            # 1. 텍스트 추출
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    slide_text.append(shape.text)
-                
-                # 2. 이미지 추출 및 분석
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    try:
-                        image_blob = shape.image.blob
-                        # Base64로 변환하여 프론트엔드 전송 준비
-                        img_b64 = base64.b64encode(image_blob).decode('utf-8')
-                        
-                        # Vision 분석
-                        prompt = f"Analyze this image in {lang_instruction}. If it's a chart, explain the trend."
-                        desc = await analyze_vision_ollama(image_blob, prompt)
-                        
-                        extracted_images.append({
-                            "b64": img_b64,
-                            "desc": desc
-                        })
-                    except:
-                        pass
-
-            slide_txt_combined = "\n".join(slide_text)
-            img_desc_combined = "\n".join([f"[Image]: {img['desc']}" for img in extracted_images])
-            
-            # 컨텍스트 누적
-            full_context += f"### Slide {i+1}\nText: {slide_txt_combined}\nVisual Analysis: {img_desc_combined}\n"
-            
-            # 결과 구조화
-            slides_data.append({
-                "slide_num": i+1,
-                "text": slide_txt_combined,
-                "images": extracted_images # 이미지 리스트
-            })
-            
-        return {
-            "type": "ppt",
-            "filename": filename,
-            "summary": f"**PPT Analysis ({len(prs.slides)} slides)**",
-            "raw_context": full_context,
-            "slides": slides_data # 상세 데이터 포함
-        }
-
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_pdf_v4(content: bytes, filename: str, lang: str):
-    """PDF 파싱 (페이지별 이미지 및 요약)"""
-    try:
-        images = convert_from_bytes(content, dpi=150, fmt='jpeg') # DPI 조정 (속도/용량)
-        pages_data = []
-        full_context = ""
-        
-        lang_instruction = "Korean" if lang == 'korean' else "English"
-        
-        print(f"📄 PDF Processing: {filename} ({len(images)} pages)")
-
-        for i, img in enumerate(images):
-            # 이미지 Base64 변환 (프론트엔드 표시용)
-            buffered = io.BytesIO()
-            img.save(buffered, format="JPEG")
-            img_bytes = buffered.getvalue()
-            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-            
-            # Vision 분석
-            # LaTeX 출력을 막기 위해 Plain Text 요청
-            prompt = f"""
-            Analyze this page in {lang_instruction}.
-            1. Summarize the main content.
-            2. If there are tables/charts, describe them in detail.
-            3. Do NOT use LaTeX formatting (no $ symbols). Use plain text.
-            4. Do NOT hallucinate image tags like <!-- image -->.
-            """
-            print(f"   - Analyzing Page {i+1}...")
-            page_desc = await analyze_vision_ollama(img_bytes, prompt)
-            
-            full_context += f"\n--- Page {i+1} ---\n{page_desc}\n"
-            
-            pages_data.append({
-                "page_num": i+1,
-                "image_b64": img_b64,
-                "desc": page_desc
-            })
-
-        return {
-            "type": "pdf",
-            "filename": filename,
-            "summary": f"**PDF Analysis ({len(images)} pages)**",
-            "raw_context": full_context,
-            "pages": pages_data
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
-
-async def parse_image_v4(content: bytes, filename: str, lang: str):
-    """단일 이미지 파싱"""
-    try:
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        img_bytes = buffered.getvalue()
-        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-        
-        lang_instruction = "Korean" if lang == 'korean' else "English"
-        desc = await analyze_vision_ollama(img_bytes, f"Analyze this image in {lang_instruction}. Focus on scientific details.")
-        
-        return {
-            "type": "image",
-            "filename": filename,
-            "summary": desc,
-            "image_b64": img_b64,
-            "raw_context": desc
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-async def parse_spectrum(content: bytes, filename: str):
-    """스펙트럼 (언어 무관, 수치 분석)"""
-    try:
-        try: df = pd.read_csv(io.BytesIO(content))
-        except: df = pd.read_csv(io.BytesIO(content), delimiter='\t')
-        x = df.iloc[:, 0].values
-        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
-        peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
-        step = max(1, len(x) // 500)
-        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
-        return {
-            "type": "spectrum",
-            "filename": filename,
-            "summary": f"Spectrum: {len(peaks)} peaks detected.",
-            "chart_data": chart_data,
-            "raw_context": f"Spectrum Peaks at: {peaks}, Max: {np.max(y)}"
-        }
-    except Exception as e:
-        return {"type": "error", "filename": filename, "msg": str(e)}
-
-
-# --- 메인 라우터 ---
-app = FastAPI(title="Analyst V4")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(
-    files: List[UploadFile] = File(...),
-    custom_prompt: Optional[str] = Form(""),
-    language: str = Form("korean")
-):
-    print(f"🚀 Processing V4 Request. Lang: {language}")
-    
-    file_data_list = []
-    for file in files:
-        file_data_list.append({"name": file.filename, "content": await file.read()})
-    
-    tasks = []
-    final_results = []
-    
-    # 1. 태스크 생성
-    for f in file_data_list:
-        fname = f["name"].lower()
-        content = f["content"]
-        
-        if fname.endswith(('.xlsx', '.xls')):
-            # 엑셀은 즉시 처리 (결과가 리스트라 구조상 분리)
-            blocks = await parse_excel_v4(content, f["name"], language)
-            final_results.extend(blocks)
-        elif fname.endswith(('.ppt', '.pptx')):
-            tasks.append(parse_ppt_v4(content, f["name"], language))
-        elif fname.endswith('.pdf'):
-            tasks.append(parse_pdf_v4(content, f["name"], language))
-        elif fname.endswith(('.csv', '.txt')):
-            tasks.append(parse_spectrum(content, f["name"]))
-        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
-            tasks.append(parse_image_v4(content, f["name"], language))
-
-    # 2. 비동기 실행
-    other_results = await asyncio.gather(*tasks)
-    final_results.extend(list(other_results))
-    
-    # 3. 종합 리포트 생성
-    valid_data = [r for r in final_results if r.get("type") != "error"]
-    context_text = ""
-    for item in valid_data:
-        # mwg-internal 필터링
-        raw = item.get("raw_context", "")
-        if "mwg-internal" not in raw:
-            context_text += f"\n=== Source: {item['filename']} ===\n{raw[:5000]}\n"
-
-    lang_inst = "Korean (Hangul)" if language == 'korean' else "English"
-    
-    system_prompt = f"""
-    You are a Senior Scientist. Synthesize the results.
-    1. Write the report in **{lang_inst}**.
-    2. Do NOT use LaTeX syntax for text. Use plain text.
-    3. Interpret the data deeply.
-    4. User Request: "{custom_prompt}"
-    """
-    
-    final_report = "분석 실패"
-    if context_text:
-        try:
-            print("📝 Synthesizing Report...")
-            res = await asyncio.to_thread(
-                ollama_client.chat,
-                model=TEXT_MODEL,
-                messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': f"Analysis Data:\n{context_text}"}
-                ]
-            )
-            final_report = res['message']['content']
-        except Exception as e:
-            final_report = f"Synthesis Error: {e}"
-
-    return {"results": final_results, "final_report": final_report}
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    if os.path.exists("index.html"): return FileResponse("index.html")
-    return "<h1>index.html not found</h1>"
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
-
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Analyst V4 (Pro)</title>
-    
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-        
-        /* 텍스트 줄바꿈 강제 적용 (레이아웃 깨짐 방지) */
-        .prose { 
-            max-width: none; 
-            overflow-wrap: break-word; 
-            word-wrap: break-word; 
-            word-break: break-word;
-        }
-        .prose pre { white-space: pre-wrap; word-break: break-all; }
-        
-        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #4f46e5; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    </style>
-</head>
-<body class="bg-slate-50 text-slate-800">
-    <div id="app" class="min-h-screen p-6">
-        
-        <!-- Header -->
-        <header class="max-w-7xl mx-auto mb-8 flex items-center justify-between">
-            <div class="flex items-center gap-3">
-                <div class="bg-indigo-600 p-2.5 rounded-xl shadow-lg">
-                    <i data-lucide="microscope" class="w-8 h-8 text-white"></i>
-                </div>
-                <div>
-                    <h1 class="text-2xl font-bold text-slate-900">AI Analyst V4</h1>
-                    <p class="text-sm text-slate-500">Dual GPU / Multi-Block Excel / PDF Full Parse</p>
-                </div>
-            </div>
-        </header>
-
-        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
-            
-            <!-- Left Panel -->
-            <div class="lg:col-span-4 space-y-6">
-                <!-- Upload -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-                    <h2 class="font-bold mb-4 flex items-center gap-2">Files</h2>
-                    <div 
-                        class="border-2 border-dashed border-slate-200 rounded-xl p-8 text-center cursor-pointer hover:border-indigo-400 hover:bg-indigo-50"
-                        @click="$refs.fileInput.click()"
-                        @drop.prevent="handleDrop" @dragover.prevent
-                    >
-                        <input type="file" ref="fileInput" multiple class="hidden" @change="handleFileSelect">
-                        <p class="font-semibold text-slate-600">Click to Upload</p>
-                    </div>
-                    <div class="mt-4 space-y-2">
-                        <div v-for="(f, i) in files" :key="i" class="flex justify-between p-2 bg-slate-50 rounded text-sm">
-                            <span class="truncate">{{ f.name }}</span>
-                            <button @click="removeFile(i)" class="text-red-400">x</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Options -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-                    <h2 class="font-bold mb-4">Options</h2>
-                    <div class="mb-4">
-                        <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Language</label>
-                        <select v-model="language" class="w-full p-2 bg-slate-50 border rounded">
-                            <option value="korean">한글 (Korean)</option>
-                            <option value="english">English</option>
-                        </select>
-                    </div>
-                    <div class="mb-4">
-                        <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Custom Prompt</label>
-                        <textarea v-model="customPrompt" class="w-full p-2 bg-slate-50 border rounded text-sm" rows="3"></textarea>
-                    </div>
-                    <button @click="analyze" :disabled="isAnalyzing || files.length===0" class="w-full py-3 bg-indigo-600 text-white rounded-xl font-bold flex justify-center gap-2">
-                        <div v-if="isAnalyzing" class="loader"></div>
-                        <span>{{ isAnalyzing ? 'Analyzing...' : 'Start Analysis' }}</span>
-                    </button>
-                </div>
-            </div>
-
-            <!-- Right Panel -->
-            <div class="lg:col-span-8">
-                <div v-if="result" class="space-y-6 animate-fade-in-up">
-                    <div class="flex justify-end">
-                        <button @click="downloadPDF" class="px-4 py-2 bg-slate-800 text-white rounded hover:bg-slate-900 text-sm">Download PDF</button>
-                    </div>
-
-                    <div id="report-content" class="bg-white p-10 rounded-2xl shadow-sm border border-slate-100">
-                        <h1 class="text-3xl font-bold mb-2">Final Report</h1>
-                        <p class="text-slate-400 text-sm mb-8">{{ new Date().toLocaleString() }}</p>
-
-                        <!-- Executive Synthesis -->
-                        <section class="mb-12">
-                            <h2 class="text-xl font-bold text-indigo-700 mb-4 border-b pb-2">1. Executive Synthesis</h2>
-                            <div class="prose text-slate-700" v-html="renderMarkdown(result.final_report)"></div>
-                        </section>
-
-                        <!-- Visual Evidence -->
-                        <section>
-                            <h2 class="text-xl font-bold text-slate-800 mb-6 border-b pb-2">2. Visual Evidence & Data</h2>
-
-                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-10 break-inside-avoid">
-                                <div class="flex items-center gap-2 mb-4">
-                                    <span class="px-2 py-1 bg-slate-100 rounded text-xs font-bold uppercase">{{ item.type }}</span>
-                                    <h3 class="font-bold text-lg">{{ item.filename }}</h3>
-                                </div>
-
-                                <!-- 1. PDF Viewer (All Pages) -->
-                                <div v-if="item.type === 'pdf' && item.pages" class="space-y-6">
-                                    <div v-for="page in item.pages" :key="page.page_num" class="bg-slate-50 p-4 rounded border border-slate-200 flex gap-4 break-inside-avoid">
-                                        <!-- Page Image -->
-                                        <div class="w-1/3 flex-shrink-0">
-                                            <img :src="'data:image/jpeg;base64,' + page.image_b64" class="w-full rounded border shadow-sm">
-                                            <p class="text-center text-xs text-slate-400 mt-1">Page {{ page.page_num }}</p>
-                                        </div>
-                                        <!-- Page Analysis -->
-                                        <div class="w-2/3 text-sm prose" v-html="renderMarkdown(page.desc)"></div>
-                                    </div>
-                                </div>
-
-                                <!-- 2. PPT Viewer (Slides & Extracted Images) -->
-                                <div v-if="item.type === 'ppt' && item.slides" class="space-y-6">
-                                    <div v-for="slide in item.slides" :key="slide.slide_num" class="bg-slate-50 p-4 rounded border border-slate-200 break-inside-avoid">
-                                        <h4 class="font-bold text-sm mb-2 text-indigo-600">Slide {{ slide.slide_num }}</h4>
-                                        <!-- Slide Text -->
-                                        <div class="text-sm mb-4 whitespace-pre-wrap">{{ slide.text }}</div>
-                                        <!-- Extracted Images -->
-                                        <div v-if="slide.images && slide.images.length > 0" class="grid grid-cols-2 gap-4">
-                                            <div v-for="(img, imgIdx) in slide.images" :key="imgIdx" class="bg-white p-2 rounded border">
-                                                <img :src="'data:image/jpeg;base64,' + img.b64" class="max-h-40 mx-auto object-contain">
-                                                <p class="text-xs text-slate-500 mt-2 p-2 bg-slate-50 rounded">{{ img.desc }}</p>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- 3. Excel Charts -->
-                                <div v-if="item.type === 'excel_block' || item.type === 'spectrum'" class="bg-slate-50 p-4 rounded border">
-                                    <div v-if="item.chart_data && item.chart_data.length > 0">
-                                        <div :id="'chart-' + idx" class="w-full h-64 bg-white"></div>
-                                    </div>
-                                    <div class="mt-4 text-sm prose" v-html="renderMarkdown(item.summary)"></div>
-                                </div>
-
-                                <!-- 4. Single Image -->
-                                <div v-if="item.type === 'image'" class="bg-slate-50 p-4 rounded border text-center">
-                                    <img :src="'data:image/jpeg;base64,' + item.image_b64" class="max-h-96 mx-auto rounded shadow-sm">
-                                    <div class="mt-4 text-sm text-left prose" v-html="renderMarkdown(item.summary)"></div>
-                                </div>
-
-                            </div>
-                        </section>
-                    </div>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <script>
-        const { createApp, ref, nextTick } = Vue;
-
-        createApp({
-            setup() {
-                const files = ref([]);
-                const isAnalyzing = ref(false);
-                const result = ref(null);
-                const customPrompt = ref("");
-                const language = ref("korean");
-
-                // Remove Image tags from Markdown to prevent 403 errors
-                const renderer = new marked.Renderer();
-                renderer.image = function() { return ''; };
-                marked.use({ renderer });
-
-                const handleFileSelect = (e) => files.value.push(...Array.from(e.target.files));
-                const handleDrop = (e) => files.value.push(...Array.from(e.dataTransfer.files));
-                const removeFile = (i) => files.value.splice(i, 1);
-                const renderMarkdown = (text) => marked.parse(text || '');
-
-                const analyze = async () => {
-                    isAnalyzing.value = true;
-                    result.value = null;
-                    const formData = new FormData();
-                    files.value.forEach(f => formData.append('files', f));
-                    formData.append('custom_prompt', customPrompt.value);
-                    formData.append('language', language.value);
-
-                    try {
-                        const res = await fetch('/api/analyze', { method: 'POST', body: formData });
-                        const data = await res.json();
-                        result.value = data;
-                        await nextTick();
-                        drawCharts(data.results);
-                        lucide.createIcons();
-                    } catch (e) {
-                        alert(e);
-                    } finally {
-                        isAnalyzing.value = false;
-                    }
+                const dlPDF = () => {
+                    html2pdf().set({ margin:10, filename:'V8_Report.pdf', image:{type:'jpeg',quality:0.98}, html2canvas:{scale:2}, jsPDF:{unit:'mm',format:'a4'} }).from(document.getElementById('report-view')).save();
                 };
 
-                const drawCharts = (results) => {
-                    results.forEach((item, idx) => {
-                        if (item.chart_data && item.chart_data.length > 0) {
-                            const trace = {
-                                x: item.chart_data.map(d => d.x),
-                                y: item.chart_data.map(d => d.y),
-                                mode: 'lines',
-                                line: { color: '#4f46e5' }
-                            };
-                            Plotly.newPlot('chart-' + idx, [trace], {
-                                margin: { t: 10, b: 30, l: 40, r: 10 },
-                                xaxis: { title: 'X' }, yaxis: { title: 'Y' }
-                            }, {displayModeBar: false});
-                        }
-                    });
-                };
-
-                const downloadPDF = () => {
-                    const el = document.getElementById('report-content');
-                    html2pdf().set({
-                        margin: 10, filename: 'Report.pdf',
-                        image: { type: 'jpeg', quality: 0.98 },
-                        html2canvas: { scale: 2 },
-                        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-                    }).from(el).save();
-                };
-
-                setTimeout(() => lucide.createIcons(), 100);
-
-                return {
-                    files, isAnalyzing, result, customPrompt, language,
-                    handleFileSelect, handleDrop, removeFile, analyze, renderMarkdown, downloadPDF
-                };
+                setTimeout(()=>lucide.createIcons(), 100);
+                return { stagedFiles, isAnalyzing, result, addFiles, removeFile, analyze, md, dlPDF };
             }
         }).mount('#app');
     </script>
