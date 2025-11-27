@@ -1,3 +1,464 @@
+브이10 수정
+import os
+import io
+import asyncio
+import base64
+import json
+import re
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+
+# ==========================================
+# [1] 네트워크/보안 설정 (필수)
+# ==========================================
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+import pandas as pd
+import numpy as np
+
+# 과학 연산 및 이미지 처리 라이브러리
+from scipy.signal import find_peaks, savgol_filter
+from scipy.ndimage import label, find_objects
+from skimage.feature import blob_log
+import cv2
+
+from ollama import Client 
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# ==========================================
+# [2] 모델 및 서버 설정
+# ==========================================
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
+
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# ==========================================
+# [3] 과학 처리 엔진 (Science Core)
+# ==========================================
+class ScienceProcessorV10:
+    
+    @staticmethod
+    def detect_footer_boundary(img_array):
+        """이미지 하단 정보바(Info Bar) 스마트 감지"""
+        try:
+            h, w = img_array.shape[:2]
+            if h < 100 or w < 100: return None
+            
+            # 하단 25%만 탐색
+            search_h = int(h * 0.25)
+            roi = img_array[h-search_h:, :]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
+            
+            # 엣지 검출 및 수평 투영
+            sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            row_sums = np.sum(np.uint8(np.absolute(sobel_y)), axis=1)
+            
+            if np.max(row_sums) < (w * 30): return None # 엣지가 약하면 정보바 없음
+            
+            split_idx = np.argmax(row_sums)
+            if split_idx > search_h * 0.98: return None # 맨 끝이면 무시
+            
+            return (h - search_h) + split_idx
+        except: return None
+
+    @staticmethod
+    def simple_baseline(y):
+        """베이스라인 추정"""
+        window = max(5, len(y)//10)
+        s = pd.Series(y).rolling(window=window, center=True).min()
+        baseline = s.bfill().ffill().values 
+        
+        if len(baseline) > 51:
+            baseline = savgol_filter(baseline, window_length=51, polyorder=3)
+        return baseline
+
+    @staticmethod
+    def process_spectrum(x, y, mode, goal):
+        """스펙트럼 데이터 전처리"""
+        y_raw = y.copy()
+        
+        if mode == "None":
+            peaks, _ = find_peaks(y, height=np.max(y)*0.05)
+            return {
+                "x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y),
+                "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks],
+                "log": ["Raw Data (No Processing)"]
+            }
+
+        # 파라미터 설정
+        window = 15
+        if mode == "AI-Adaptive" and "noise" in goal.lower(): window = 31
+        
+        # 처리: Baseline -> Smoothing -> Peak Finding
+        base = ScienceProcessorV10.simple_baseline(y)
+        y_proc = np.maximum(y - base, 0)
+        
+        if len(y_proc) > window:
+            y_proc = savgol_filter(y_proc, window, 3)
+        
+        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+
+        return {
+            "x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base,
+            "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks],
+            "log": ["Processed"]
+        }
+
+    @staticmethod
+    def process_image(img_bytes, equipment, mode, goal):
+        """이미지 전처리"""
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_raw is None: return None, {}
+        
+        # 1. Smart Crop
+        body_img = img_raw
+        footer_img = None
+        split_y = ScienceProcessorV10.detect_footer_boundary(img_raw)
+        
+        if split_y:
+            body_img = img_raw[:split_y, :]
+            footer_img = img_raw[split_y:, :]
+        
+        # 인코딩 준비
+        _, buf_body = cv2.imencode('.jpg', body_img)
+        b64_body = base64.b64encode(buf_body).decode('utf-8')
+        
+        b64_footer = None
+        if footer_img is not None:
+            _, buf_f = cv2.imencode('.jpg', footer_img)
+            b64_footer = base64.b64encode(buf_f).decode('utf-8')
+
+        # Mode: None이면 여기서 종료
+        if mode == "None":
+            return {
+                "raw_b64": b64_body, "proc_b64": b64_body, "footer_b64": b64_footer,
+                "stats": {"info": "Cropped Raw Image"}
+            }
+
+        # 2. Auto-Invert (흰 배경 대응)
+        gray = cv2.cvtColor(body_img, cv2.COLOR_BGR2GRAY)
+        is_bright = np.mean(gray) > 127
+        gray_proc = cv2.bitwise_not(gray) if is_bright else gray
+        
+        # Denoise
+        gray_blur = cv2.GaussianBlur(gray_proc, (5, 5), 0)
+        overlay = body_img.copy()
+        stats = {"bg": "Bright (Inverted)" if is_bright else "Dark"}
+
+        # 3. Detection Logic
+        detect_atoms = False
+        detect_particles = False
+        
+        kwd = (equipment + " " + goal).lower()
+        if any(x in kwd for x in ["atom", "stem", "tem"]): detect_atoms = True
+        if any(x in kwd for x in ["particle", "sem", "optical", "bf", "pl"]): detect_particles = True
+
+        if detect_atoms:
+            blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, threshold=0.1)
+            for y, x, r in blobs:
+                cv2.circle(overlay, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
+            stats["count"] = len(blobs)
+            stats["type"] = "Atoms"
+            
+        elif detect_particles:
+            _, thresh = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 2)
+            stats["count"] = len(cnts)
+            stats["type"] = "Particles"
+
+        _, buf_proc = cv2.imencode('.jpg', overlay)
+        
+        return {
+            "raw_b64": b64_body,
+            "proc_b64": base64.b64encode(buf_proc).decode('utf-8'),
+            "footer_b64": b64_footer,
+            "stats": stats
+        }
+
+# ==========================================
+# [4] 헬퍼 함수
+# ==========================================
+def detect_excel_blocks(df):
+    """엑셀 아일랜드 감지"""
+    blocks = []
+    if df.empty: return blocks
+    mask = ~df.isnull().to_numpy()
+    labeled, n = label(mask, structure=[[0,1,0],[1,1,1],[0,1,0]])
+    for sl in find_objects(labeled):
+        b = df.iloc[sl]
+        if b.shape[0]>=3 and b.shape[1]>=2: blocks.append(b.reset_index(drop=True))
+    return blocks
+
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    """Vision LLM 호출 Wrapper"""
+    try:
+        b64 = base64.b64encode(image_bytes).decode('utf-8')
+        res = await asyncio.to_thread(
+            ollama_client.chat, 
+            model=VISION_MODEL, 
+            messages=[{'role':'user','content':prompt,'images':[b64]}]
+        )
+        return res['message']['content']
+    except Exception as e: return f"[Vision Error: {e}]"
+
+# ==========================================
+# [5] FastAPI 라우터 및 로직
+# ==========================================
+app = FastAPI(title="Analyst V10 Full")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# 번역 요청 모델
+class TranslateReq(BaseModel):
+    text: str
+
+@app.post("/api/translate")
+async def translate_text(req: TranslateReq):
+    """영문 번역 엔드포인트"""
+    try:
+        sys_prompt = "You are a professional scientific translator. Translate the text to English. Preserve markdown."
+        res = await asyncio.to_thread(
+            ollama_client.chat,
+            model=TEXT_MODEL,
+            messages=[{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': req.text}]
+        )
+        return {"translated": res['message']['content']}
+    except Exception as e: return {"translated": f"Error: {e}"}
+
+@app.post("/api/analyze")
+async def analyze_orchestrator(files: List[UploadFile] = File(...), file_configs: str = Form(...)):
+    configs = json.loads(file_configs)
+    print(f"🚀 V10 Processing {len(files)} files")
+    
+    tasks = []
+    final_results = []
+    file_map = {f.filename: await f.read() for f in files}
+    
+    for filename, config in configs.items():
+        if filename not in file_map: continue
+        content = file_map[filename]
+        
+        eq = config.get("equipment", "General")
+        goal = config.get("goal", "")
+        mode = config.get("mode", "Auto")
+        fname_lower = filename.lower()
+        
+        # -------------------------------------------------
+        # [A] Document Path (PDF/PPT) - 전처리 건너뜀
+        # -------------------------------------------------
+        if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
+            async def process_doc(c, n, e):
+                try:
+                    # PDF 처리
+                    if n.lower().endswith('.pdf'):
+                        images = convert_from_bytes(c, dpi=150, fmt='jpeg')[:10] # 최대 10페이지
+                        full_txt = ""
+                        pages = []
+                        for idx, img in enumerate(images):
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG")
+                            b64 = base64.b64encode(buf.getvalue()).decode()
+                            
+                            # ★ 강제 한글 요약
+                            desc = await analyze_vision_ollama(buf.getvalue(), "이 페이지 내용을 한글로 요약해줘. 표나 그림이 있다면 설명해줘.")
+                            full_txt += f"\nPage {idx+1}: {desc}"
+                            pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
+                            
+                        return {
+                            "type": "pdf", "filename": n, "equipment": "Literature",
+                            "raw_context": full_txt, "pages": pages 
+                        }
+                    
+                    # PPT 처리
+                    elif n.lower().endswith(('.ppt', '.pptx')):
+                        prs = Presentation(io.BytesIO(c))
+                        slides = []
+                        full_txt = ""
+                        for i, slide in enumerate(prs.slides):
+                            txt = ""
+                            imgs = []
+                            for s in slide.shapes:
+                                if hasattr(s, "text"): txt += s.text + "\n"
+                                if s.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                                    try:
+                                        ib64 = base64.b64encode(s.image.blob).decode('utf-8')
+                                        idesc = await analyze_vision_ollama(s.image.blob, "이 그림을 한글로 설명해.")
+                                        imgs.append({"b64": ib64, "desc": idesc})
+                                    except: pass
+                            
+                            full_txt += f"Slide {i+1}: {txt}\n"
+                            slides.append({"slide_num": i+1, "text": txt, "images": imgs})
+                            
+                        return {
+                            "type": "ppt", "filename": n, "equipment": "Literature",
+                            "raw_context": full_txt, "slides": slides
+                        }
+                        
+                except Exception as e:
+                    return {"type": "error", "filename": n, "msg": str(e)}
+            
+            tasks.append(process_doc(content, filename, eq))
+            continue
+
+        # -------------------------------------------------
+        # [B] Data Path (Excel/Image/CSV) - 전처리 수행
+        # -------------------------------------------------
+        
+        # 1. Excel (Spectrum)
+        if fname_lower.endswith(('.xlsx', '.xls')):
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                    blocks = detect_excel_blocks(df)
+                    for i, block in enumerate(blocks):
+                        async def proc_xls(blk, sname, idx):
+                            try:
+                                num_block = blk.apply(pd.to_numeric, errors='coerce').dropna(how='all').dropna(how='all', axis=1)
+                                if not num_block.empty and num_block.shape[0] > 5:
+                                    x = num_block.iloc[:, 0].fillna(0).values
+                                    y = num_block.iloc[:, 1].fillna(0).values
+                                    
+                                    # V10 Process
+                                    res = ScienceProcessorV10.process_spectrum(x, y, mode, goal)
+                                    
+                                    step = max(1, len(x)//100)
+                                    chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(x), step)]
+                                    
+                                    # Context용 텍스트
+                                    txt = block.to_csv(index=False, header=False)[:500]
+                                    return {
+                                        "type": "spectrum", "filename": f"{filename} ({sname}-{idx+1})",
+                                        "equipment": eq,
+                                        "raw_context": f"Spectrum Data ({eq}). Peaks: {len(res['peaks'])}\n{txt}",
+                                        "chart_data": chart, "log": res["log"]
+                                    }
+                            except: return None
+                        tasks.append(proc_xls(block, sheet_name, i))
+            except Exception as e: pass
+
+        # 2. Image (Microscopy)
+        elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+            async def proc_img(c, n, e, g, m):
+                try:
+                    # V10 Process (Smart Crop -> Invert -> Analysis)
+                    vis_res = ScienceProcessorV10.process_image(c, e, m, g)
+                    if not vis_res: return {"type": "error", "filename": n, "msg": "Image failed"}
+                    
+                    # Footer OCR (메타데이터 읽기)
+                    meta_text = ""
+                    if vis_res.get("footer_b64"):
+                        fb = base64.b64decode(vis_res["footer_b64"])
+                        meta_text = await analyze_vision_ollama(fb, "Read scale bar, voltage, magnification.")
+                    
+                    # Body Analysis (한글 강제)
+                    body_bytes = base64.b64decode(vis_res["proc_b64"])
+                    prompt = f"""
+                    이 {e} 이미지를 한글로 정밀 분석해줘.
+                    사용자 목표: {g}.
+                    이미지 통계(CV): {vis_res['stats']}.
+                    메타데이터: {meta_text}.
+                    위 정보를 바탕으로 과학적 의미를 해석해.
+                    """
+                    desc = await analyze_vision_ollama(body_bytes, prompt)
+                    
+                    return {
+                        "type": "image", "filename": n, "equipment": e,
+                        "summary": desc,
+                        "raw_context": f"Image Analysis ({e}): {desc}\nMetadata: {meta_text}\nStats: {vis_res['stats']}",
+                        "raw_b64": vis_res["raw_b64"],
+                        "proc_b64": vis_res["proc_b64"],
+                        "footer_b64": vis_res.get("footer_b64"),
+                        "stats": vis_res["stats"]
+                    }
+                except Exception as ex: return {"type": "error", "filename": n, "msg": str(ex)}
+            tasks.append(proc_img(content, filename, eq, goal, mode))
+            
+        # 3. CSV Spectrum
+        elif fname_lower.endswith(('.csv', '.txt')):
+             async def proc_csv(c, n, e, g, m):
+                try:
+                    try: df = pd.read_csv(io.BytesIO(c))
+                    except: df = pd.read_csv(io.BytesIO(c), delimiter='\t')
+                    x = df.iloc[:, 0].values
+                    y = df.iloc[:, 1].values
+                    res = ScienceProcessorV10.process_spectrum(x, y, mode, g)
+                    step = max(1, len(x)//100)
+                    chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(x), step)]
+                    return {
+                        "type": "spectrum", "filename": n, "equipment": e,
+                        "chart_data": chart,
+                        "raw_context": f"Spectrum Peaks: {len(res['peaks'])}",
+                        "log": res["log"]
+                    }
+                except Exception as ex: return {"type": "error", "filename": n, "msg": str(ex)}
+             tasks.append(proc_csv(content, filename, eq, goal, mode))
+
+    if tasks:
+        # 500 에러 방지용 return_exceptions=True
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, dict): final_results.append(r)
+
+    # Synthesis (Korean Default)
+    data_ctx, lit_ctx = "", ""
+    for r in final_results:
+        if r and r.get("type") != "error":
+            raw = r.get("raw_context") or ""
+            blk = f"\n=== File: {r['filename']} ===\n{raw[:3000]}\n"
+            if r.get("equipment") == "Literature": lit_ctx += blk
+            else: data_ctx += blk
+            
+    final_report = "분석 실패"
+    if data_ctx or lit_ctx:
+        try:
+            # ★ 강제 한글 종합 리포트
+            prompt = """
+            당신은 수석 연구원입니다.
+            제공된 '실험 데이터(Data)'와 '참고 문헌(Literature)'을 종합하여, 논리적이고 과학적인 연구 보고서를 **한글**로 작성하세요.
+            마크다운 표(Table)를 적극적으로 사용하여 수치를 비교하세요.
+            """
+            final_input = f"--- Data ---\n{data_ctx}\n\n--- Literature ---\n{lit_ctx}"
+            
+            res = await asyncio.to_thread(
+                ollama_client.chat,
+                model=TEXT_MODEL,
+                messages=[{'role':'system','content':prompt}, {'role':'user','content':final_input}]
+            )
+            final_report = res['message']['content']
+        except Exception as e: final_report = f"리포트 생성 중 오류 발생: {e}"
+
+    return {"results": final_results, "final_report": final_report}
+
+# ★ [Fix] 누락되었던 HTML 서빙 라우터 복구
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"): return FileResponse("index.html")
+    return "<h1>index.html not found. Please upload index.html</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
+
+
+브이10
 import os
 import io
 import asyncio
