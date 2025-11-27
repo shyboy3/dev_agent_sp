@@ -1532,3 +1532,311 @@ if __name__ == "__main__":
 
 
 
+새로운 main.py 코드
+
+import os
+import io
+import asyncio
+import base64
+import json
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+# --- [핵심 수정 1] 프록시 강제 해제 (Imports 바로 아래에 위치해야 함) ---
+# 회사망 프록시가 로컬호스트 접속을 가로채지 못하게 설정
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+# 혹시 모르니 시스템 프록시 변수를 이 프로세스 내에서만 삭제
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+# -------------------------------------------------------------
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import pandas as pd
+import numpy as np
+from scipy.signal import find_peaks
+from ollama import Client 
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# --- 0. 사용자 환경 설정 ---
+# 로그에 11435 포트가 보였는데, 보통 11434입니다. 
+# 혹시 포트를 변경하셨다면 아래 값을 11435로 수정하세요.
+OLLAMA_HOST = "http://127.0.0.1:11434" 
+
+# 프록시 없는 클라이언트 생성
+ollama_client = Client(host=OLLAMA_HOST)
+
+# 모델 설정
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# --- 1. 유틸리티 함수 ---
+
+def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+    """엑셀 시트 내 데이터 블록 감지"""
+    blocks = []
+    if df.empty: return blocks
+    mask = df.isnull().all(axis=1)
+    data_rows = df[~mask]
+    if data_rows.empty: return blocks
+    groups = (data_rows.index.to_series().diff() > 1).cumsum()
+    for _, group in data_rows.groupby(groups):
+        block = group.dropna(axis=1, how='all')
+        if not block.empty and block.shape[0] > 1 and block.shape[1] > 1:
+            blocks.append(block)
+    return blocks
+
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    """Ollama Vision 모델 호출 (보안망 에러 필터링 추가)"""
+    try:
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
+        )
+        content = response['message']['content']
+        
+        # --- [핵심 수정 2] McAfee/보안망 HTML 응답 감지 ---
+        # 만약 응답에 HTML 태그나 mwg-internal이 포함되어 있으면 에러로 처리
+        if "<script" in content or "mwg-internal" in content or "<html" in content:
+            return "[System Error] Corporate Firewall blocked the local AI connection. (403 Forbidden)"
+            
+        return content
+        
+    except Exception as e:
+        return f"[Vision Connection Error] {str(e)}"
+
+# --- 2. 파서 엔진 (Parsers) ---
+
+async def parse_excel_advanced(content: bytes, filename: str):
+    """멀티 시트, 멀티 블록 엑셀 파싱"""
+    results = []
+    try:
+        xls = pd.ExcelFile(io.BytesIO(content))
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            blocks = detect_excel_blocks(df)
+            
+            for i, block in enumerate(blocks):
+                block_str = block.to_csv(index=False, header=False)
+                chart_data = []
+                try:
+                    numeric_block = block.apply(pd.to_numeric, errors='coerce')
+                    valid_cols = numeric_block.dropna(axis=1, how='all')
+                    if not valid_cols.empty and valid_cols.shape[0] > 2:
+                        x = valid_cols.iloc[:, 0].fillna(0).values
+                        y = valid_cols.iloc[:, 1].fillna(0).values if valid_cols.shape[1] > 1 else x
+                        step = max(1, len(x) // 100)
+                        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
+                except:
+                    pass
+
+                results.append({
+                    "type": "excel_block",
+                    "filename": f"{filename} ({sheet_name}, Block {i+1})",
+                    "summary": f"**Data Block {i+1}** extracted from {sheet_name}.",
+                    "raw_context": f"Excel Data Block {i+1}:\n{block_str[:2000]}",
+                    "chart_data": chart_data
+                })
+    except Exception as e:
+        return [{"type": "error", "filename": filename, "msg": str(e)}]
+    return results
+
+async def parse_ppt_advanced(content: bytes, filename: str):
+    try:
+        prs = Presentation(io.BytesIO(content))
+        full_text_summary = ""
+        
+        for i, slide in enumerate(prs.slides):
+            slide_text = []
+            slide_images = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_text.append(shape.text)
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    image_blob = shape.image.blob
+                    desc = await analyze_vision_ollama(image_blob, "Describe this chart/image in detail.")
+                    slide_images.append(desc)
+
+            combined_text = "\n".join(slide_text)
+            combined_images = "\n".join([f"[Image Analysis]: {img}" for img in slide_images])
+            full_text_summary += f"### Slide {i+1}\n**Text:**\n{combined_text}\n\n**Visuals:**\n{combined_images}\n"
+            
+        return {
+            "type": "ppt",
+            "filename": filename,
+            "summary": f"**PPT Analysis**\n{full_text_summary}",
+            "raw_context": full_text_summary
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_pdf_full(content: bytes, filename: str):
+    try:
+        # PDF 전체 페이지 파싱
+        images = convert_from_bytes(content, dpi=200, fmt='jpeg')
+        full_text = ""
+        preview_image_b64 = None
+
+        print(f"📄 PDF Processing: {filename} ({len(images)} pages)")
+
+        for i, img in enumerate(images):
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            img_bytes = buffered.getvalue()
+            
+            if i == 0:
+                preview_image_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            print(f"   - Analyzing Page {i+1}...")
+            page_desc = await analyze_vision_ollama(
+                img_bytes, 
+                "Transcribe this page into Markdown. Preserve tables and headers."
+            )
+            full_text += f"\n--- Page {i+1} ---\n{page_desc}\n"
+
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": f"**PDF Analysis**\n{full_text}",
+            "image_b64": preview_image_b64,
+            "raw_context": full_text
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
+
+async def parse_spectrum(content: bytes, filename: str):
+    try:
+        try: df = pd.read_csv(io.BytesIO(content))
+        except: df = pd.read_csv(io.BytesIO(content), delimiter='\t')
+        x = df.iloc[:, 0].values
+        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
+        peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
+        step = max(1, len(x) // 500)
+        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
+        return {
+            "type": "spectrum",
+            "filename": filename,
+            "summary": f"Spectrum: {len(peaks)} peaks detected.",
+            "chart_data": chart_data,
+            "raw_context": f"Spectrum Peaks at: {peaks}, Max Intensity: {np.max(y)}"
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_image_file(content: bytes, filename: str):
+    try:
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        img_bytes = buffered.getvalue()
+        desc = await analyze_vision_ollama(img_bytes, "Analyze this scientific image.")
+        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": f"**Image Analysis**\n{desc}",
+            "image_b64": img_b64,
+            "raw_context": desc
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+# --- 3. 메인 라우터 ---
+
+app = FastAPI(title="Professional Analyst Proxy Fixed")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.post("/api/analyze")
+async def analyze_orchestrator(
+    files: List[UploadFile] = File(...),
+    custom_prompt: Optional[str] = Form(""),
+    language: str = Form("korean")
+):
+    print(f"🚀 Analyzing {len(files)} files. Language: {language}")
+    
+    # 파일을 메모리에 모두 로드
+    file_data_list = []
+    for file in files:
+        file_data_list.append({"name": file.filename, "content": await file.read()})
+    
+    tasks = []
+    for f in file_data_list:
+        fname = f["name"].lower()
+        content = f["content"]
+        
+        if fname.endswith(('.xlsx', '.xls')):
+            # 엑셀은 비동기 아님 (블록 처리 때문)
+            pass
+        elif fname.endswith(('.ppt', '.pptx')):
+            tasks.append(parse_ppt_advanced(content, f["name"]))
+        elif fname.endswith('.pdf'):
+            tasks.append(parse_pdf_full(content, f["name"]))
+        elif fname.endswith(('.csv', '.txt')):
+            tasks.append(parse_spectrum(content, f["name"]))
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            tasks.append(parse_image_file(content, f["name"]))
+
+    # 1. 엑셀 외 파일 병렬 처리
+    other_results = await asyncio.gather(*tasks)
+    final_results = list(other_results)
+    
+    # 2. 엑셀 처리
+    for f in file_data_list:
+        if f["name"].lower().endswith(('.xlsx', '.xls')):
+            blocks = await parse_excel_advanced(f["content"], f["name"])
+            final_results.extend(blocks)
+            
+    # --- 종합 리포트 생성 ---
+    valid_data = [r for r in final_results if r.get("type") != "error"]
+    context_text = ""
+    for item in valid_data:
+        text_content = item.get("raw_context", item.get("summary", ""))
+        # 프록시 에러 텍스트 필터링
+        if "mwg-internal" in text_content: continue
+        context_text += f"\n=== Source File: {item['filename']} ===\n{text_content[:4000]}\n"
+
+    lang_instruction = "Write in **Korean**." if language == 'korean' else "Write in **English**."
+    system_prompt = f"""
+    You are a Senior Data Scientist. Synthesize the multi-modal analysis results.
+    1. {lang_instruction}
+    2. Use Markdown tables.
+    3. User Request: "{custom_prompt}"
+    """
+    
+    final_report = "분석된 데이터가 없습니다."
+    if context_text:
+        try:
+            print("📝 Generating Final Report...")
+            res = await asyncio.to_thread(
+                ollama_client.chat,
+                model=TEXT_MODEL,
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': f"Analysis Data:\n{context_text}"}
+                ]
+            )
+            final_report = res['message']['content']
+        except Exception as e:
+            # 여기도 프록시 에러일 가능성 높음
+            final_report = f"Report Generation Failed (Check Proxy/Firewall): {e}"
+
+    return {"results": final_results, "final_report": final_report}
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"): return FileResponse("index.html")
+    return "<h1>index.html not found</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    # 로그에 11435 포트 오류가 있었으므로, 백엔드 포트는 8000 유지
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
