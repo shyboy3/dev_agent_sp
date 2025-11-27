@@ -1,3 +1,349 @@
+신규 코드
+
+import os
+import io
+import asyncio
+import base64
+import json
+import re
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+# --- [필수] 프록시 강제 해제 ---
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+# ------------------------------
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import pandas as pd
+import numpy as np
+from scipy.signal import find_peaks
+from scipy.ndimage import label, find_objects # ★ 핵심 추가: 아일랜드 감지용
+from ollama import Client 
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# --- 설정 ---
+OLLAMA_HOST = "http://127.0.0.1:11434" 
+ollama_client = Client(host=OLLAMA_HOST)
+
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# --- [핵심] 엑셀 섬(Island) 감지 알고리즘 ---
+
+def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+    """
+    컴퓨터 비전의 'Connected Components Labeling'을 사용하여
+    상하좌우로 떨어진 모든 데이터 블록을 독립적으로 감지합니다.
+    """
+    blocks = []
+    if df.empty: return blocks
+
+    # 1. 데이터가 있는 곳을 True, 없는 곳을 False로 마스킹
+    #    (헤더나 인덱스 처리를 위해 일단 전체를 봄)
+    mask = ~df.isnull().to_numpy() # numpy 배열로 변환
+    
+    # 2. 연결된 요소 라벨링 (대각선 연결도 포함하려면 structure=[[1,1,1],[1,1,1],[1,1,1]])
+    #    여기서는 상하좌우 연결만 인정 (십자가 구조)
+    structure = [[0,1,0], [1,1,1], [0,1,0]]
+    labeled_array, num_features = label(mask, structure=structure)
+    
+    if num_features == 0:
+        return blocks
+
+    # 3. 각 라벨(섬)별로 bounding box 추출
+    slices = find_objects(labeled_array)
+    
+    for i, slice_obj in enumerate(slices):
+        # slice_obj는 (row_slice, col_slice) 튜플임
+        # 원본 데이터프레임에서 해당 영역만 잘라냄
+        block = df.iloc[slice_obj]
+        
+        # 4. 너무 작은 블록(노이즈) 제거 (예: 2x2 미만)
+        if block.shape[0] >= 2 and block.shape[1] >= 2:
+            # 인덱스 초기화 (깔끔하게 처리하기 위함)
+            blocks.append(block.reset_index(drop=True))
+            
+    return blocks
+
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    """Vision 모델 호출"""
+    try:
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
+        )
+        content = response['message']['content']
+        if "<script" in content or "mwg-internal" in content:
+            return "[Error: Blocked by Firewall]"
+        return content
+    except Exception as e:
+        return f"[Vision Error: {e}]"
+
+# --- 파서 (Parsers) ---
+
+async def parse_excel_v5(content: bytes, filename: str, lang: str):
+    """엑셀 파싱 (개선된 블록 감지 적용)"""
+    results = []
+    try:
+        xls = pd.ExcelFile(io.BytesIO(content))
+        
+        for sheet_name in xls.sheet_names:
+            # 헤더 없이 원본 그대로 읽음
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            
+            # ★ 개선된 감지 로직 호출
+            blocks = detect_excel_blocks(df)
+            
+            print(f"📊 Sheet '{sheet_name}': Detected {len(blocks)} blocks.") # 디버깅용 로그
+
+            for i, block in enumerate(blocks):
+                # 차트 데이터 추출 시도
+                chart_data = []
+                try:
+                    # 블록 내에서 숫자로만 구성된 가장 큰 영역 찾기
+                    # (헤더나 텍스트 컬럼을 제외하기 위함)
+                    num_block = block.apply(pd.to_numeric, errors='coerce')
+                    num_block = num_block.dropna(how='all', axis=0).dropna(how='all', axis=1)
+                    
+                    if not num_block.empty and num_block.shape[0] > 2:
+                        # 첫번째 숫자 컬럼 = X, 두번째 숫자 컬럼 = Y
+                        x = num_block.iloc[:, 0].fillna(0).values
+                        y = num_block.iloc[:, 1].fillna(0).values if num_block.shape[1] > 1 else x
+                        
+                        # 데이터 포인트가 너무 많으면 샘플링
+                        step = max(1, len(x) // 100)
+                        chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x[::step], y[::step])]
+                except:
+                    pass
+
+                # LLM에게 줄 텍스트 (앞부분 2000자)
+                raw_csv = block.to_csv(index=False, header=False)[:2000]
+                
+                results.append({
+                    "type": "excel_block",
+                    "filename": f"{filename} ({sheet_name} - Block {i+1})",
+                    "summary": f"Data Block {i+1} found in sheet '{sheet_name}'. Contains {block.shape[0]} rows x {block.shape[1]} columns.",
+                    "raw_context": f"Excel Data Block {i+1} ({sheet_name}):\n{raw_csv}",
+                    "chart_data": chart_data,
+                    "image_b64": None
+                })
+                
+    except Exception as e:
+        return [{"type": "error", "filename": filename, "msg": str(e)}]
+    return results
+
+async def parse_ppt_v4(content: bytes, filename: str, lang: str):
+    """PPTX 파싱"""
+    try:
+        prs = Presentation(io.BytesIO(content))
+        slides_data = []
+        full_context = ""
+        lang_inst = "Korean" if lang == 'korean' else "English"
+
+        for i, slide in enumerate(prs.slides):
+            slide_text = []
+            extracted_images = []
+            
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_text.append(shape.text)
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        image_blob = shape.image.blob
+                        img_b64 = base64.b64encode(image_blob).decode('utf-8')
+                        prompt = f"Analyze this image in {lang_inst}. Explain scientific details."
+                        desc = await analyze_vision_ollama(image_blob, prompt)
+                        extracted_images.append({"b64": img_b64, "desc": desc})
+                    except: pass
+
+            combined_txt = "\n".join(slide_text)
+            img_desc_combined = "\n".join([f"[Image]: {img['desc']}" for img in extracted_images])
+            full_context += f"### Slide {i+1}\nText: {combined_txt}\nVisuals: {img_desc_combined}\n"
+            
+            slides_data.append({
+                "slide_num": i+1,
+                "text": combined_txt,
+                "images": extracted_images
+            })
+            
+        return {
+            "type": "ppt",
+            "filename": filename,
+            "summary": f"**PPT Analysis ({len(prs.slides)} slides)**",
+            "raw_context": full_context,
+            "slides": slides_data
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_pdf_v4(content: bytes, filename: str, lang: str):
+    """PDF 파싱"""
+    try:
+        images = convert_from_bytes(content, dpi=150, fmt='jpeg')
+        pages_data = []
+        full_context = ""
+        lang_inst = "Korean" if lang == 'korean' else "English"
+        
+        print(f"📄 PDF: {filename} ({len(images)} pages)")
+
+        for i, img in enumerate(images):
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            img_bytes = buffered.getvalue()
+            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            prompt = f"""
+            Analyze page {i+1} in {lang_inst}.
+            1. Summarize content.
+            2. Describe figures/tables clearly.
+            3. No LaTeX. Plain text only.
+            """
+            print(f"   - Page {i+1} Vision Analysis...")
+            page_desc = await analyze_vision_ollama(img_bytes, prompt)
+            
+            full_context += f"\n--- Page {i+1} ---\n{page_desc}\n"
+            pages_data.append({"page_num": i+1, "image_b64": img_b64, "desc": page_desc})
+
+        return {
+            "type": "pdf",
+            "filename": filename,
+            "summary": f"**PDF Analysis ({len(images)} pages)**",
+            "raw_context": full_context,
+            "pages": pages_data
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": f"PDF Error: {str(e)}"}
+
+async def parse_image_v4(content: bytes, filename: str, lang: str):
+    try:
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        img_bytes = buffered.getvalue()
+        img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+        
+        lang_inst = "Korean" if lang == 'korean' else "English"
+        desc = await analyze_vision_ollama(img_bytes, f"Analyze in {lang_inst}. Focus on scientific details.")
+        
+        return {
+            "type": "image",
+            "filename": filename,
+            "summary": desc,
+            "image_b64": img_b64,
+            "raw_context": desc
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+async def parse_spectrum(content: bytes, filename: str):
+    try:
+        try: df = pd.read_csv(io.BytesIO(content))
+        except: df = pd.read_csv(io.BytesIO(content), delimiter='\t')
+        x = df.iloc[:, 0].values
+        y = df.iloc[:, 1].values if df.shape[1] > 1 else df.iloc[:, 0].values
+        peaks, _ = find_peaks(y, height=np.mean(y), distance=20)
+        step = max(1, len(x) // 500)
+        chart_data = [{"x": float(xi), "y": float(yi)} for xi, yi in zip(x[::step], y[::step])]
+        return {
+            "type": "spectrum",
+            "filename": filename,
+            "summary": f"Spectrum: {len(peaks)} peaks.",
+            "chart_data": chart_data,
+            "raw_context": f"Spectrum Peaks: {peaks}, Max: {np.max(y)}"
+        }
+    except Exception as e:
+        return {"type": "error", "filename": filename, "msg": str(e)}
+
+# --- 메인 라우터 ---
+app = FastAPI(title="Analyst V5")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.post("/api/analyze")
+async def analyze_orchestrator(
+    files: List[UploadFile] = File(...),
+    custom_prompt: Optional[str] = Form(""),
+    language: str = Form("korean")
+):
+    print(f"🚀 Processing Request. Lang: {language}")
+    
+    file_data_list = []
+    for file in files:
+        file_data_list.append({"name": file.filename, "content": await file.read()})
+    
+    tasks = []
+    final_results = []
+    
+    for f in file_data_list:
+        fname = f["name"].lower()
+        content = f["content"]
+        
+        if fname.endswith(('.xlsx', '.xls')):
+            # 엑셀은 즉시 처리
+            blocks = await parse_excel_v5(content, f["name"], language)
+            final_results.extend(blocks)
+        elif fname.endswith(('.ppt', '.pptx')):
+            tasks.append(parse_ppt_v4(content, f["name"], language))
+        elif fname.endswith('.pdf'):
+            tasks.append(parse_pdf_v4(content, f["name"], language))
+        elif fname.endswith(('.csv', '.txt')):
+            tasks.append(parse_spectrum(content, f["name"]))
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            tasks.append(parse_image_v4(content, f["name"], language))
+
+    other_results = await asyncio.gather(*tasks)
+    final_results.extend(list(other_results))
+    
+    # 종합 리포트
+    valid_data = [r for r in final_results if r.get("type") != "error"]
+    context_text = ""
+    for item in valid_data:
+        raw = item.get("raw_context", "")
+        if "mwg-internal" not in raw:
+            context_text += f"\n=== Source: {item['filename']} ===\n{raw[:5000]}\n"
+
+    lang_inst = "Korean" if language == 'korean' else "English"
+    system_prompt = f"You are a Senior Scientist. Write the report in **{lang_inst}**. User Request: {custom_prompt}"
+    
+    final_report = "분석 실패"
+    if context_text:
+        try:
+            print("📝 Synthesizing Report...")
+            res = await asyncio.to_thread(
+                ollama_client.chat,
+                model=TEXT_MODEL,
+                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': context_text}]
+            )
+            final_report = res['message']['content']
+        except Exception as e:
+            final_report = f"Error: {e}"
+
+    return {"results": final_results, "final_report": final_report}
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"): return FileResponse("index.html")
+    return "<h1>index.html not found</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
+
 import os
 import io
 import asyncio
