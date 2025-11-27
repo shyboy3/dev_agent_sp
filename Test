@@ -1,3 +1,494 @@
+에이전트 모드 신규 코드
+import os
+import io
+import asyncio
+import base64
+import json
+import re
+from typing import List, Dict, Any, Optional
+
+# [필수] 보안망 우회
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import numpy as np
+
+# 과학 연산 & 이미지 처리
+from scipy.signal import find_peaks, savgol_filter, peak_widths
+from scipy.optimize import curve_fit
+from scipy.ndimage import label, find_objects
+import cv2
+from skimage.feature import blob_log # 원자 검출용 (Laplacian of Gaussian)
+from ollama import Client 
+from PIL import Image
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# --- 설정 ---
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# --- [V6 핵심] AI 적응형 프로세서 ---
+
+class AdaptiveProcessor:
+    
+    @staticmethod
+    def gaussian(x, amp, cen, wid):
+        return amp * np.exp(-(x-cen)**2 / (2*wid**2))
+
+    @staticmethod
+    def fit_peaks(x, y, peaks):
+        """피크 위치에 가우시안 피팅 수행"""
+        fitted_params = []
+        for p in peaks:
+            try:
+                # 초기값 추정 (Amplitude, Center, Width)
+                p0 = [y[p], x[p], 1.0]
+                # 주변 데이터만 잘라서 피팅 (속도 향상)
+                window = 20
+                start, end = max(0, p-window), min(len(x), p+window)
+                popt, _ = curve_fit(AdaptiveProcessor.gaussian, x[start:end], y[start:end], p0=p0, maxfev=1000)
+                fitted_params.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
+            except:
+                pass
+        return fitted_params
+
+    @staticmethod
+    def process_spectrum(x, y, mode, goal):
+        """
+        Mode: None, Auto, AI-Adaptive
+        Goal: 사용자 입력 (예: '노이즈 제거해줘', '피팅해줘')
+        """
+        log = []
+        y_proc = y.copy()
+        features = {}
+
+        # 1. Mode: None (전처리 없음)
+        if mode == "None":
+            peaks, _ = find_peaks(y, height=np.max(y)*0.1)
+            return x, y, {"peaks": peaks, "note": "Raw Data Used"}
+
+        # 2. 파라미터 결정 (AI or Default)
+        window_length = 11
+        polyorder = 3
+        do_fitting = False
+        
+        if mode == "AI-Adaptive" and goal:
+            # 간단한 키워드 매칭으로 파라미터 조정 (속도를 위해 LLM 호출 대신 로직 처리)
+            # (더 고도화하려면 여기서 LLM에게 JSON 설정을 받아올 수 있음)
+            if "노이즈" in goal or "noise" in goal.lower():
+                window_length = 21 # 스무딩 강화
+                log.append("AI: Detected noise reduction goal -> Increased smoothing window.")
+            if "피팅" in goal or "fit" in goal.lower() or "gaussian" in goal.lower():
+                do_fitting = True
+                log.append("AI: Detected fitting goal -> Enabled Gaussian fitting.")
+            if "날것" in goal or "raw" in goal.lower():
+                window_length = 0 # 스무딩 끔
+
+        # 3. 신호 처리 수행
+        # Smoothing
+        if window_length > 3:
+            y_proc = savgol_filter(y_proc, window_length, polyorder)
+        
+        # Baseline Correction
+        baseline = np.percentile(y_proc, 5)
+        y_proc = y_proc - baseline
+        y_proc[y_proc < 0] = 0
+
+        # Peak Finding
+        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+        
+        # Fitting (AI 결정)
+        fits = []
+        if do_fitting and len(peaks) > 0:
+            fits = AdaptiveProcessor.fit_peaks(x, y_proc, peaks)
+            features["fits"] = fits
+
+        # 결과 정리
+        peak_info = [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks]
+        features["peaks"] = peak_info
+        features["log"] = log
+        
+        return x, y_proc, features
+
+    @staticmethod
+    def process_image(img_bytes, mode, goal, equipment):
+        """
+        원자 영상(STEM) 처리 및 적응형 필터링
+        """
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        stats = {}
+        processed_img = img.copy()
+        
+        if mode == "None":
+            _, buffer = cv2.imencode('.jpg', img)
+            return base64.b64encode(buffer).decode('utf-8'), {"note": "Raw Image"}
+
+        # --- AI 판단 로직 ---
+        detect_atoms = False
+        denoise_strength = 5
+        
+        if mode == "AI-Adaptive":
+            if "원자" in goal or "atom" in goal.lower() or "STEM" in equipment:
+                detect_atoms = True
+            if "노이즈" in goal or "clean" in goal.lower():
+                denoise_strength = 9
+        elif equipment in ["STEM", "TEM"]: # Auto Mode 기본값
+            detect_atoms = True
+
+        # 1. Denoising
+        gray_blur = cv2.GaussianBlur(gray, (denoise_strength, denoise_strength), 0)
+
+        # 2. Atomic Analysis (Blob Detection)
+        if detect_atoms:
+            # scikit-image의 blob_log (Laplacian of Gaussian) 사용 - 원자 검출에 탁월
+            # min_sigma, max_sigma는 원자의 대략적 크기 픽셀 반경
+            blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, num_sigma=10, threshold=0.1)
+            
+            # 시각화 (빨간 원 그리기)
+            for blob in blobs:
+                y, x, r = blob
+                cv2.circle(processed_img, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
+            
+            stats["atom_count"] = len(blobs)
+            stats["method"] = "LoG (Laplacian of Gaussian)"
+        
+        # 3. General Particle Analysis (Watershed) - SEM 등
+        elif equipment in ["SEM", "Optical"]:
+             _, thresh = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+             cv2.drawContours(processed_img, contours, -1, (0, 255, 0), 1)
+             stats["particle_count"] = len(contours)
+             stats["method"] = "Otsu Thresholding"
+
+        _, buffer = cv2.imencode('.jpg', processed_img)
+        return base64.b64encode(buffer).decode('utf-8'), stats
+
+# --- [재사용] 엑셀 아일랜드 감지 ---
+def detect_excel_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+    blocks = []
+    if df.empty: return blocks
+    mask = ~df.isnull().to_numpy()
+    structure = [[0,1,0], [1,1,1], [0,1,0]]
+    labeled_array, num_features = label(mask, structure=structure)
+    slices = find_objects(labeled_array)
+    for slice_obj in slices:
+        block = df.iloc[slice_obj]
+        if block.shape[0] >= 3 and block.shape[1] >= 2:
+            blocks.append(block.reset_index(drop=True))
+    return blocks
+
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    try:
+        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        response = await asyncio.to_thread(
+            ollama_client.chat,
+            model=VISION_MODEL,
+            messages=[{'role': 'user', 'content': prompt, 'images': [img_b64]}]
+        )
+        content = response['message']['content']
+        if "<script" in content or "mwg-internal" in content: return "[Error: Firewall Blocked]"
+        return content
+    except Exception as e: return f"[Vision Error: {e}]"
+
+# --- 메인 라우터 ---
+app = FastAPI(title="Analyst V6 Adaptive")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.post("/api/analyze")
+async def analyze_orchestrator(
+    files: List[UploadFile] = File(...),
+    custom_prompt: Optional[str] = Form(""),
+    goal: Optional[str] = Form(""),       # 사용자 분석 목표 (예: "원자 세줘")
+    preprocess_mode: str = Form("Auto"),  # None, Auto, AI-Adaptive
+    language: str = Form("korean"),
+    equipment: str = Form("General")
+):
+    print(f"🚀 V6 Request. Mode: {preprocess_mode}, Goal: {goal}, Eq: {equipment}")
+    
+    file_data_list = []
+    for file in files:
+        file_data_list.append({"name": file.filename, "content": await file.read()})
+    
+    final_results = []
+    tasks = []
+
+    # 1. 엑셀 처리
+    for f in file_data_list:
+        fname = f["name"].lower()
+        content = f["content"]
+        
+        if fname.endswith(('.xlsx', '.xls')):
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                    blocks = detect_excel_blocks(df)
+                    for i, block in enumerate(blocks):
+                        chart_data = []
+                        peaks_info = []
+                        fits_info = []
+                        
+                        # 숫자 추출 및 처리
+                        try:
+                            num_block = block.apply(pd.to_numeric, errors='coerce').dropna(how='all', axis=0).dropna(how='all', axis=1)
+                            if not num_block.empty and num_block.shape[0] > 5:
+                                x = num_block.iloc[:, 0].fillna(0).values
+                                y = num_block.iloc[:, 1].fillna(0).values if num_block.shape[1] > 1 else x
+                                
+                                # [V6] Adaptive Processing 호출
+                                x_proc, y_proc, feats = AdaptiveProcessor.process_spectrum(x, y, preprocess_mode, goal)
+                                peaks_info = feats.get('peaks', [])
+                                fits_info = feats.get('fits', [])
+                                
+                                step = max(1, len(x_proc) // 150)
+                                chart_data = [{"x": float(v1), "y": float(v2)} for v1, v2 in zip(x_proc[::step], y_proc[::step])]
+                        except: pass
+
+                        raw_txt = block.to_csv(index=False, header=False)[:1000]
+                        peak_str = ", ".join([f"{p['x']:.1f}" for p in peaks_info[:5]])
+                        
+                        final_results.append({
+                            "type": "excel_block",
+                            "filename": f"{f['name']} ({sheet_name}-{i+1})",
+                            "summary": f"Peaks found: {len(peaks_info)}. Fits: {len(fits_info)}",
+                            "raw_context": f"Data: {equipment}\nPeaks: {peak_str}\nRaw:\n{raw_txt}",
+                            "chart_data": chart_data,
+                            "fits": fits_info
+                        })
+            except Exception as e:
+                final_results.append({"type": "error", "filename": f["name"], "msg": str(e)})
+
+        # 2. 이미지 처리
+        elif fname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+            try:
+                img_b64, stats = AdaptiveProcessor.process_image(content, preprocess_mode, goal, equipment)
+                
+                # Vision LLM 해석
+                lang_inst = "Korean" if language == 'korean' else "English"
+                prompt = f"Analyze this {equipment} image in {lang_inst}. Goal: {goal}. CV Stats: {stats}"
+                desc = await analyze_vision_ollama(content, prompt)
+                
+                final_results.append({
+                    "type": "image",
+                    "filename": f["name"],
+                    "summary": desc,
+                    "image_b64": img_b64,
+                    "raw_context": f"Image Analysis ({equipment}): {desc}\nCV Stats: {stats}"
+                })
+            except Exception as e:
+                final_results.append({"type": "error", "filename": f["name"], "msg": str(e)})
+                
+        # 3. PDF/PPT/CSV (기존 V4 로직 사용 - 여기선 생략했으나 실제 코드엔 포함되어야 함)
+        # ... (이전 코드의 tasks.append 로직 그대로 사용)
+
+    # (간소화를 위해 다른 타입 스킵, 실제로는 여기에 gather 로직 필요)
+
+    # 종합 리포트
+    context_text = ""
+    for item in final_results:
+        if item.get("type") != "error":
+            raw = item.get("raw_context", "")
+            if "mwg-internal" not in raw:
+                context_text += f"\n=== Source: {item['filename']} ===\n{raw[:2000]}\n"
+
+    lang_inst = "Korean" if language == 'korean' else "English"
+    system_prompt = f"""
+    You are a Senior Scientist. Write report in **{lang_inst}**.
+    Focus on the user's goal: "{goal}".
+    Do NOT generate code.
+    """
+    
+    final_report = "분석 실패"
+    if context_text:
+        try:
+            res = await asyncio.to_thread(
+                ollama_client.chat,
+                model=TEXT_MODEL,
+                messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': context_text}]
+            )
+            final_report = res['message']['content']
+        except Exception as e:
+            final_report = f"Error: {e}"
+
+    return {"results": final_results, "final_report": final_report}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+에이전트 모드 신규 웹페이지
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Science Lab V6</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap'); body { font-family: 'Inter', sans-serif; } .prose { max-width: none; overflow-wrap: break-word; } .loader { border: 3px solid #f3f3f3; border-top: 3px solid #db2777; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+    <div id="app" class="min-h-screen p-6">
+        <header class="max-w-7xl mx-auto mb-8 flex items-center gap-3">
+            <div class="bg-pink-600 p-2.5 rounded-xl shadow-lg"><i data-lucide="atom" class="w-8 h-8 text-white"></i></div>
+            <div><h1 class="text-2xl font-bold text-slate-900">AI Science Lab V6</h1><p class="text-sm text-slate-500">Adaptive Preprocessing • Atomic Analysis</p></div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
+            <!-- Controls -->
+            <div class="lg:col-span-4 space-y-6">
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+                    <h2 class="font-bold mb-4">1. Configuration</h2>
+                    
+                    <div class="mb-4">
+                        <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Preprocessing Mode</label>
+                        <select v-model="preprocessMode" class="w-full p-2 bg-slate-50 border rounded text-sm">
+                            <option value="Auto">Auto (Equipment Default)</option>
+                            <option value="None">None (Raw Data)</option>
+                            <option value="AI-Adaptive">AI-Adaptive (Goal Driven)</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-4" v-if="preprocessMode === 'AI-Adaptive'">
+                        <label class="block text-xs font-bold text-pink-500 uppercase mb-1">Analysis Goal (AI Target)</label>
+                        <input type="text" v-model="goal" class="w-full p-2 border-2 border-pink-100 rounded focus:border-pink-500 text-sm" placeholder="e.g., Count atoms, Remove noise, Fit Gaussian">
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Equipment</label>
+                        <select v-model="equipment" class="w-full p-2 bg-slate-50 border rounded text-sm">
+                            <option value="STEM">STEM / TEM (Atomic)</option>
+                            <option value="SEM">SEM (Particles)</option>
+                            <option value="Spectrum">Spectrum (General)</option>
+                        </select>
+                    </div>
+
+                    <div class="border-2 border-dashed border-slate-200 rounded-xl p-6 text-center cursor-pointer hover:bg-pink-50 hover:border-pink-300" @click="$refs.f.click()">
+                        <input type="file" ref="f" multiple class="hidden" @change="hF">
+                        <p class="font-semibold text-slate-600">Upload Data</p>
+                    </div>
+                    <div v-if="files.length" class="mt-2 text-xs text-slate-500">{{ files.length }} files selected</div>
+                </div>
+
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+                    <button @click="analyze" :disabled="isAnalyzing" class="w-full py-3 bg-pink-600 text-white rounded-xl font-bold flex justify-center gap-2 shadow-lg shadow-pink-200">
+                        <div v-if="isAnalyzing" class="loader"></div>
+                        <span>Run V6 Analysis</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Results -->
+            <div class="lg:col-span-8">
+                <div v-if="result" class="space-y-6 animate-fade-in-up">
+                    <div id="report-content" class="bg-white p-10 rounded-2xl shadow-sm border border-slate-100">
+                        <div class="flex justify-between items-center mb-6">
+                            <h1 class="text-3xl font-bold">Analysis Report</h1>
+                            <span class="px-3 py-1 bg-pink-100 text-pink-700 rounded-full text-xs font-bold">{{ result.mode }} Mode</span>
+                        </div>
+
+                        <section class="mb-10">
+                            <h2 class="text-xl font-bold text-pink-700 mb-4 pb-2 border-b">Synthesis</h2>
+                            <div class="prose text-slate-700" v-html="md(result.final_report)"></div>
+                        </section>
+
+                        <section>
+                            <h2 class="text-xl font-bold text-slate-800 mb-6 pb-2 border-b">Visual Data</h2>
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-10 break-inside-avoid">
+                                <h3 class="font-bold text-lg mb-2">{{ item.filename }}</h3>
+
+                                <!-- Chart -->
+                                <div v-if="item.chart_data" class="bg-slate-50 p-4 rounded border mb-4">
+                                    <div :id="'chart-' + idx" class="w-full h-64 bg-white"></div>
+                                    <p v-if="item.fits && item.fits.length" class="text-xs text-green-600 mt-2 font-mono">
+                                        Gaussian Fits detected: {{ item.fits.length }} (Check graph)
+                                    </p>
+                                </div>
+
+                                <!-- Image -->
+                                <div v-if="item.image_b64" class="text-center mb-4 bg-slate-50 p-4 rounded border">
+                                    <img :src="'data:image/jpeg;base64,' + item.image_b64" class="max-h-96 mx-auto rounded shadow-sm bg-black">
+                                </div>
+
+                                <div class="text-sm prose" v-html="md(item.summary)"></div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const { createApp, ref, nextTick } = Vue;
+        createApp({
+            setup() {
+                const files = ref([]);
+                const isAnalyzing = ref(false);
+                const result = ref(null);
+                const preprocessMode = ref("Auto");
+                const goal = ref("");
+                const equipment = ref("STEM");
+
+                const md = (t) => marked.parse(t||'');
+                const hF = (e) => files.value.push(...e.target.files);
+
+                const analyze = async () => {
+                    isAnalyzing.value = true;
+                    const fd = new FormData();
+                    files.value.forEach(f => fd.append('files', f));
+                    fd.append('preprocess_mode', preprocessMode.value);
+                    fd.append('goal', goal.value);
+                    fd.append('equipment', equipment.value);
+
+                    try {
+                        const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+                        const data = await res.json();
+                        result.value = { ...data, mode: preprocessMode.value };
+                        await nextTick();
+                        
+                        // Draw Charts
+                        data.results.forEach((item, idx) => {
+                            if (item.chart_data) {
+                                const trace = {
+                                    x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y),
+                                    mode: 'lines', name: 'Data', line: {color: '#db2777'}
+                                };
+                                Plotly.newPlot('chart-'+idx, [trace], {margin:{t:10,b:30,l:40,r:10}}, {displayModeBar:false});
+                            }
+                        });
+                        lucide.createIcons();
+                    } catch(e) { alert(e); } 
+                    finally { isAnalyzing.value = false; }
+                };
+                setTimeout(() => lucide.createIcons(), 100);
+                return { files, isAnalyzing, result, preprocessMode, goal, equipment, hF, analyze, md };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
+
+
+
+
+
+
+
 신규 코드
 
 import os
