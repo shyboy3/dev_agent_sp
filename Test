@@ -458,323 +458,12 @@ if __name__ == "__main__":
 
 
 
-브이10
-import os
-import io
-import asyncio
-import base64
-import json
-from typing import List, Optional
-from pydantic import BaseModel
-
-# [1] 보안망/프록시 우회
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
-if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
-if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
-
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import numpy as np
-
-# 과학 연산
-from scipy.signal import find_peaks, savgol_filter
-from scipy.ndimage import label, find_objects
-from skimage.feature import blob_log
-import cv2
-
-from ollama import Client 
-from PIL import Image
-from pdf2image import convert_from_bytes
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# [2] 설정
-OLLAMA_HOST = "http://127.0.0.1:11434"
-ollama_client = Client(host=OLLAMA_HOST)
-VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
-TEXT_MODEL = "llama3:70b"
-
-# --- V10 과학 엔진 (V9와 동일, 안전성 유지) ---
-class ScienceProcessorV10:
-    @staticmethod
-    def detect_footer_boundary(img_array):
-        try:
-            h, w = img_array.shape[:2]
-            if h < 100 or w < 100: return None
-            search_h = int(h * 0.25)
-            roi = img_array[h-search_h:, :]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
-            sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            row_sums = np.sum(np.uint8(np.absolute(sobel_y)), axis=1)
-            if np.max(row_sums) < (w * 30): return None
-            split_idx = np.argmax(row_sums)
-            if split_idx > search_h * 0.98: return None
-            return (h - search_h) + split_idx
-        except: return None
-
-    @staticmethod
-    def process_spectrum(x, y, mode, goal):
-        y_raw = y.copy()
-        if mode == "None":
-            peaks, _ = find_peaks(y, height=np.max(y)*0.05)
-            return {"x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y), "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks]}
-
-        window = 15
-        if mode == "AI-Adaptive" and "noise" in goal.lower(): window = 31
-        
-        # V9 Fix: Pandas Future Warning 해결
-        s = pd.Series(y).rolling(window=max(5, len(y)//10), center=True).min()
-        baseline = s.bfill().ffill().values 
-        if len(baseline) > 51: baseline = savgol_filter(baseline, 51, 3)
-        
-        y_proc = np.maximum(y - baseline, 0)
-        if len(y_proc) > window: y_proc = savgol_filter(y_proc, window, 3)
-        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
-
-        return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": baseline, "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks]}
-
-    @staticmethod
-    def process_image(img_bytes, equipment, mode, goal):
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img_raw is None: return None, {}
-        
-        # Smart Crop
-        body_img, footer_img, split_y = img_raw, None, ScienceProcessorV10.detect_footer_boundary(img_raw)
-        if split_y:
-            body_img = img_raw[:split_y, :]
-            footer_img = img_raw[split_y:, :]
-        
-        _, buf_body = cv2.imencode('.jpg', body_img)
-        b64_body = base64.b64encode(buf_body).decode('utf-8')
-        b64_footer = None
-        if footer_img is not None:
-            _, buf_f = cv2.imencode('.jpg', footer_img)
-            b64_footer = base64.b64encode(buf_f).decode('utf-8')
-
-        if mode == "None":
-            return {"raw_b64": b64_body, "proc_b64": b64_body, "footer_b64": b64_footer, "stats": {"info": "Cropped Raw"}}
-
-        # Auto-Invert
-        gray = cv2.cvtColor(body_img, cv2.COLOR_BGR2GRAY)
-        is_bright = np.mean(gray) > 127
-        gray_proc = cv2.bitwise_not(gray) if is_bright else gray
-        gray_blur = cv2.GaussianBlur(gray_proc, (5, 5), 0)
-        overlay = body_img.copy()
-        
-        stats = {"bg": "Bright (Inverted)" if is_bright else "Dark"}
-        kwd = (equipment + " " + goal).lower()
-        
-        # Detection
-        if any(x in kwd for x in ["atom", "stem", "tem"]):
-            blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, threshold=0.1)
-            for y, x, r in blobs: cv2.circle(overlay, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
-            stats["count"] = len(blobs)
-        elif any(x in kwd for x in ["particle", "sem", "optical", "bf", "pl"]):
-            _, th = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 2)
-            stats["count"] = len(cnts)
-
-        _, buf_proc = cv2.imencode('.jpg', overlay)
-        return {"raw_b64": b64_body, "proc_b64": base64.b64encode(buf_proc).decode('utf-8'), "footer_b64": b64_footer, "stats": stats}
-
-# --- Helper ---
-def detect_excel_blocks(df):
-    blocks = []
-    if df.empty: return blocks
-    mask = ~df.isnull().to_numpy()
-    labeled, n = label(mask, structure=[[0,1,0],[1,1,1],[0,1,0]])
-    for sl in find_objects(labeled):
-        b = df.iloc[sl]
-        if b.shape[0]>=3 and b.shape[1]>=2: blocks.append(b.reset_index(drop=True))
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    try:
-        b64 = base64.b64encode(image_bytes).decode('utf-8')
-        res = await asyncio.to_thread(ollama_client.chat, model=VISION_MODEL, messages=[{'role':'user','content':prompt,'images':[b64]}])
-        return res['message']['content']
-    except Exception as e: return str(e)
-
-# --- API ---
-app = FastAPI(title="Analyst V10")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# [New] 번역 요청 모델
-class TranslateReq(BaseModel):
-    text: str
-
-@app.post("/api/translate")
-async def translate_text(req: TranslateReq):
-    """텍스트를 영문으로 번역하는 전용 엔드포인트"""
-    try:
-        system_prompt = "You are a professional translator. Translate the following scientific text into English. Maintain markdown formatting (headers, tables, bold)."
-        res = await asyncio.to_thread(
-            ollama_client.chat,
-            model=TEXT_MODEL,
-            messages=[
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': req.text}
-            ]
-        )
-        return {"translated": res['message']['content']}
-    except Exception as e:
-        return {"translated": f"[Translation Error] {str(e)}"}
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(files: List[UploadFile] = File(...), file_configs: str = Form(...)):
-    configs = json.loads(file_configs)
-    print(f"🚀 V10 Processing {len(files)} files")
-    
-    tasks = []
-    final_results = []
-    file_map = {f.filename: await f.read() for f in files}
-    
-    for filename, config in configs.items():
-        if filename not in file_map: continue
-        content = file_map[filename]
-        eq = config.get("equipment", "General")
-        goal = config.get("goal", "")
-        mode = config.get("mode", "Auto")
-        fname_lower = filename.lower()
-        
-        # [A] Document (Literature)
-        if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
-            async def process_doc(c, n, e):
-                try:
-                    if n.lower().endswith('.pdf'):
-                        images = convert_from_bytes(c, dpi=150, fmt='jpeg')[:10]
-                        full_txt = ""
-                        pages = []
-                        for idx, img in enumerate(images):
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG")
-                            b64 = base64.b64encode(buf.getvalue()).decode()
-                            # ★ 강제 한글 요약
-                            desc = await analyze_vision_ollama(buf.getvalue(), "이 페이지를 한글로 요약해줘. 표나 그림이 있다면 자세히 설명해줘.")
-                            full_txt += f"\nPage {idx+1}: {desc}"
-                            pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
-                        return {"type": "pdf", "filename": n, "equipment": "Literature", "raw_context": full_txt, "pages": pages}
-                    
-                    elif n.lower().endswith(('.ppt', '.pptx')):
-                        prs = Presentation(io.BytesIO(c))
-                        slides = []
-                        full_txt = ""
-                        for i, slide in enumerate(prs.slides):
-                            txt = ""
-                            imgs = []
-                            for s in slide.shapes:
-                                if hasattr(s, "text"): txt += s.text + "\n"
-                                if s.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                                    try:
-                                        ib64 = base64.b64encode(s.image.blob).decode('utf-8')
-                                        desc = await analyze_vision_ollama(s.image.blob, "이 그림을 한글로 설명해줘.")
-                                        imgs.append({"b64": ib64, "desc": desc})
-                                    except: pass
-                            full_txt += f"Slide {i+1}: {txt}\n"
-                            slides.append({"slide_num": i+1, "text": txt, "images": imgs})
-                        return {"type": "ppt", "filename": n, "equipment": "Literature", "raw_context": full_txt, "slides": slides}
-                except Exception as e: return {"type": "error", "filename": n, "msg": str(e)}
-            tasks.append(process_doc(content, filename, eq))
-            continue
-
-        # [B] Data (Spectrum/Image)
-        if fname_lower.endswith(('.xlsx', '.xls')):
-            try:
-                xls = pd.ExcelFile(io.BytesIO(content))
-                for sheet_name in xls.sheet_names:
-                    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-                    blocks = detect_excel_blocks(df)
-                    for i, block in enumerate(blocks):
-                        async def proc_xls(blk, sname, idx):
-                            try:
-                                num_block = blk.apply(pd.to_numeric, errors='coerce').dropna(how='all').dropna(how='all', axis=1)
-                                if not num_block.empty and num_block.shape[0] > 5:
-                                    x = num_block.iloc[:, 0].fillna(0).values
-                                    y = num_block.iloc[:, 1].fillna(0).values
-                                    res = ScienceProcessorV10.process_spectrum(x, y, mode, goal)
-                                    step = max(1, len(x)//100)
-                                    chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(x), step)]
-                                    return {
-                                        "type": "spectrum", "filename": f"{filename} ({sname}-{idx+1})",
-                                        "equipment": eq, "raw_context": f"Spectrum Data. Peaks: {len(res['peaks'])}",
-                                        "chart_data": chart
-                                    }
-                            except: return None
-                        tasks.append(proc_xls(block, sheet_name, i))
-            except: pass
-
-        elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
-            async def proc_img(c, n, e, g, m):
-                try:
-                    vis_res = ScienceProcessorV10.process_image(c, e, m, g)
-                    body = base64.b64decode(vis_res["proc_b64"])
-                    # ★ 강제 한글 분석
-                    desc = await analyze_vision_ollama(body, f"이 {e} 이미지를 한글로 분석해줘. 목표: {g}. 특징: {vis_res['stats']}")
-                    
-                    return {
-                        "type": "image", "filename": n, "equipment": e,
-                        "summary": desc, "raw_context": f"Image: {desc}\nStats: {vis_res['stats']}",
-                        "raw_b64": vis_res["raw_b64"], "proc_b64": vis_res["proc_b64"], "footer_b64": vis_res.get("footer_b64"),
-                        "stats": vis_res["stats"]
-                    }
-                except Exception as ex: return {"type": "error", "filename": n, "msg": str(ex)}
-            tasks.append(proc_img(content, filename, eq, goal, mode))
-            
-        elif fname_lower.endswith(('.csv', '.txt')):
-             async def proc_csv(c, n, e, g, m):
-                try:
-                    try: df = pd.read_csv(io.BytesIO(c))
-                    except: df = pd.read_csv(io.BytesIO(c), delimiter='\t')
-                    x = df.iloc[:, 0].values
-                    y = df.iloc[:, 1].values
-                    res = ScienceProcessorV10.process_spectrum(x, y, mode, g)
-                    step = max(1, len(x)//100)
-                    chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(x), step)]
-                    return {"type": "spectrum", "filename": n, "equipment": e, "chart_data": chart, "raw_context": f"Spectrum Peaks: {len(res['peaks'])}"}
-                except Exception as ex: return {"type": "error", "filename": n, "msg": str(ex)}
-             tasks.append(proc_csv(content, filename, eq, goal, mode))
-
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, dict): final_results.append(r)
-
-    # Synthesis (Korean Default)
-    data_ctx, lit_ctx = "", ""
-    for r in final_results:
-        if r and r.get("type") != "error":
-            raw = r.get("raw_context") or ""
-            blk = f"\n=== File: {r['filename']} ===\n{raw[:3000]}\n"
-            if r.get("equipment") == "Literature": lit_ctx += blk
-            else: data_ctx += blk
-            
-    final_report = "분석 실패"
-    if data_ctx or lit_ctx:
-        try:
-            # ★ 강제 한글 종합
-            prompt = "당신은 수석 연구원입니다. 실험 데이터(Data)와 문헌(Literature)을 종합하여 한글로 보고서를 작성하세요. 표(Table)를 적극 활용하세요."
-            res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':prompt}, {'role':'user','content':f"Data:\n{data_ctx}\n\nLiterature:\n{lit_ctx}"}])
-            final_report = res['message']['content']
-        except Exception as e: final_report = str(e)
-
-    return {"results": final_results, "final_report": final_report}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
+브이10.1
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>AI Research Center V10</title>
+    <title>AI Research Center V10.1</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
@@ -795,7 +484,7 @@ if __name__ == "__main__":
     <div id="app" class="min-h-screen p-6">
         <header class="max-w-7xl mx-auto mb-6 flex items-center gap-3">
             <div class="bg-indigo-600 p-2 rounded-lg shadow"><i data-lucide="globe" class="w-6 h-6 text-white"></i></div>
-            <div><h1 class="text-2xl font-bold">AI Research Center V10</h1><p class="text-xs text-slate-500">Global Language Hub • Translation Tab</p></div>
+            <div><h1 class="text-2xl font-bold">AI Research Center V10.1</h1><p class="text-xs text-slate-500">PPT Visualization Fixed</p></div>
         </header>
 
         <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -909,17 +598,33 @@ if __name__ == "__main__":
                                     <img v-if="item.view==='footer'" :src="'data:image/jpeg;base64,' + item.footer_b64" class="max-h-24 mx-auto object-contain border mt-2">
                                 </div>
 
-                                <!-- Docs -->
+                                <!-- Docs (PDF) -->
                                 <div v-if="item.pages" class="grid grid-cols-1 gap-4">
                                     <div v-for="p in item.pages" :key="p.page_num" class="flex gap-3 bg-white p-3 rounded border">
                                         <img :src="'data:image/jpeg;base64,'+p.image_b64" class="w-24 object-contain border">
-                                        <!-- Document Text Display (Lang aware) -->
                                         <div class="text-xs prose" v-html="md(lang === 'en' ? (p.desc_en || p.desc) : p.desc)"></div>
                                     </div>
                                 </div>
-                                <div v-if="item.slides" class="text-xs text-slate-600">PPT Slides (Check Synthesis)</div>
 
-                                <!-- Summary Text Display (Lang aware) -->
+                                <!-- ★ [FIXED] Docs (PPT Slides) -->
+                                <div v-if="item.slides && item.slides.length > 0" class="space-y-4">
+                                    <h4 class="text-xs font-bold text-slate-500 border-b pb-1">Presentation Slides</h4>
+                                    <div v-for="s in item.slides" :key="s.slide_num" class="bg-white p-3 rounded border">
+                                        <div class="text-xs font-bold text-indigo-600 mb-1">Slide {{s.slide_num}}</div>
+                                        
+                                        <!-- Slide Text -->
+                                        <div class="text-xs prose mb-2 whitespace-pre-wrap max-h-40 overflow-y-auto">{{ s.text }}</div>
+                                        
+                                        <!-- Slide Extracted Images -->
+                                        <div v-if="s.images && s.images.length" class="grid grid-cols-2 gap-2 mt-2 border-t pt-2">
+                                            <div v-for="(img, imx) in s.images" :key="imx" class="bg-slate-50 p-2 rounded">
+                                                <img :src="'data:image/jpeg;base64,'+img.b64" class="max-h-32 mx-auto object-contain border bg-white mb-1">
+                                                <p class="text-[10px] text-slate-500 text-center">{{ img.desc }}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <div class="text-xs text-slate-600 mt-2 prose" v-html="md(lang === 'en' ? (item.summary_en || item.summary) : item.summary)"></div>
                             </div>
                         </section>
@@ -936,7 +641,7 @@ if __name__ == "__main__":
                 const isAnalyzing = ref(false);
                 const isTranslating = ref(false);
                 const result = ref(null);
-                const lang = ref('ko'); // 'ko' or 'en'
+                const lang = ref('ko'); 
                 const translatedReport = ref('');
 
                 const renderer = new marked.Renderer(); renderer.image = () => ''; marked.use({ renderer });
@@ -956,7 +661,7 @@ if __name__ == "__main__":
 
                 const analyze = async () => {
                     isAnalyzing.value = true;
-                    lang.value = 'ko'; // Reset to Korean on new analysis
+                    lang.value = 'ko'; 
                     translatedReport.value = '';
                     
                     const fd = new FormData();
@@ -984,11 +689,7 @@ if __name__ == "__main__":
                         return;
                     }
                     if (target === 'en') {
-                        if (translatedReport.value) {
-                            lang.value = 'en'; // Already translated
-                            return;
-                        }
-                        // Need Translation
+                        if (translatedReport.value) { lang.value = 'en'; return; }
                         isTranslating.value = true;
                         try {
                             const res = await fetch('/api/translate', {
@@ -1015,7 +716,7 @@ if __name__ == "__main__":
                     });
                 };
                 
-                const dlPDF = () => html2pdf().set({ margin:10, filename:'V10_Report.pdf', image:{type:'jpeg',quality:0.98}, html2canvas:{scale:2}, jsPDF:{unit:'mm',format:'a4'} }).from(document.getElementById('report-view')).save();
+                const dlPDF = () => html2pdf().set({ margin:10, filename:'V10_1_Report.pdf', image:{type:'jpeg',quality:0.98}, html2canvas:{scale:2}, jsPDF:{unit:'mm',format:'a4'} }).from(document.getElementById('report-view')).save();
 
                 setTimeout(()=>lucide.createIcons(), 100);
                 return { stagedFiles, isAnalyzing, isTranslating, result, lang, displayReport, addFiles, removeFile, analyze, md, dlPDF, setLang };
@@ -1024,5 +725,7 @@ if __name__ == "__main__":
     </script>
 </body>
 </html>
+
+
 
 
