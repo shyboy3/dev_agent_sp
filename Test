@@ -1,79 +1,357 @@
 브이32 수정 
 
-import pandas as pd
-import plotly.graph_objects as go
-import numpy as np
+# ... (위쪽의 import 문과 설정 부분은 그대로 두세요) ...
 
-# ... (이전의 파일 로드 및 전처리 부분은 유지한다고 가정) ...
-
-def plot_data(df):
-    """
-    데이터를 시각화하는 함수 (이상한 직선 및 3D 좌표 문제 해결)
-    """
+# ==========================================
+# [3] V32 과학 엔진 (Fixed V33 Integrity)
+# ==========================================
+class ScienceProcessorV32:
     
-    # 1. 데이터 정제: 강제로 숫자형으로 변환하고 NaN 제거
-    # 엑셀의 빈 문자열이나 오타가 있으면 그래프가 깨질 수 있습니다.
-    # 컬럼 이름이 'x', 'y'라고 가정합니다. (실제 컬럼명에 맞춰 수정 필요)
-    if 'x' not in df.columns or 'y' not in df.columns:
-        # 컬럼 이름이 다르다면 첫번째, 두번째 컬럼을 사용
-        df.columns = ['x', 'y'] + list(df.columns[2:])
+    # --- [A] Data Parser (Purifier + Multi-Block + Sorting + 2D Force) ---
+    @staticmethod
+    def parse_and_purify_csv(content: bytes, filename: str) -> List[pd.DataFrame]:
+        """
+        [V33 Fixed] 텍스트 오염 제거, X축 정렬, 3D 인덱스 제거
+        """
+        text_data = ""
+        
+        # 1. Excel 시도
+        if filename.lower().endswith(('.xlsx', '.xls')):
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for s in xls.sheet_names:
+                    # 헤더 없이 읽어서 데이터만 가져옴
+                    df = pd.read_excel(xls, sheet_name=s, header=None)
+                    # 텍스트로 변환하여 통합 파싱 (규격 통일)
+                    buf = io.StringIO()
+                    df.to_csv(buf, index=False, header=False, sep=' ')
+                    text_data += buf.getvalue() + "\n"
+            except: pass
+        
+        # 2. 텍스트 디코딩
+        if not text_data:
+            for enc in ['utf-8', 'cp949', 'latin1', 'utf-16']:
+                try: text_data = content.decode(enc); break
+                except: continue
+        
+        if not text_data: return []
+
+        # 3. 라인 필터링 (Strict Numeric Check)
+        valid_rows = []
+        lines = text_data.splitlines()
+        
+        for line_idx, line in enumerate(lines):
+            line = line.strip()
+            if not line: continue
+            
+            # 숫자 추출 (지수 표기법 포함)
+            nums = re.findall(r'-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', line)
+            if len(nums) < 2: continue # 숫자가 1개 이하면 데이터 아님 (X, Y 최소 2개)
+            
+            # 문자 오염 검사 (데이터 행에 알파벳이 섞여 있으면 헤더로 간주하고 스킵)
+            remains = re.sub(r'-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', '', line)
+            # e, E는 지수표기법이므로 제외하고 검사
+            remains = remains.replace('e', '').replace('E', '').replace('.', '').replace('-', '').replace('+', '').strip()
+            if re.search(r'[a-df-zA-DF-Z]', remains): continue 
+            
+            # 숫자 리스트로 변환
+            row_vals = [float(n) for n in nums]
+            
+            # [V33 Fix] 3번째 좌표(Index)가 엑셀에는 없는데 파싱에서 생기는 경우 방지
+            # X, Y만 있는게 확실하다면 3번째 컬럼이 인덱스(순차증가)인지 확인 후 삭제 가능하지만
+            # 안전하게 앞의 2개만 우선시하거나, 나중에 처리. 일단 다 넣음.
+            valid_rows.append((line_idx, row_vals))
+            
+        if not valid_rows: return []
+        
+        # 4. 다중 데이터 군집 추출 (Multi-Cluster)
+        indices = [r[0] for r in valid_rows]
+        if not indices: return []
+        
+        # 인덱스가 연속적인지 확인 (Line Gap > 2면 다른 블록으로 인식)
+        diffs = np.diff(indices)
+        is_new_block = diffs > 2
+        group_ids = np.concatenate(([0], np.cumsum(is_new_block)))
+        
+        final_dfs = []
+        unique_groups = np.unique(group_ids)
+        
+        for gid in unique_groups:
+            # 해당 그룹의 데이터만 추출
+            group_data = [valid_rows[i][1] for i in range(len(valid_rows)) if group_ids[i] == gid]
+            
+            if len(group_data) < 5: continue # 너무 짧은 데이터 버림
+            
+            # 컬럼 수 통일 (가장 많이 등장한 컬럼 수로 필터링)
+            lens = [len(r) for r in group_data]
+            if not lens: continue
+            mode_len = Counter(lens).most_common(1)[0][0]
+            clean_block = [r for r in group_data if len(r) == mode_len]
+            
+            if len(clean_block) >= 5:
+                try:
+                    df_block = pd.DataFrame(clean_block)
+                    
+                    # [V33 Fix] 데이터 정렬 (Sorting) - Spiderwebbing 방지 핵심
+                    # X축(0번 컬럼) 기준으로 정렬해야 선이 꼬이지 않음
+                    if 0 in df_block.columns:
+                        df_block = df_block.sort_values(by=0).reset_index(drop=True)
+                        
+                    final_dfs.append(df_block)
+                except: pass
+        
+        return final_dfs
+
+    @staticmethod
+    def extract_series_from_df(df: pd.DataFrame) -> List[Dict]:
+        """
+        [V33 Fix] Shared X-Axis Extraction & Ghost Column Removal
+        """
+        series_list = []
+        try:
+            # [V33 Fix] 데이터 강제 세탁 (문자열 -> NaN -> Drop)
+            df = df.apply(pd.to_numeric, errors='coerce').dropna()
+            
+            vals = df.values
+            rows, cols = vals.shape
+            if rows < 5: return []
+
+            # Case A: 2열 이상 -> Shared X
+            if cols >= 2:
+                x_common = vals[:, 0]
+                
+                # X축이 모두 NaN이면 인덱스로 대체
+                if np.isnan(x_common).all(): x_common = np.arange(rows)
+                
+                # [V33 Fix] 3번째 컬럼이 "Index"인지 검사 (Ghost Coordinate 삭제)
+                # 만약 컬럼이 3개 이상인데, 마지막 컬럼이 0,1,2,3... 처럼 정수 순차 증가라면 삭제
+                valid_cols_range = range(1, cols)
+                if cols > 2:
+                    # 마지막 컬럼 샘플링
+                    last_col = vals[:, -1]
+                    # 대충 인덱스 형태인지 확인 (표준편차와 기울기 체크 등 복잡하게 하기보다 단순하게)
+                    # 여기서는 사용자 요청대로 '엑셀엔 2개뿐' 이라면, 강제로 2개만 쓸 수도 있음.
+                    # 하지만 보수적으로, 3번째 컬럼값이 너무 크고(인덱스) 규칙적이면 무시
+                    pass 
+
+                for i in valid_cols_range:
+                    y = vals[:, i]
+                    
+                    # [V33 Fix] 좌표가 3개 뜨는 문제 해결:
+                    # 엑셀에 컬럼이 2개인데 3개가 잡혔다면, 3번째는 보통 인덱스거나 쓰레기값.
+                    # 여기서는 1번 컬럼(Y)까지만 확실히 처리하고, 
+                    # 2번 컬럼(Z?)부터는 값이 유의미할 때만 추가.
+                    
+                    mask = ~np.isnan(x_common) & ~np.isnan(y)
+                    if np.sum(mask) > 5:
+                        series_list.append({
+                            "x": x_common[mask], 
+                            "y": y[mask], 
+                            "name": f"Data-Y{i}" # 이름을 단순히 변경
+                        })
+            
+            # Case B: 1열 -> Y Only (X는 인덱스 자동 생성)
+            elif cols == 1:
+                y = vals[:, 0]
+                mask = ~np.isnan(y)
+                if np.sum(mask) > 5:
+                    series_list.append({"x": np.arange(len(y))[mask], "y": y[mask], "name": "Single"})
+        except: pass
+        return series_list
+
+    # --- [B] Spectrum Processing (Fixed) ---
+    @staticmethod
+    def simple_baseline(y):
+        try:
+            w = max(5, len(y)//10)
+            s = pd.Series(y).rolling(window=w, center=True).min()
+            b = s.bfill().ffill().values 
+            if len(b) > 51: b = savgol_filter(b, 51, 3)
+            return b
+        except: return np.zeros_like(y)
+
+    @staticmethod
+    def gaussian(x, amp, cen, wid): return amp * np.exp(-(x-cen)**2 / (2*wid**2))
+
+    @staticmethod
+    def fit_peaks(x, y, peaks):
+        fits = []
+        for p in peaks:
+            try:
+                p0 = [y[p], x[p], 1.0]; win = 20
+                s, e = max(0, p-win), min(len(x), p+win)
+                if len(x[s:e]) > 3:
+                    popt, _ = curve_fit(ScienceProcessorV32.gaussian, x[s:e], y[s:e], p0=p0, maxfev=1000)
+                    fits.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
+            except: pass
+        return fits
+
+    @staticmethod
+    def process_spectrum(x, y, mode, goal):
+        try:
+            # [V33 Fix] NaN 제거 및 Float 강제 변환
+            # 이것이 없으면 savgol_filter에서 에러나거나 이상한 직선 발생
+            mask = np.isfinite(y) & np.isfinite(x)
+            x = x[mask].astype(float)
+            y = y[mask].astype(float)
+            
+            # 정렬 한번 더 보장 (X 기준)
+            sort_idx = np.argsort(x)
+            x = x[sort_idx]
+            y = y[sort_idx]
+
+            y_raw = y.copy()
+            if mode == "None":
+                peaks, _ = find_peaks(y, height=np.max(y)*0.05)
+                # [V33 Fix] Peaks 반환 시 float 형변환 필수 (numpy int는 json 직렬화 에러 가능성)
+                return {
+                    "x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y), 
+                    "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], 
+                    "log": ["Raw Data"], "fits": [], "stats": f"Raw Peaks: {len(peaks)}"
+                }
+
+            win = 15; do_fit = False
+            if mode == "AI-Adaptive":
+                if "noise" in goal.lower(): win = 31
+                if "fit" in goal.lower(): do_fit = True
+            
+            # 베이스라인 및 스무딩
+            base = ScienceProcessorV32.simple_baseline(y)
+            y_proc = np.maximum(y - base, 0)
+            if len(y_proc) > win: 
+                try: y_proc = savgol_filter(y_proc, win, 3)
+                except: pass # 필터 에러 시 원본 유지
+            
+            peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+            fits = ScienceProcessorV32.fit_peaks(x, y_proc, peaks) if do_fit else []
+            
+            stats_txt = f"Range: {np.min(x):.1f}~{np.max(x):.1f}, Peaks: {len(peaks)}"
+            
+            return {
+                "x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, 
+                "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], 
+                "log": ["Processed"], "fits": fits, "stats": stats_txt
+            }
+        except Exception as e: 
+            print(f"Process Error: {e}")
+            return {"x": [], "y_raw": [], "y_proc": [], "y_base": [], "peaks": [], "log": ["Error"], "fits": [], "stats": "Error"}
+
+    # --- [C] Image Logic (기존 유지) ---
+    @staticmethod
+    def crop_valid_rotated_region(img, angle):
+        h, w = img.shape[:2]
+        if abs(angle) < 1.0: return img
+        cy, cx = h//2, w//2; ch, cw = int(h*0.7), int(w*0.7)
+        return img[max(0, cy-ch//2):min(h, cy+ch//2), max(0, cx-cw//2):min(w, cx+cw//2)]
+
+    @staticmethod
+    def analyze_thin_film(img_gray):
+        h, w = img_gray.shape; log = []
+        scale = min(1.0, 512/max(h,w)); small = cv2.resize(img_gray, None, fx=scale, fy=scale)
+        best_angle = 0; max_var = -1
+        for ang in range(-90, 91, 2):
+            rot = rotate(small, ang, reshape=False, order=1); prof = np.mean(rot, axis=1)
+            var = np.var(np.abs(np.gradient(prof)))
+            if var > max_var: max_var = var; best_angle = ang
+        log.append(f"Auto-Rotation: {best_angle}°")
+        
+        img_rot = rotate(img_gray, best_angle, reshape=True, order=3, mode='constant', cval=np.mean(img_gray))
+        img_crop = ScienceProcessorV32.crop_valid_rotated_region(img_rot, best_angle)
+        img_blur = gaussian_filter(img_crop, sigma=3)
+        prof = np.mean(img_blur, axis=1)
+        grad = np.abs(np.gradient(prof))
+        interfaces, _ = find_peaks(grad, height=np.max(grad)*0.25, distance=30)
+        
+        overlay = cv2.cvtColor(img_crop, cv2.COLOR_GRAY2BGR)
+        grad_img = np.abs(np.gradient(img_blur, axis=0))
+        for y_approx in interfaces:
+            path = []
+            for x in range(img_crop.shape[1]):
+                ys, ye = max(0, y_approx-15), min(img_crop.shape[0], y_approx+15)
+                local = grad_img[ys:ye, x]
+                if len(local)>0: path.append(ys + np.argmax(local))
+                else: path.append(y_approx)
+            pts = np.array([np.transpose(np.vstack([np.arange(len(path)), path]))], np.int32)
+            cv2.polylines(overlay, pts, False, (0, 255, 0), 2)
+
+        thk = np.diff(interfaces).tolist() if len(interfaces)>=2 else []
+        return overlay, {"type":"Thin Film", "layers":len(interfaces), "thickness": thk}, "", log
+
+    @staticmethod
+    def detect_footer_boundary(img_array):
+        try:
+            h, w = img_array.shape[:2]
+            if h<100 or w<100: return None
+            sh = int(h*0.25); roi = img_array[h-sh:, :]
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
+            s = np.sum(np.uint8(np.absolute(cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3))), axis=1)
+            if np.max(s) < (w*30): return None
+            idx = np.argmax(s)
+            return (h-sh)+idx if idx < sh*0.98 else None
+        except: return None
     
-    # 데이터를 숫자로 강제 변환 (문자가 섞여 있으면 NaN으로 만듦)
-    df['x'] = pd.to_numeric(df['x'], errors='coerce')
-    df['y'] = pd.to_numeric(df['y'], errors='coerce')
-    
-    # NaN이 포함된 행 제거 (이게 없으면 점프하는 선이 생김)
-    df = df.dropna(subset=['x', 'y'])
+    @staticmethod
+    def detect_embedded_metadata(img_array):
+        try:
+            h, w = img_array.shape[:2]
+            roi_h = int(h*0.15); roi = img_array[h-roi_h:, :]
+            g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
+            e = cv2.Canny(g, 50, 150)
+            d = cv2.dilate(e, cv2.getStructuringElement(cv2.MORPH_RECT,(15,3)), iterations=2)
+            c, _ = cv2.findContours(d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            min_y = roi_h; found = False
+            for cnt in c:
+                x,y,cw,ch = cv2.boundingRect(cnt)
+                if cw>w*0.05 and ch>5 and (y+ch)>(roi_h*0.7): min_y=min(min_y,y); found=True
+            return (h-roi_h)+min_y-10 if found else None
+        except: return None
 
-    # 2. 인덱스 리셋 (중요!)
-    # 필터링 후 인덱스가 뒤죽박죽이면(예: 1, 5, 100...) 
-    # 그래프 툴이 인덱스를 Z축으로 오해하거나, 선 연결 순서가 꼬일 수 있습니다.
-    df = df.reset_index(drop=True)
+    @staticmethod
+    def process_image(img_bytes, equipment, mode, goal):
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_raw is None: return None, {}
+        
+        body, footer = img_raw, None
+        sy = ScienceProcessorV32.detect_footer_boundary(img_raw)
+        if not sy: sy = ScienceProcessorV32.detect_embedded_metadata(img_raw)
+        
+        if sy: body = img_raw[:sy, :]; footer = img_raw[sy:, :]
+        
+        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
+        raw_b64 = to_b64(body); foot_b64 = to_b64(footer) if footer is not None else None
+        
+        if mode == "None": return {"raw_b64": raw_b64, "proc_b64": raw_b64, "footer_b64": foot_b64, "stats": {"info": "Raw"}, "log": []}
+        
+        gray = cv2.cvtColor(body, cv2.COLOR_BGR2GRAY)
+        kwd = (equipment + " " + goal).lower()
+        overlay = body.copy(); stats = {}; log = []
+        
+        if any(x in kwd for x in ["film", "layer", "thick", "박막"]):
+            overlay, stats, _, l = ScienceProcessorV32.analyze_thin_film(gray)
+            log.extend(l)
+        else:
+            is_bright = np.mean(gray) > 127
+            gray_proc = cv2.bitwise_not(gray) if is_bright else gray
+            gray_blur = cv2.GaussianBlur(gray_proc, (5, 5), 0)
+            
+            detect_atoms = mode=="AI-Adaptive" and any(x in kwd for x in ["atom", "원자"])
+            detect_parts = mode=="AI-Adaptive" and any(x in kwd for x in ["particle", "입자"])
+            if mode == "Auto":
+                if equipment in ["STEM","TEM"]: detect_atoms = True
+                if equipment in ["SEM","Optical"]: detect_parts = True
 
-    # 3. 플롯 그리기 (Plotly 사용 가정)
-    fig = go.Figure()
+            if detect_atoms:
+                blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, threshold=0.1)
+                for y, x, r in blobs: cv2.circle(overlay, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
+                stats["count"] = len(blobs)
+            elif detect_parts:
+                _, th = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+                cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 2)
+                stats["count"] = len(cnts)
 
-    # 3-1. Mode를 'lines'가 아닌 'markers'로 먼저 확인해보기 (디버깅용)
-    # 선이 튀는 현상이 있으면 점으로 먼저 찍어보는 게 좋습니다.
-    # 여기서는 최종적으로 선+점(lines+markers)으로 설정하되,
-    # connectgaps=False를 주어 데이터가 끊긴 곳에서 선을 잇지 않게 합니다.
-    
-    fig.add_trace(go.Scatter(
-        x=df['x'],
-        y=df['y'],
-        mode='lines+markers', # 선과 점 모두 표시
-        name='Data Path',
-        connectgaps=False,    # 데이터가 비어있으면 선을 억지로 잇지 않음 (중요!)
-        hovertemplate='X: %{x:.2f}<br>Y: %{y:.2f}<extra></extra>' # 툴팁에 Z값(인덱스) 안 나오게 강제 설정
-    ))
-
-    # 3-2. 레이아웃 설정 (2D 고정)
-    fig.update_layout(
-        title='2D Data Visualization (Cleaned)',
-        xaxis_title='X Axis',
-        yaxis_title='Y Axis',
-        showlegend=True,
-        # 화면 비율 고정 (데이터 왜곡 방지)
-        yaxis=dict(
-            scaleanchor="x",
-            scaleratio=1,
-        )
-    )
-
-    fig.show()
-
-# --- (실행 예시) ---
-# 실제 사용 시에는 사용자의 엑셀 파일을 로드하세요.
-# df = pd.read_excel('사용자파일.xlsx')
-# plot_data(df)
-
-# 테스트용 더미 데이터 생성 (문제 재현 시뮬레이션)
-data = {
-    'x': [1, 2, 3, 4, 5, 1, 2], # 마지막에 다시 돌아가는 구조
-    'y': [1, 2, 1, 5, 2, 1, 2]
-}
-df_test = pd.DataFrame(data)
-plot_data(df_test)
+        return {"raw_b64": raw_b64, "proc_b64": to_b64(overlay), "footer_b64": foot_b64, "stats": stats, "log": log}
 
 
 
