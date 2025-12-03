@@ -1,3 +1,83 @@
+브이32 수정 
+
+import pandas as pd
+import plotly.graph_objects as go
+import numpy as np
+
+# ... (이전의 파일 로드 및 전처리 부분은 유지한다고 가정) ...
+
+def plot_data(df):
+    """
+    데이터를 시각화하는 함수 (이상한 직선 및 3D 좌표 문제 해결)
+    """
+    
+    # 1. 데이터 정제: 강제로 숫자형으로 변환하고 NaN 제거
+    # 엑셀의 빈 문자열이나 오타가 있으면 그래프가 깨질 수 있습니다.
+    # 컬럼 이름이 'x', 'y'라고 가정합니다. (실제 컬럼명에 맞춰 수정 필요)
+    if 'x' not in df.columns or 'y' not in df.columns:
+        # 컬럼 이름이 다르다면 첫번째, 두번째 컬럼을 사용
+        df.columns = ['x', 'y'] + list(df.columns[2:])
+    
+    # 데이터를 숫자로 강제 변환 (문자가 섞여 있으면 NaN으로 만듦)
+    df['x'] = pd.to_numeric(df['x'], errors='coerce')
+    df['y'] = pd.to_numeric(df['y'], errors='coerce')
+    
+    # NaN이 포함된 행 제거 (이게 없으면 점프하는 선이 생김)
+    df = df.dropna(subset=['x', 'y'])
+
+    # 2. 인덱스 리셋 (중요!)
+    # 필터링 후 인덱스가 뒤죽박죽이면(예: 1, 5, 100...) 
+    # 그래프 툴이 인덱스를 Z축으로 오해하거나, 선 연결 순서가 꼬일 수 있습니다.
+    df = df.reset_index(drop=True)
+
+    # 3. 플롯 그리기 (Plotly 사용 가정)
+    fig = go.Figure()
+
+    # 3-1. Mode를 'lines'가 아닌 'markers'로 먼저 확인해보기 (디버깅용)
+    # 선이 튀는 현상이 있으면 점으로 먼저 찍어보는 게 좋습니다.
+    # 여기서는 최종적으로 선+점(lines+markers)으로 설정하되,
+    # connectgaps=False를 주어 데이터가 끊긴 곳에서 선을 잇지 않게 합니다.
+    
+    fig.add_trace(go.Scatter(
+        x=df['x'],
+        y=df['y'],
+        mode='lines+markers', # 선과 점 모두 표시
+        name='Data Path',
+        connectgaps=False,    # 데이터가 비어있으면 선을 억지로 잇지 않음 (중요!)
+        hovertemplate='X: %{x:.2f}<br>Y: %{y:.2f}<extra></extra>' # 툴팁에 Z값(인덱스) 안 나오게 강제 설정
+    ))
+
+    # 3-2. 레이아웃 설정 (2D 고정)
+    fig.update_layout(
+        title='2D Data Visualization (Cleaned)',
+        xaxis_title='X Axis',
+        yaxis_title='Y Axis',
+        showlegend=True,
+        # 화면 비율 고정 (데이터 왜곡 방지)
+        yaxis=dict(
+            scaleanchor="x",
+            scaleratio=1,
+        )
+    )
+
+    fig.show()
+
+# --- (실행 예시) ---
+# 실제 사용 시에는 사용자의 엑셀 파일을 로드하세요.
+# df = pd.read_excel('사용자파일.xlsx')
+# plot_data(df)
+
+# 테스트용 더미 데이터 생성 (문제 재현 시뮬레이션)
+data = {
+    'x': [1, 2, 3, 4, 5, 1, 2], # 마지막에 다시 돌아가는 구조
+    'y': [1, 2, 1, 5, 2, 1, 2]
+}
+df_test = pd.DataFrame(data)
+plot_data(df_test)
+
+
+
+
 브이32
 
 import os
@@ -8,7 +88,7 @@ import json
 import re
 import math
 from collections import Counter
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, 
 from pydantic import BaseModel
 
 # [1] 보안 설정
