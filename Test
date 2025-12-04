@@ -1,4 +1,280 @@
-엔브이3
+엔브이2 웹
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Analyst NV2 Refined</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .prose table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        .prose th, .prose td { border: 1px solid #cbd5e1; padding: 8px; font-size: 0.9rem; }
+        .prose th { background-color: #f1f5f9; }
+        .loader { border: 3px solid #f3f3f3; border-top: 3px solid #6366f1; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+    <div id="app" class="min-h-screen p-6">
+        <header class="max-w-7xl mx-auto mb-6 flex items-center gap-3">
+            <div class="bg-indigo-600 p-2 rounded-lg shadow"><i data-lucide="microscope" class="w-6 h-6 text-white"></i></div>
+            <div><h1 class="text-2xl font-bold">Analyst NV2 Refined</h1><p class="text-xs text-slate-500">Enhanced Identity Check & Interactive Graphs</p></div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+            
+            <div class="lg:col-span-4 space-y-4">
+                <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                    <h2 class="font-bold mb-3 flex items-center gap-2"><i data-lucide="files" class="w-4 h-4"></i> Data Staging</h2>
+                    <div class="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-indigo-50 cursor-pointer" @click="$refs.f.click()">
+                        <input type="file" ref="f" multiple class="hidden" @change="addFiles">
+                        <p class="text-sm font-semibold text-slate-600">Add Files</p>
+                    </div>
+                    <div v-if="stagedFiles.length" class="mt-4 space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+                        <div v-for="(item, i) in stagedFiles" :key="i" class="p-3 bg-slate-50 border rounded-lg text-sm">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="font-bold truncate w-2/3" :title="item.file.name">{{ item.file.name }}</span>
+                                <button @click="removeFile(i)" class="text-red-400 hover:text-red-600"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                            <div class="grid grid-cols-1 gap-2">
+                                <select v-model="item.equipment" class="w-full p-1.5 border rounded text-xs bg-white font-semibold text-indigo-700">
+                                    <optgroup label="Spectroscopy">
+                                        <option value="XRD">XRD</option>
+                                        <option value="EDS">EDS / EDX</option>
+                                        <option value="EELS">EELS</option>
+                                        <option value="Raman">Raman</option>
+                                        <option value="FT-IR">FT-IR</option>
+                                        <option value="XPS">XPS</option>
+                                        <option value="PL">PL</option>
+                                    </optgroup>
+                                    <optgroup label="Microscopy">
+                                        <option value="TEM">TEM (Thin Film)</option>
+                                        <option value="STEM">STEM (Thin Film)</option>
+                                        <option value="SEM">SEM</option>
+                                        <option value="AFM">AFM</option>
+                                        <option value="Optical">Optical</option>
+                                    </optgroup>
+                                    <optgroup label="Literature">
+                                        <option value="Document">Document (PDF/PPT)</option>
+                                    </optgroup>
+                                </select>
+                                <select v-if="item.equipment !== 'Document'" v-model="item.mode" class="w-full p-1.5 border rounded text-xs bg-white text-indigo-700">
+                                    <option value="Auto">✨ Auto Process</option>
+                                    <option value="None">🚫 None (Raw)</option>
+                                    <option value="AI-Adaptive">🧠 AI-Adaptive</option>
+                                </select>
+                                <input v-if="item.equipment !== 'Document'" v-model="item.goal" type="text" placeholder="Goal (e.g. Count atoms)" class="w-full p-1.5 border rounded text-xs">
+                            </div>
+                        </div>
+                    </div>
+                    <button @click="analyze" :disabled="isAnalyzing || stagedFiles.length===0" class="w-full mt-4 py-3 bg-indigo-600 text-white rounded-lg font-bold flex justify-center gap-2 shadow hover:bg-indigo-700 disabled:opacity-50">
+                        <div v-if="isAnalyzing" class="loader"></div>
+                        <span>Generate Report</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="lg:col-span-8">
+                <div v-if="result" class="space-y-6 animate-fade-in">
+                    
+                    <div class="flex justify-between items-center bg-white p-2 rounded-xl shadow-sm border border-slate-200">
+                        <div class="flex gap-2">
+                            <button @click="setLang('ko')" :class="lang==='ko'?'bg-indigo-100 text-indigo-700 font-bold':'text-slate-500 hover:bg-slate-50'" class="px-4 py-2 rounded-lg text-sm transition-all flex items-center gap-2">🇰🇷 한글</button>
+                            <button @click="setLang('en')" :class="lang==='en'?'bg-blue-100 text-blue-700 font-bold':'text-slate-500 hover:bg-slate-50'" class="px-4 py-2 rounded-lg text-sm transition-all flex items-center gap-2">
+                                <div v-if="isTranslating" class="w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                                <span v-else>🇺🇸</span> English
+                            </button>
+                        </div>
+                        <button @click="dlPDF" class="px-3 py-1.5 bg-slate-800 text-white text-xs rounded">PDF Export</button>
+                    </div>
+
+                    <div id="report-view" class="bg-white p-8 rounded-xl shadow-sm border border-slate-200">
+                        
+                        <section class="mb-10">
+                            <h2 class="text-lg font-bold text-indigo-700 mb-3 border-b pb-1">1. Synthesis</h2>
+                            <div class="prose prose-sm text-slate-700 max-w-none" v-html="md(displayReport)"></div>
+                        </section>
+
+                        <section>
+                            <h2 class="text-lg font-bold text-slate-800 mb-5 border-b pb-1">2. Data Evidence</h2>
+                            
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-8 p-4 bg-slate-50 rounded-lg border break-inside-avoid">
+                                <div class="flex items-center justify-between mb-3">
+                                    <div class="flex items-center gap-2">
+                                        <span class="px-2 py-0.5 bg-white border rounded text-[10px] font-bold uppercase text-slate-500">{{ item.equipment }}</span>
+                                        <h3 class="font-bold text-sm">{{ item.filename }}</h3>
+                                    </div>
+                                    <button @click="item.showDocs = !item.showDocs" class="text-xs text-indigo-600 font-bold hover:underline flex items-center gap-1">
+                                        <i :data-lucide="item.showDocs ? 'eye-off' : 'eye'" class="w-3 h-3"></i>
+                                        {{ item.showDocs ? 'Hide Info' : 'Show Info' }}
+                                    </button>
+                                </div>
+
+                                <div v-if="item.chart_data" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 justify-end mb-1">
+                                        <button @click="toggleTrace(idx, 0)" class="text-[10px] px-2 py-0.5 border rounded bg-slate-50 hover:bg-slate-100 text-slate-500 font-bold">Raw</button>
+                                        <button @click="toggleTrace(idx, 1)" class="text-[10px] px-2 py-0.5 border rounded bg-amber-50 hover:bg-amber-100 text-amber-600 font-bold">Base</button>
+                                        <button @click="toggleTrace(idx, 2)" class="text-[10px] px-2 py-0.5 border rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-600 font-bold">Proc</button>
+                                    </div>
+                                    <div :id="'chart-'+idx" class="w-full h-60"></div>
+                                    <div v-if="item.interpretation && item.showDocs" class="mt-3 p-3 bg-indigo-50 border border-indigo-100 rounded text-xs text-indigo-800">
+                                        <h4 class="font-bold mb-1 flex items-center gap-1"><i data-lucide="lightbulb" class="w-3 h-3"></i> AI Interpretation</h4>
+                                        <div class="prose prose-xs text-indigo-700" v-html="md(item.interpretation)"></div>
+                                    </div>
+                                </div>
+
+                                <div v-if="item.raw_b64" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 mb-2 text-xs justify-center">
+                                        <button @click="item.view='proc'" :class="item.view!=='raw'?'font-bold text-indigo-600':''">Processed</button>
+                                        <span class="text-slate-300">|</span>
+                                        <button @click="item.view='raw'" :class="item.view==='raw'?'font-bold text-indigo-600':''">Original</button>
+                                        <span class="text-slate-300" v-if="item.footer_b64">|</span>
+                                        <button v-if="item.footer_b64" @click="item.view='footer'" :class="item.view==='footer'?'font-bold text-indigo-600':''">Info Bar</button>
+                                    </div>
+                                    <img v-if="item.view!=='footer'" :src="'data:image/jpeg;base64,' + (item.view==='raw' ? item.raw_b64 : item.proc_b64)" class="max-h-80 mx-auto object-contain bg-black">
+                                    <img v-if="item.view==='footer'" :src="'data:image/jpeg;base64,' + item.footer_b64" class="max-h-24 mx-auto object-contain border mt-2">
+                                </div>
+
+                                <div v-if="item.log && item.log.length > 0 && item.showDocs" class="mt-2 p-2 bg-gray-100 rounded border text-[10px] font-mono text-gray-600">
+                                    <strong class="block mb-1">⚙️ Processing Log:</strong>
+                                    <ul class="list-disc pl-4 space-y-0.5">
+                                        <li v-for="(l, lx) in item.log" :key="lx">{{ l }}</li>
+                                    </ul>
+                                </div>
+
+                                <div v-if="item.showDocs">
+                                    <div v-if="item.pages" class="grid grid-cols-1 gap-4 mt-2">
+                                        <div v-for="p in item.pages" :key="p.page_num" class="flex gap-3 bg-white p-3 rounded border">
+                                            <img :src="'data:image/jpeg;base64,'+p.image_b64" class="w-24 object-contain border">
+                                            <div class="text-xs prose" v-html="md(lang === 'en' ? (p.desc_en || p.desc) : p.desc)"></div>
+                                        </div>
+                                    </div>
+                                    <div v-if="item.slides" class="space-y-4 mt-2">
+                                        <div v-for="s in item.slides" :key="s.slide_num" class="bg-white p-3 rounded border">
+                                            <div class="text-xs font-bold text-indigo-600 mb-1">Slide {{s.slide_num}}</div>
+                                            <div class="text-xs prose mb-2 whitespace-pre-wrap max-h-32 overflow-y-auto">{{ s.text }}</div>
+                                            <div v-if="s.images.length" class="grid grid-cols-2 gap-2 border-t pt-2">
+                                                <div v-for="(img, imx) in s.images" :key="imx" class="bg-slate-50 p-2">
+                                                    <img :src="'data:image/jpeg;base64,'+img.b64" class="max-h-32 mx-auto object-contain bg-white">
+                                                    <p class="text-[10px] text-slate-500 text-center mt-1">{{ img.desc }}</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div v-if="item.summary" class="text-xs text-slate-600 mt-2 prose bg-slate-50 p-3 rounded" v-html="md(lang === 'en' ? (item.summary_en || item.summary) : item.summary)"></div>
+                                </div>
+
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const { createApp, ref, computed, nextTick } = Vue;
+        createApp({
+            setup() {
+                const stagedFiles = ref([]);
+                const isAnalyzing = ref(false);
+                const isTranslating = ref(false);
+                const result = ref(null);
+                const lang = ref('ko'); 
+                const translatedReport = ref('');
+                const md = (t) => marked.parse(t||'');
+
+                const displayReport = computed(() => lang.value === 'en' && translatedReport.value ? translatedReport.value : (result.value ? result.value.final_report : ''));
+
+                const addFiles = (e) => {
+                    Array.from(e.target.files).forEach(f => {
+                        let eq = 'General';
+                        if(f.name.match(/\.(pdf|ppt|pptx)$/i)) eq = 'Document';
+                        stagedFiles.value.push({ file: f, equipment: eq, goal: '', mode: 'Auto', view: 'proc', showDocs: true });
+                    });
+                    e.target.value = ''; 
+                };
+                const removeFile = (i) => stagedFiles.value.splice(i, 1);
+
+                const analyze = async () => {
+                    isAnalyzing.value = true;
+                    lang.value = 'ko'; 
+                    translatedReport.value = '';
+                    const fd = new FormData();
+                    const configs = {};
+                    stagedFiles.value.forEach(item => {
+                        fd.append('files', item.file);
+                        configs[item.file.name] = { equipment: item.equipment, goal: item.goal, mode: item.mode };
+                    });
+                    fd.append('file_configs', JSON.stringify(configs));
+
+                    try {
+                        const res = await fetch('/api/analyze', { method: 'POST', body: fd });
+                        const data = await res.json();
+                        if(data.results) data.results.forEach(r => r.showDocs = true);
+                        result.value = data;
+                        await nextTick();
+                        
+                        data.results.forEach((item, i) => {
+                            if(item.chart_data) {
+                                const raw = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_raw), mode:'lines', name:'Raw', line:{color:'#cbd5e1', width:1}, visible: true };
+                                const base = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_base), mode:'lines', name:'Base', line:{color:'#f59e0b', width:1, dash:'dot'}, visible: true };
+                                const proc = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_proc), mode:'lines', name:'Proc', line:{color:'#4f46e5', width:2}, visible: true };
+                                Plotly.newPlot('chart-'+i, [raw, base, proc], {margin:{t:10,b:30,l:40,r:10}, showlegend:false}, {displayModeBar:false});
+                            }
+                        });
+                        lucide.createIcons();
+                    } catch(e) { alert(e); } 
+                    finally { isAnalyzing.value = false; }
+                };
+
+                const toggleTrace = (idx, traceIdx) => {
+                    const el = document.getElementById('chart-'+idx);
+                    if(el) {
+                        const current = el.data[traceIdx].visible;
+                        const next = current === true ? 'legendonly' : true;
+                        Plotly.restyle(el, {'visible': next}, [traceIdx]);
+                    }
+                };
+
+                const setLang = async (target) => {
+                    if (target === 'ko') { lang.value = 'ko'; return; }
+                    if (target === 'en') {
+                        if (translatedReport.value) { lang.value = 'en'; return; }
+                        isTranslating.value = true;
+                        try {
+                            const res = await fetch('/api/translate', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ text: result.value.final_report })
+                            });
+                            const data = await res.json();
+                            translatedReport.value = data.translated;
+                            lang.value = 'en';
+                        } catch(e) { alert("Trans Error: " + e); }
+                        finally { isTranslating.value = false; }
+                    }
+                };
+                
+                const dlPDF = () => html2pdf().set({ margin:10, filename:'V28_Report.pdf', image:{type:'jpeg',quality:0.98}, html2canvas:{scale:2}, jsPDF:{unit:'mm',format:'a4'} }).from(document.getElementById('report-view')).save();
+
+                setTimeout(()=>lucide.createIcons(), 100);
+                return { stagedFiles, isAnalyzing, isTranslating, result, lang, displayReport, addFiles, removeFile, analyze, md, dlPDF, setLang, toggleTrace };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
+
+
+
+
+엔브이2 리파인
 
 import os
 import io
@@ -57,7 +333,7 @@ def sanitize_json(obj):
     return obj
 
 # ==========================================
-# [3] V29 과학 엔진 (NV3: Vertical Index Splitter)
+# [3] V29 과학 엔진 (NV2 Refined)
 # ==========================================
 class ScienceProcessorV29:
     
@@ -103,72 +379,23 @@ class ScienceProcessorV29:
                 except: pass
         return dfs
 
-    # --- [B] Block Parser (Advanced) ---
-    @staticmethod
-    def split_vertical_by_index(df: pd.DataFrame) -> List[pd.DataFrame]:
-        """ 
-        [NV3 New Feature] 
-        첫 번째 열(Index)의 값이 갑자기 뚝 떨어지는(Reset) 지점을 찾아 블록을 나눕니다.
-        (예: 0~100 가다가 다시 0부터 시작하는 경우)
-        """
-        if df.shape[0] < 10: return [df]
-        
-        try:
-            # 1열 추출 (숫자 변환)
-            idx_col = pd.to_numeric(df.iloc[:, 0], errors='coerce')
-            if idx_col.isna().all(): return [df]
-            
-            vals = idx_col.values
-            # NaN 채우기 (단순 계산용)
-            vals_filled = pd.Series(vals).ffill().bfill().values
-            
-            diff = np.diff(vals_filled)
-            data_range = np.max(vals_filled) - np.min(vals_filled)
-            
-            if data_range == 0: return [df]
-            
-            # 임계값: 전체 범위의 30% 이상 급락하면 분할 (CV의 완만한 감소와 구분)
-            threshold = -0.3 * data_range
-            
-            # 급락 지점 찾기
-            split_indices = np.where(diff < threshold)[0] + 1
-            
-            if len(split_indices) == 0: return [df]
-            
-            # 분할 실행
-            splits = np.split(df, split_indices)
-            return [s for s in splits if s.shape[0] >= 5]
-        except:
-            return [df]
-
+    # --- [B] Block Parser ---
     @staticmethod
     def detect_structured_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
-        """ 1차: 빈 행 기준 분리 -> 2차: 인덱스 리셋 기준 분리 """
         blocks = []
         if df.empty: return []
-
         df_num = df.apply(pd.to_numeric, errors='coerce')
         is_data_row = df_num.notna().sum(axis=1) >= 1
         groups = (is_data_row != is_data_row.shift()).cumsum()
-        
-        # 1. 빈 행(Empty Row) 기준으로 1차 분할
-        temp_blocks = []
         for _, group in df.groupby(groups):
             if is_data_row.loc[group.index[0]]:
                 block = df_num.loc[group.index].dropna(how='all', axis=1)
                 if block.shape[0] >= 5:
-                    temp_blocks.append(block.reset_index(drop=True))
-        
-        # 2. 인덱스 리셋(Sawtooth) 기준으로 2차 분할 (NV3)
-        for tb in temp_blocks:
-            sub_splits = ScienceProcessorV29.split_vertical_by_index(tb)
-            blocks.extend(sub_splits)
-            
+                    blocks.append(block.reset_index(drop=True))
         return blocks
 
     @staticmethod
     def split_horizontal_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
-        """ 빈 열(Empty Column) 기준 가로 분할 """
         sub_blocks = []
         if df.empty: return []
         col_counts = df.apply(pd.to_numeric, errors='coerce').notna().sum()
@@ -214,38 +441,50 @@ class ScienceProcessorV29:
             current_x = vals[:, 0]
             current_x_idx = 0
             
+            # 첫 열이 X축 아니면 Index를 X로
             if not ScienceProcessorV29.is_likely_axis(current_x):
                 current_x = np.arange(rows)
-            
+
             for i in range(1, cols):
                 col_data = vals[:, i]
                 mask_valid = ~np.isnan(col_data)
                 if np.sum(mask_valid) < 5: continue
 
+                # 1. 단조증가/감소 -> 새로운 X축
                 if ScienceProcessorV29.is_likely_axis(col_data):
                     current_x = col_data
                     current_x_idx = i
                     continue 
-                
-                # Identity Check (직선 제거)
+
+                # 2. [Aggressive Identity Check] 직선(X=Y) 제거
                 try:
                     mask = ~np.isnan(current_x) & ~np.isnan(col_data)
                     if np.sum(mask) > 5:
                         cx = current_x[mask]; cy = col_data[mask]
-                        if abs(np.corrcoef(cx, cy)[0, 1]) > 0.99: continue
+                        
+                        # (A) 상관계수 체크
+                        corr = np.corrcoef(cx, cy)[0, 1]
+                        if abs(corr) > 0.98: continue 
+                        
+                        # (B) 값 차이 체크 (y - x 가 거의 0에 가까우면 스킵)
+                        # 스케일링 된 오차 계산
+                        diff = np.abs(cy - cx)
+                        mean_val = np.mean(np.abs(cx)) + 1e-6
+                        if np.mean(diff) / mean_val < 0.05: # 오차가 5% 미만이면 동일 데이터로 간주
+                             continue
                 except: pass
 
-                # Y축 데이터 추가
+                # 3. Y축 데이터 추가
                 mask = ~np.isnan(current_x) & ~np.isnan(col_data)
                 if np.sum(mask) > 5:
                     series_list.append({
                         "x": current_x[mask], "y": col_data[mask], 
-                        "name": f"Col-{i} (vs Col-{current_x_idx})"
+                        "name": f"Col-{i}"
                     })
         except: pass
         return series_list
 
-    # --- [C] Spectrum Logic (유지) ---
+    # --- [C] Spectrum Logic (Log Fix) ---
     @staticmethod
     def simple_baseline(y):
         try:
@@ -274,35 +513,61 @@ class ScienceProcessorV29:
 
     @staticmethod
     def process_spectrum(x, y, mode, goal):
+        # Log가 항상 반환되도록 구조 보장
+        log = []
+        y_raw = y.copy()
+        base = np.zeros_like(y)
+        y_proc = y.copy()
+        peaks = []
+        fits = []
+        stats_txt = "Error"
+        
         try:
-            log = []
-            y_raw = y.copy()
             if mode == "None":
                 peaks, _ = find_peaks(y, height=np.max(y)*0.05)
-                return {"x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y), "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], "log": ["Raw Data"], "fits": [], "stats": f"Raw Peaks: {len(peaks)}"}
+                log.append("Mode: Raw Data Only")
+                stats_txt = f"Raw Peaks: {len(peaks)}"
+            else:
+                win = 15; do_fit = False
+                if mode == "AI-Adaptive":
+                    log.append("Mode: AI-Adaptive")
+                    if "noise" in goal.lower(): win = 31; log.append("AI: Heavy Smoothing")
+                    if "fit" in goal.lower(): do_fit = True; log.append("AI: Fitting On")
+                else:
+                    log.append("Mode: Auto")
+                
+                base = ScienceProcessorV29.simple_baseline(y)
+                y_proc = np.maximum(y - base, 0)
+                log.append(f"Baseline Removed")
+                
+                if len(y_proc) > win:
+                    y_proc = savgol_filter(y_proc, win, 3)
+                    log.append(f"Smoothing (win={win})")
+                
+                peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+                log.append(f"Peaks Found: {len(peaks)}")
+                
+                if do_fit:
+                    fits = ScienceProcessorV29.fit_peaks(x, y_proc, peaks)
+                    if fits: log.append(f"Gaussian Fits: {len(fits)}")
+                
+                stats_txt = f"Range: {np.min(x):.1f}~{np.max(x):.1f}, Peaks: {len(peaks)}"
 
-            win = 15; do_fit = False
-            if mode == "AI-Adaptive":
-                if "noise" in goal.lower(): win = 31; log.append("AI: Noise Reduction")
-                if "fit" in goal.lower(): do_fit = True; log.append("AI: Fitting On")
-            
-            base = ScienceProcessorV29.simple_baseline(y)
-            y_proc = np.maximum(y - base, 0)
-            log.append(f"Baseline Corr")
-            
-            if len(y_proc) > win:
-                y_proc = savgol_filter(y_proc, win, 3)
-                log.append(f"Smoothing")
-            
-            peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
-            log.append(f"Peaks: {len(peaks)}")
-            
-            fits = ScienceProcessorV29.fit_peaks(x, y_proc, peaks) if do_fit else []
-            stats_txt = f"Range: {np.min(x):.1f}~{np.max(x):.1f}, Peaks: {len(peaks)}"
-            return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], "log": log, "fits": fits, "stats": stats_txt}
-        except: return {"x": [], "y_raw": [], "y_proc": [], "y_base": [], "peaks": [], "log": ["Error"], "fits": [], "stats": "Error"}
+            return {
+                "x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, 
+                "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], 
+                "log": log, "fits": fits, "stats": stats_txt
+            }
+        except Exception as e:
+            return {
+                "x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, 
+                "peaks": [], "log": ["Error: " + str(e)], "fits": [], "stats": "Error"
+            }
 
-    # --- [D] Image Logic ---
+    # ... [D] Image Logic & Helper & App (Keep Same) ...
+    # (이미지 처리 등 나머지 코드는 NV2_final과 동일하므로 아래에 붙여넣기 하세요)
+    # 편의를 위해 App 부분까지 풀 코드를 유지합니다.
+
     @staticmethod
     def crop_valid_rotated_region(img, angle):
         h, w = img.shape[:2]
@@ -396,7 +661,7 @@ async def interpret_spectrum_data(raw_context: str, equipment: str) -> str:
     except: return ""
 
 # [5] App
-app = FastAPI(title="Analyst NV3")
+app = FastAPI(title="Analyst NV2 Refined")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class TranslateReq(BaseModel): text: str
@@ -455,22 +720,20 @@ async def analyze_orchestrator(files: List[UploadFile] = File(...), file_configs
             tasks.append(proc_doc(content, filename, eq))
             continue
 
-        # [B] Spectrum (NV3 Flow)
+        # [B] Spectrum (NV2 Refined Flow)
         if fname_lower.endswith(('.xlsx', '.xls', '.csv', '.txt')):
             async def proc_spec(c, n, e, g, m):
                 try:
                     dfs = ScienceProcessorV29.read_universal_dataframe(c, n)
                     res_list = []
                     for i, df in enumerate(dfs):
-                        # 1. Vertical Split (Empty Row & Index Reset)
                         v_blocks = ScienceProcessorV29.detect_structured_blocks(df)
+                        if not v_blocks: v_blocks = [df]
                         
                         for v_block in v_blocks:
-                            # 2. Horizontal Split
                             h_blocks = ScienceProcessorV29.split_horizontal_blocks(v_block)
                             
                             for h_block in h_blocks:
-                                # 3. Parse
                                 series_list = ScienceProcessorV29.extract_series_from_df(h_block)
                                 for s in series_list:
                                     res = ScienceProcessorV29.process_spectrum(s['x'], s['y'], m, g)
@@ -534,11 +797,6 @@ async def analyze_orchestrator(files: List[UploadFile] = File(...), file_configs
         except Exception as e: final_report = str(e)
 
     return {"results": final_results, "final_report": final_report}
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    if os.path.exists("index.html"): return FileResponse("index.html")
-    return "<h1>Upload index.html</h1>"
 
 if __name__ == "__main__":
     import uvicorn
