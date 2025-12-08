@@ -1,3 +1,767 @@
+엔브이3 웹 코드
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Analyst NV3 (SAM Enabled)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .prose table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        .prose th, .prose td { border: 1px solid #cbd5e1; padding: 8px; font-size: 0.9rem; }
+        .prose th { background-color: #f1f5f9; }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+    <div id="app" class="min-h-screen p-6">
+        <header class="max-w-7xl mx-auto mb-6 flex items-center gap-3">
+            <div class="bg-emerald-600 p-2 rounded-lg shadow"><i data-lucide="microscope" class="w-6 h-6 text-white"></i></div>
+            <div><h1 class="text-2xl font-bold">Analyst NV3 <span class="text-sm font-normal text-slate-500">with SAM & Robust Engine</span></h1></div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div class="lg:col-span-4 space-y-4">
+                <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                    <h2 class="font-bold mb-3 flex items-center gap-2"><i data-lucide="files" class="w-4 h-4"></i> Data Staging</h2>
+                    <div class="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-emerald-50 cursor-pointer" @click="$refs.f.click()">
+                        <input type="file" ref="f" multiple class="hidden" @change="addFiles">
+                        <p class="text-sm font-semibold text-slate-600">Add Files</p>
+                    </div>
+                    <div v-if="stagedFiles.length" class="mt-4 space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+                        <div v-for="(item, i) in stagedFiles" :key="i" class="p-3 bg-slate-50 border rounded-lg text-sm">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="font-bold truncate w-2/3">{{ item.file.name }}</span>
+                                <button @click="removeFile(i)" class="text-red-400 hover:text-red-600"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                            <div class="grid grid-cols-1 gap-2">
+                                <select v-model="item.equipment" class="w-full p-1.5 border rounded text-xs bg-white font-semibold text-emerald-700">
+                                    <option value="XPS">XPS / Spectrum</option>
+                                    <option value="SEM">SEM / Image</option>
+                                    <option value="Document">Document</option>
+                                </select>
+                                <select v-if="item.equipment !== 'Document'" v-model="item.mode" class="w-full p-1.5 border rounded text-xs bg-white">
+                                    <option value="Auto">Auto (Denoise)</option>
+                                    <option value="None">Raw</option>
+                                </select>
+                                <input v-if="item.equipment !== 'Document'" v-model="item.goal" type="text" placeholder="Goal (e.g. particle)" class="w-full p-1.5 border rounded text-xs">
+                            </div>
+                        </div>
+                    </div>
+                    <button @click="startAnalysis" :disabled="isAnalyzing || stagedFiles.length===0" class="w-full mt-4 py-3 bg-emerald-600 text-white rounded-lg font-bold flex justify-center gap-2 shadow hover:bg-emerald-700 disabled:opacity-50">
+                        <span>Generate Report</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="lg:col-span-8">
+                <div v-if="isAnalyzing" class="bg-white p-6 rounded-xl shadow border border-slate-200 text-center py-12">
+                    <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-600 mx-auto mb-4"></div>
+                    <h3 class="text-lg font-bold text-slate-700">Analyzing...</h3>
+                    <p class="text-sm text-slate-500 mb-4">{{ currentStep }}</p>
+                    <div class="w-full bg-slate-200 rounded-full h-2.5 mb-2">
+                        <div class="bg-emerald-600 h-2.5 rounded-full transition-all duration-500" :style="{width: progress + '%'}"></div>
+                    </div>
+                    <p class="text-xs text-right text-slate-400">{{ progress }}%</p>
+                </div>
+
+                <div v-if="result && !isAnalyzing" class="space-y-6 animate-fade-in">
+                    <div id="report-view" class="bg-white p-8 rounded-xl shadow-sm border border-slate-200">
+                        <section class="mb-10">
+                            <h2 class="text-lg font-bold text-emerald-700 mb-3 border-b pb-1">1. Synthesis</h2>
+                            <div class="prose prose-sm text-slate-700 max-w-none" v-html="md(result.final_report)"></div>
+                        </section>
+                        <section>
+                            <h2 class="text-lg font-bold text-slate-800 mb-5 border-b pb-1">2. Data Evidence</h2>
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-8 p-4 bg-slate-50 rounded-lg border">
+                                <div class="flex items-center justify-between mb-3">
+                                    <div class="flex items-center gap-2">
+                                        <span class="px-2 py-0.5 bg-white border rounded text-[10px] font-bold uppercase text-slate-500">{{ item.equipment }}</span>
+                                        <h3 class="font-bold text-sm">{{ item.filename }}</h3>
+                                    </div>
+                                    <button @click="item.showDocs = !item.showDocs" class="text-xs text-emerald-600 font-bold hover:underline flex items-center gap-1">
+                                        <i :data-lucide="item.showDocs ? 'eye-off' : 'eye'" class="w-3 h-3"></i> Info
+                                    </button>
+                                </div>
+
+                                <div v-if="item.chart_data" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 justify-end mb-1">
+                                        <button @click="toggleTrace(idx, 0)" class="text-[10px] px-2 py-0.5 border rounded">Raw</button>
+                                        <button @click="toggleTrace(idx, 2)" class="text-[10px] px-2 py-0.5 border rounded font-bold text-emerald-600">Proc</button>
+                                    </div>
+                                    <div :id="'chart-'+idx" class="w-full h-60"></div>
+                                    <div v-if="item.interpretation && item.showDocs" class="mt-3 p-3 bg-emerald-50 border border-emerald-100 rounded text-xs text-emerald-800">
+                                        <div class="prose prose-xs" v-html="md(item.interpretation)"></div>
+                                    </div>
+                                </div>
+
+                                <div v-if="item.raw_b64" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 mb-2 text-xs justify-center">
+                                        <button @click="item.view='proc'" :class="item.view!=='raw'?'font-bold text-emerald-600':''">SAM Result</button>
+                                        <span class="text-slate-300">|</span>
+                                        <button @click="item.view='raw'" :class="item.view==='raw'?'font-bold text-emerald-600':''">Original</button>
+                                    </div>
+                                    <img :src="'data:image/jpeg;base64,' + (item.view==='raw' ? item.raw_b64 : item.proc_b64)" class="max-h-96 mx-auto object-contain bg-black">
+                                </div>
+
+                                <div v-if="item.log && item.log.length > 0 && item.showDocs" class="mt-2 p-2 bg-gray-100 rounded border text-[10px] font-mono text-gray-600">
+                                    <ul class="list-disc pl-4 space-y-0.5"><li v-for="l in item.log">{{ l }}</li></ul>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const { createApp, ref, nextTick } = Vue;
+        createApp({
+            setup() {
+                const stagedFiles = ref([]);
+                const isAnalyzing = ref(false);
+                const progress = ref(0);
+                const currentStep = ref("");
+                const result = ref(null);
+                const md = (t) => marked.parse(t||'');
+
+                const addFiles = (e) => {
+                    Array.from(e.target.files).forEach(f => {
+                        let eq = 'General';
+                        if(f.name.match(/\.(pdf|ppt|pptx)$/i)) eq = 'Document';
+                        stagedFiles.value.push({ file: f, equipment: eq, goal: '', mode: 'Auto', view: 'proc', showDocs: true });
+                    });
+                    e.target.value = ''; 
+                };
+                const removeFile = (i) => stagedFiles.value.splice(i, 1);
+
+                const startAnalysis = async () => {
+                    isAnalyzing.value = true;
+                    progress.value = 0;
+                    currentStep.value = "Initializing...";
+                    
+                    const fd = new FormData();
+                    const configs = {};
+                    stagedFiles.value.forEach(item => {
+                        fd.append('files', item.file);
+                        configs[item.file.name] = { equipment: item.equipment, goal: item.goal, mode: item.mode };
+                    });
+                    fd.append('file_configs', JSON.stringify(configs));
+
+                    try {
+                        const initRes = await fetch('/api/analyze', { method: 'POST', body: fd });
+                        const { job_id } = await initRes.json();
+                        
+                        // Polling
+                        const poll = setInterval(async () => {
+                            const statusRes = await fetch(`/api/status/${job_id}`);
+                            const status = await statusRes.json();
+                            
+                            progress.value = status.progress || 0;
+                            currentStep.value = status.step || "Processing...";
+                            
+                            if (status.status === "Completed") {
+                                clearInterval(poll);
+                                result.value = status.results;
+                                if(result.value.results) result.value.results.forEach(r => r.showDocs = true);
+                                isAnalyzing.value = false;
+                                await nextTick();
+                                renderCharts(result.value.results);
+                            } else if (status.status === "Failed") {
+                                clearInterval(poll);
+                                alert("Analysis Failed: " + status.error);
+                                isAnalyzing.value = false;
+                            }
+                        }, 1000);
+                    } catch(e) { alert(e); isAnalyzing.value = false; }
+                };
+
+                const renderCharts = (items) => {
+                    items.forEach((item, i) => {
+                        if(item.chart_data) {
+                            const raw = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_raw), mode:'lines', name:'Raw', line:{color:'#cbd5e1', width:1}, visible: true };
+                            const proc = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_proc), mode:'lines', name:'Proc', line:{color:'#059669', width:2}, visible: true };
+                            Plotly.newPlot('chart-'+i, [raw, proc], {margin:{t:10,b:30,l:40,r:10}, showlegend:false}, {displayModeBar:false});
+                        }
+                    });
+                    lucide.createIcons();
+                };
+
+                const toggleTrace = (idx, traceIdx) => {
+                    const el = document.getElementById('chart-'+idx);
+                    if(el) {
+                        const current = el.data[traceIdx].visible;
+                        const next = current === true ? 'legendonly' : true;
+                        Plotly.restyle(el, {'visible': next}, [traceIdx]);
+                    }
+                };
+
+                setTimeout(()=>lucide.createIcons(), 100);
+                return { stagedFiles, isAnalyzing, progress, currentStep, result, addFiles, removeFile, startAnalysis, md, toggleTrace };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
+
+
+
+
+
+엔브이3 코드
+
+import os
+import io
+import asyncio
+import base64
+import json
+import re
+import math
+import uuid
+import time
+import requests
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+
+# [1] 보안 설정
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+import pandas as pd
+import numpy as np
+
+# 과학/영상 연산
+from scipy.signal import find_peaks, savgol_filter
+from scipy.optimize import curve_fit
+from scipy.ndimage import gaussian_filter, rotate
+import cv2
+import torch
+
+# SAM & LLM
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+from ollama import Client 
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# [2] 설정 및 전역 변수
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+# SAM 설정 (vit_b가 가장 가볍습니다)
+SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
+SAM_MODEL_TYPE = "vit_b"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+mask_generator = None # Startup 시 로드
+JOBS = {} # 작업 상태 저장소
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 앱 시작 시 SAM 모델 로드
+    global mask_generator
+    if os.path.exists(SAM_CHECKPOINT):
+        print(f"Loading SAM ({SAM_MODEL_TYPE}) on {device}...")
+        sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=SAM_CHECKPOINT)
+        sam.to(device=device)
+        mask_generator = SamAutomaticMaskGenerator(sam)
+        print("SAM Loaded successfully.")
+    else:
+        print(f"WARNING: {SAM_CHECKPOINT} not found. Image segmentation will fail.")
+    yield
+    # 앱 종료 시 정리
+    JOBS.clear()
+
+# --- JSON Sanitizer ---
+def sanitize_json(obj):
+    if isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj): return 0.0
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+    elif isinstance(obj, (np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.float64, np.float32)):
+        if np.isnan(obj) or np.isinf(obj): return 0.0
+        return float(obj)
+    return obj
+
+# ==========================================
+# [3] NV3 과학 엔진 (SAM Integrated)
+# ==========================================
+class ScienceProcessorNV3:
+    
+    # --- Universal Loader (NV2 유지) ---
+    @staticmethod
+    def read_universal_dataframe(content: bytes, filename: str) -> List[pd.DataFrame]:
+        dfs = []
+        fname = filename.lower()
+        if fname.endswith(('.xlsx', '.xls')):
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for s in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=s, header=None)
+                    num_count = df.apply(pd.to_numeric, errors='coerce').notna().sum().sum()
+                    if num_count < 5: raise Exception("Not enough numbers")
+                    if not df.empty: dfs.append(df)
+                if dfs: return dfs
+            except: pass
+
+        text_content = ""
+        for enc in ['utf-8', 'cp949', 'latin1', 'utf-16']:
+            try: text_content = content.decode(enc); break
+            except: continue
+        if text_content:
+            lines = text_content.splitlines()
+            data_start = -1; delimiter = None
+            separators = [',', '\t', ';', '\s+']
+            for i, line in enumerate(lines[:100]):
+                for sep in separators:
+                    parts = line.split() if sep=='\s+' else line.split(sep)
+                    nums = sum(1 for p in parts if re.match(r'^-?\d+(\.\d+)?(?:[eE][+-]?\d+)?$', p.strip()))
+                    if nums >= 2:
+                        data_start = i; delimiter = sep; break
+                if data_start != -1: break
+            if data_start != -1:
+                try:
+                    data_str = "\n".join(lines[data_start:])
+                    sep_arg = '\s+' if delimiter=='\s+' else delimiter
+                    df = pd.read_csv(io.StringIO(data_str), sep=sep_arg, header=None, engine='python')
+                    dfs.append(df)
+                except: pass
+        return dfs
+
+    # --- Block Parser (NV2 Robust 유지) ---
+    @staticmethod
+    def detect_structured_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+        blocks = []
+        if df.empty: return []
+        df_num = df.apply(pd.to_numeric, errors='coerce')
+        if df.shape[1] > 0: is_data_row = df_num.iloc[:, 0].notna()
+        else: is_data_row = df_num.notna().any(axis=1)
+        groups = (is_data_row != is_data_row.shift()).cumsum()
+        for _, group in df.groupby(groups):
+            if is_data_row.loc[group.index[0]]:
+                block = df_num.loc[group.index].dropna(how='all', axis=1)
+                if block.shape[0] >= 10: blocks.append(block.reset_index(drop=True))
+        return blocks
+
+    @staticmethod
+    def split_horizontal_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+        sub_blocks = []
+        if df.empty: return []
+        col_counts = df.apply(pd.to_numeric, errors='coerce').notna().sum()
+        valid_col_indices = np.where(col_counts >= 2)[0]
+        if len(valid_col_indices) == 0: return []
+        split_points = np.where(np.diff(valid_col_indices) > 1)[0] + 1
+        groups = np.split(valid_col_indices, split_points)
+        for g in groups:
+            if len(g) > 0:
+                sub_df = df.iloc[:, g].reset_index(drop=True)
+                if sub_df.shape[1] >= 1 and sub_df.shape[0] >= 2: sub_blocks.append(sub_df)
+        return sub_blocks
+
+    @staticmethod
+    def is_likely_axis(arr):
+        try:
+            arr = arr[~np.isnan(arr)]
+            if len(arr) < 5: return False
+            diff = np.diff(arr)
+            if np.all(diff >= 0) or np.all(diff <= 0): return True
+            pos = np.sum(diff > 0); neg = np.sum(diff < 0)
+            if max(pos, neg) / len(diff) > 0.9: return True
+            return False
+        except: return False
+
+    @staticmethod
+    def extract_series_from_df(df: pd.DataFrame) -> List[Dict]:
+        series_list = []
+        try:
+            vals = df.values
+            rows, cols = vals.shape
+            if rows < 5: return []
+            if cols == 1:
+                y = vals[:, 0]
+                mask = ~np.isnan(y)
+                if np.sum(mask) > 5:
+                    series_list.append({"x": np.arange(len(y))[mask], "y": y[mask], "name": "Single"})
+                return series_list
+            current_x = vals[:, 0]
+            if not ScienceProcessorNV3.is_likely_axis(current_x): current_x = np.arange(rows)
+            for i in range(1, cols):
+                col_data = vals[:, i]
+                mask_valid = ~np.isnan(col_data)
+                if np.sum(mask_valid) < 5: continue
+                if ScienceProcessorNV3.is_likely_axis(col_data):
+                    current_x = col_data; continue 
+                mask = ~np.isnan(current_x) & ~np.isnan(col_data)
+                if np.sum(mask) > 5:
+                    series_list.append({"x": current_x[mask], "y": col_data[mask], "name": f"Col-{i}"})
+        except: pass
+        return series_list
+
+    # --- Spectrum Logic (NV2 유지) ---
+    @staticmethod
+    def simple_baseline(y):
+        try:
+            w = max(5, len(y)//10)
+            s = pd.Series(y).rolling(window=w, center=True).min()
+            b = s.bfill().ffill().values 
+            if len(b) > 51: b = savgol_filter(b, 51, 3)
+            return b
+        except: return np.zeros_like(y)
+    @staticmethod
+    def gaussian(x, amp, cen, wid): return amp * np.exp(-(x-cen)**2 / (2*wid**2))
+    @staticmethod
+    def fit_peaks(x, y, peaks):
+        fits = []
+        for p in peaks:
+            try:
+                p0 = [y[p], x[p], 1.0]; win = 20
+                s, e = max(0, p-win), min(len(x), p+win)
+                if len(x[s:e]) > 3:
+                    popt, _ = curve_fit(ScienceProcessorNV3.gaussian, x[s:e], y[s:e], p0=p0, maxfev=1000)
+                    fits.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
+            except: pass
+        return fits
+    @staticmethod
+    def process_spectrum(x, y, mode, goal):
+        log = []
+        y_raw = y.copy(); base = np.zeros_like(y); y_proc = y.copy()
+        peaks = []; fits = []; stats_txt = "Error"
+        try:
+            if mode == "None":
+                peaks, _ = find_peaks(y, height=np.max(y)*0.05)
+                log.append("Mode: Raw")
+                stats_txt = f"Raw Peaks: {len(peaks)}"
+            else:
+                win = 15; do_fit = False
+                if mode == "AI-Adaptive":
+                    log.append("Mode: AI-Adaptive")
+                    if "noise" in goal.lower(): win = 31; log.append("AI: Heavy Smoothing")
+                    if "fit" in goal.lower(): do_fit = True; log.append("AI: Fitting On")
+                else: log.append("Mode: Auto")
+                base = ScienceProcessorNV3.simple_baseline(y)
+                y_proc = np.maximum(y - base, 0)
+                log.append(f"Baseline Removed")
+                if len(y_proc) > win:
+                    y_proc = savgol_filter(y_proc, win, 3)
+                    log.append(f"Smoothing")
+                peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+                log.append(f"Peaks: {len(peaks)}")
+                if do_fit: fits = ScienceProcessorNV3.fit_peaks(x, y_proc, peaks)
+                stats_txt = f"Range: {np.min(x):.1f}~{np.max(x):.1f}, Peaks: {len(peaks)}"
+            return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], "log": log, "fits": fits, "stats": stats_txt}
+        except Exception as e: return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [], "log": [str(e)], "fits": [], "stats": "Error"}
+
+    # --- [NEW] SAM-based Image Logic ---
+    @staticmethod
+    def analyze_sam_results(img_rgb, masks, mode):
+        """ SAM 결과 마스크를 분석하여 박막/입자 정보 추출 """
+        overlay = img_rgb.copy()
+        stats = {"particles": 0, "layers": 0, "thickness_avg": 0, "roughness_avg": 0}
+        log = []
+        
+        # Color palette for masks
+        colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (0, 255, 255)
+        ]
+
+        particles_found = 0
+        layers_found = 0
+        thickness_list = []
+        roughness_list = []
+
+        # 마스크 면적순 정렬 (큰 배경부터 처리 안 하도록)
+        sorted_masks = sorted(masks, key=lambda x: x['area'], reverse=True)
+
+        for i, ann in enumerate(sorted_masks):
+            m = ann['segmentation']
+            area = ann['area']
+            bbox = ann['bbox'] # [x, y, w, h]
+            
+            # 너무 크거나(배경) 너무 작은(노이즈) 것 제외
+            img_area = img_rgb.shape[0] * img_rgb.shape[1]
+            if area < 50 or area > img_area * 0.90: continue
+
+            # 마스크 윤곽선
+            mask_uint8 = (m * 255).astype(np.uint8)
+            cnts, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts: continue
+            cnt = cnts[0]
+
+            # 기하학적 특징
+            x, y, w, h = [int(v) for v in bbox]
+            aspect_ratio = w / float(h)
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+
+            # 박막 (Thin Film) 분석 로직
+            if "film" in mode.lower() or "layer" in mode.lower() or "thick" in mode.lower():
+                # 가로로 길쭉한 형태
+                if aspect_ratio > 3.0:
+                    layers_found += 1
+                    color = colors[layers_found % len(colors)]
+                    
+                    # 마스크 오버레이
+                    overlay[m] = overlay[m] * 0.5 + np.array(color) * 0.5
+                    cv2.rectangle(overlay, (x, y), (x+w, y+h), color, 2)
+                    
+                    # 두께 계산 (평균 높이)
+                    # 해당 마스크의 픽셀 개수 / 너비
+                    avg_thickness = area / w
+                    thickness_list.append(avg_thickness)
+                    
+                    # 거칠기(Roughness) 계산: 상단 경계선의 표준편차
+                    # y좌표들의 std 계산 (간략화)
+                    ys, xs = np.where(m)
+                    if len(ys) > 0:
+                        roughness = np.std(ys) # 매우 단순화된 근사
+                        roughness_list.append(roughness)
+
+            # 입자 (Particle) 분석 로직
+            else:
+                # 동그란 형태
+                if circularity > 0.5 and 0.2 < aspect_ratio < 5.0:
+                    particles_found += 1
+                    cv2.drawContours(overlay, [cnt], -1, (0, 255, 0), 2)
+        
+        if "film" in mode.lower() or "layer" in mode.lower():
+            stats["layers"] = layers_found
+            stats["thickness_avg"] = round(np.mean(thickness_list), 2) if thickness_list else 0
+            stats["roughness_avg"] = round(np.mean(roughness_list), 2) if roughness_list else 0
+            log.append(f"Layers: {layers_found}, Avg Thk: {stats['thickness_avg']}px")
+        else:
+            stats["particles"] = particles_found
+            log.append(f"Particles: {particles_found}")
+
+        return overlay, stats, log
+
+    @staticmethod
+    def process_image_nv3(img_bytes, equipment, mode, goal):
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_raw is None: return {}
+        
+        # 1. Preprocessing (Auto Mode)
+        img_proc = img_raw.copy()
+        log = []
+        if mode == "Auto":
+            # Denoise
+            img_proc = cv2.bilateralFilter(img_proc, 9, 75, 75)
+            log.append("Preproc: Denoise")
+        
+        # 2. SAM Inference
+        # 이미지 RGB 변환
+        img_rgb = cv2.cvtColor(img_proc, cv2.COLOR_BGR2RGB)
+        
+        if mask_generator:
+            log.append("SAM: Generating Masks...")
+            masks = mask_generator.generate(img_rgb)
+            log.append(f"SAM: Found {len(masks)} segments")
+            
+            # 3. Analyze Results
+            overlay, stats, sam_log = ScienceProcessorNV3.analyze_sam_results(img_rgb, masks, mode + goal)
+            log.extend(sam_log)
+            # BGR로 다시 변환 (OpenCV 호환)
+            overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        else:
+            log.append("SAM Error: Model not loaded")
+            overlay = img_raw
+            stats = {}
+
+        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
+        
+        return {
+            "type": "image",
+            "raw_b64": to_b64(img_raw),
+            "proc_b64": to_b64(overlay),
+            "stats": stats,
+            "log": log
+        }
+
+# [4] Helper Async Functions
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    try:
+        b64 = base64.b64encode(image_bytes).decode('utf-8')
+        res = await asyncio.to_thread(ollama_client.chat, model=VISION_MODEL, messages=[{'role':'user','content':prompt,'images':[b64]}])
+        return res['message']['content']
+    except: return "Vision Error"
+
+async def interpret_spectrum_data(raw_context: str, equipment: str) -> str:
+    try:
+        prompt = f"Analyze spectrum ({equipment}). Brief interpretation in Korean. Data: {raw_context}"
+        res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'user','content':prompt}])
+        return res['message']['content']
+    except: return ""
+
+# [5] App & Job System
+app = FastAPI(title="Analyst NV3", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+class TranslateReq(BaseModel): text: str
+
+@app.post("/api/translate")
+async def translate_text(req: TranslateReq):
+    try:
+        res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':'Translate to English.'}, {'role':'user','content':req.text}])
+        return {"translated": res['message']['content']}
+    except Exception as e: return {"translated": str(e)}
+
+# --- Background Job Logic ---
+async def process_analysis_job(job_id: str, files_map: Dict, configs: Dict):
+    try:
+        JOBS[job_id]["status"] = "Processing"
+        JOBS[job_id]["progress"] = 10
+        
+        final_results = []
+        total_files = len(configs)
+        processed_count = 0
+
+        for filename, config in configs.items():
+            if filename not in files_map: continue
+            content = files_map[filename]
+            eq = config.get("equipment", "General")
+            goal = config.get("goal", "")
+            mode = config.get("mode", "Auto")
+            fname_lower = filename.lower()
+            
+            # Step 업데이트
+            JOBS[job_id]["step"] = f"Analyzing {filename}..."
+            
+            # [A] Document
+            if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
+                # (기존 NV2 로직 사용)
+                try:
+                    if fname_lower.endswith('.pdf'):
+                        images = convert_from_bytes(content, dpi=150, fmt='jpeg')[:10]
+                        full_txt = ""; pages = []
+                        for idx, img in enumerate(images):
+                            buf = io.BytesIO(); img.save(buf, format="JPEG")
+                            b64 = base64.b64encode(buf.getvalue()).decode()
+                            desc = await analyze_vision_ollama(buf.getvalue(), "한글 요약.")
+                            full_txt += f"\nPage {idx+1}: {desc}"
+                            pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
+                        final_results.append({"type": "pdf", "filename": filename, "equipment": "Lit", "raw_context": full_txt, "pages": pages})
+                    # PPT 로직 생략 (위와 유사)
+                except Exception as e: final_results.append({"type": "error", "filename": filename, "msg": str(e)})
+
+            # [B] Spectrum (NV2 Robust)
+            elif fname_lower.endswith(('.xlsx', '.xls', '.csv', '.txt')):
+                try:
+                    dfs = ScienceProcessorNV3.read_universal_dataframe(content, filename)
+                    for i, df in enumerate(dfs):
+                        v_blocks = ScienceProcessorNV3.detect_structured_blocks(df)
+                        for v_block in v_blocks:
+                            h_blocks = ScienceProcessorNV3.split_horizontal_blocks(v_block)
+                            for h_block in h_blocks:
+                                series_list = ScienceProcessorNV3.extract_series_from_df(h_block)
+                                for s in series_list:
+                                    res = ScienceProcessorNV3.process_spectrum(s['x'], s['y'], mode, goal)
+                                    step = max(1, len(s['x'])//100)
+                                    chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(s['x']), step)]
+                                    ctx = f"Data: {s['name']}\nStats: {res['stats']}"
+                                    interp = await interpret_spectrum_data(ctx, eq)
+                                    final_results.append({
+                                        "type": "spectrum", "filename": f"{filename} ({s['name']})", "equipment": eq,
+                                        "raw_context": f"{ctx}\nInterp: {interp}", 
+                                        "chart_data": chart, "log": res["log"], "interpretation": interp
+                                    })
+                except Exception as ex: final_results.append({"type": "error", "filename": filename, "msg": str(ex)})
+
+            # [C] Image (NV3 SAM Integrated)
+            elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+                try:
+                    JOBS[job_id]["step"] = f"SAM Segmentation: {filename}..."
+                    vis_res = await asyncio.to_thread(ScienceProcessorNV3.process_image_nv3, content, eq, mode, goal)
+                    
+                    if vis_res:
+                        # LLM 설명 생성
+                        desc = await analyze_vision_ollama(base64.b64decode(vis_res["proc_b64"]), f"한글 분석. {eq}. {goal}. {vis_res.get('stats',{})}")
+                        final_results.append({
+                            "type": "image", "filename": filename, "equipment": eq, "summary": desc,
+                            "raw_context": f"Img {eq}: {desc}",
+                            "raw_b64": vis_res["raw_b64"], "proc_b64": vis_res["proc_b64"],
+                            "stats": vis_res.get("stats",{}), "log": vis_res.get("log", [])
+                        })
+                except Exception as ex: final_results.append({"type": "error", "filename": filename, "msg": str(ex)})
+            
+            processed_count += 1
+            JOBS[job_id]["progress"] = 10 + int((processed_count / total_files) * 80)
+
+        # Final Report
+        JOBS[job_id]["step"] = "Generating Final Report..."
+        final_results = sanitize_json(final_results)
+        
+        data_ctx = ""
+        for r in final_results:
+            if r.get("type") != "error":
+                raw = r.get("raw_context") or ""
+                data_ctx += f"\n=== File: {r['filename']} ===\n{raw[:1000]}\n"
+
+        final_report = "Fail"
+        if data_ctx:
+            try:
+                system_prompt = "You are a research assistant. MUST write the report strictly in Korean. Summarize data. No LaTeX."
+                res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':system_prompt}, {'role':'user','content':f"Data:\n{data_ctx}"}])
+                final_report = res['message']['content']
+            except Exception as e: final_report = str(e)
+
+        JOBS[job_id]["results"] = {"results": final_results, "final_report": final_report}
+        JOBS[job_id]["status"] = "Completed"
+        JOBS[job_id]["progress"] = 100
+        
+    except Exception as e:
+        print(f"Job Failed: {e}")
+        JOBS[job_id]["status"] = "Failed"
+        JOBS[job_id]["error"] = str(e)
+
+@app.post("/api/analyze")
+async def start_analysis(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...), file_configs: str = Form(...)):
+    job_id = str(uuid.uuid4())
+    configs = json.loads(file_configs)
+    
+    # 파일을 메모리에 미리 읽어둠 (백그라운드 태스크로 넘기기 위해)
+    files_map = {f.filename: await f.read() for f in files}
+    
+    JOBS[job_id] = {"status": "Pending", "progress": 0, "step": "Initializing", "results": None}
+    
+    background_tasks.add_task(process_analysis_job, job_id, files_map, configs)
+    
+    return {"job_id": job_id}
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    return JOBS.get(job_id, {"status": "Not Found"})
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"): return FileResponse("index.html")
+    return "<h1>NV3 Backend Running</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
 엔브이2 리프레시 웹
 
 <!DOCTYPE html>
