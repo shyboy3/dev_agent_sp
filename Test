@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 import pandas as pd
 import numpy as np
 
-# SciPy & CV & Sklearn (NMF Added)
+# SciPy & CV & Sklearn (NMF Raw Patch)
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import MinMaxScaler
 from scipy.signal import find_peaks, savgol_filter
@@ -36,6 +36,7 @@ from scipy.optimize import curve_fit
 from scipy.ndimage import center_of_mass
 from skimage.feature import peak_local_max
 import cv2
+import matplotlib.cm as cm # For colormap
 
 # Models
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
@@ -87,9 +88,9 @@ def sanitize_json(obj):
     return obj
 
 # ==========================================
-# [3] NV7 NMF Engine
+# [3] NV8 Raw NMF Engine
 # ==========================================
-class ScienceProcessorNV7:
+class ScienceProcessorNV8:
     
     # --- Universal Loader ---
     @staticmethod
@@ -214,7 +215,7 @@ class ScienceProcessorNV7:
                     if "noise" in goal.lower(): win = 31
                     if "fit" in goal.lower(): do_fit = True
                 
-                base, bw = ScienceProcessorNV7.simple_baseline(y)
+                base, bw = ScienceProcessorNV8.simple_baseline(y)
                 y_proc = np.maximum(y - base, 0)
                 log.append(f"Base: Rolling Min (w={bw})")
                 
@@ -243,116 +244,74 @@ class ScienceProcessorNV7:
             return img_bgr[:real_split, :], img_bgr[real_split:, :]
         return img_bgr, None
 
-    # --- [E] NV7 NMF Crystal Engine ---
+    # --- [E] NV8 Raw NMF Engine (Patch=128, k=10) ---
     @staticmethod
     def analyze_crystal_nmf(img_bgr):
         log = []
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
         
-        # 1. Feature Extraction
-        patch_size = 32
-        step = 16
-        features = []
+        # [Update] Patch Size 128
+        patch_size = 128
+        step = 64 # Overlap for smoother result
+        patches = []
         coords = []
         
-        log.append(f"NMF Analysis: Patch={patch_size}, Step={step}")
+        log.append(f"Raw NMF: Patch={patch_size}, Step={step}, k=10")
         
-        for y in range(0, h - patch_size, step):
-            for x in range(0, w - patch_size, step):
+        # 1. Collect Raw Patches
+        for y in range(0, h - patch_size + 1, step):
+            for x in range(0, w - patch_size + 1, step):
                 roi = gray[y:y+patch_size, x:x+patch_size]
-                
-                # F1: Variance (Normalized)
-                var = np.var(roi)
-                
-                # F2: FFT Peak (Crystallinity)
-                f = np.fft.fft2(roi)
-                fshift = np.fft.fftshift(f)
-                mag = 20 * np.log(np.abs(fshift) + 1e-9)
-                cy, cx = patch_size//2, patch_size//2
-                mag[cy-2:cy+3, cx-2:cx+3] = 0 
-                peak_val = np.max(mag)
-                
-                # F3: Entropy
-                hist, _ = np.histogram(roi.ravel(), bins=256, range=(0, 256), density=True)
-                ent = -np.sum(hist * np.log2(hist + 1e-7))
-                
-                features.append([var, peak_val, ent])
+                patches.append(roi.flatten())
                 coords.append((x, y))
         
-        if len(features) < 10: return {"type":"error", "msg":"Img too small"}
+        if not patches: return {"type":"error", "msg":"Img too small for 128px patch"}
         
-        X = np.array(features)
-        # NMF needs non-negative inputs
+        # 2. NMF on Raw Pixel Data
+        X = np.array(patches).astype(np.float32) # Shape: (N_patches, 128*128)
+        
+        # Normalize (NMF requires non-negative)
         scaler = MinMaxScaler()
-        X_norm = scaler.fit_transform(X) + 0.001 # Avoid pure zero
+        X_norm = scaler.fit_transform(X.T).T # Normalize per patch
         
-        # 2. NMF (Components=3: Amor, Part, Cryst)
-        nmf = NMF(n_components=3, init='random', random_state=42)
-        W = nmf.fit_transform(X_norm) # Basis weights per sample
-        H = nmf.components_         # Component characteristics
+        # NMF with 10 components
+        n_components = 10
+        nmf = NMF(n_components=n_components, init='nndsvda', random_state=42, max_iter=500)
+        W = nmf.fit_transform(X_norm) # (N_patches, 10) - Weights
+        H = nmf.components_         # (10, 128*128) - Basis patterns
         
-        # 3. Identify Components Automatically
-        # H shape: (3, 3) -> (Component, Feature[Var, Peak, Ent])
-        # Find which component has highest FFT Peak (Index 1) -> Crystal
-        feat_fft_idx = 1
-        comp_fft_strength = H[:, feat_fft_idx]
-        
-        # Sort indices by FFT strength
-        sorted_indices = np.argsort(comp_fft_strength)
-        
-        # Map: Low FFT -> Amorphous, Mid -> Partial, High -> Crystal
-        idx_amor = sorted_indices[0]
-        idx_part = sorted_indices[1]
-        idx_crys = sorted_indices[2]
-        
-        mapping = {idx_amor: "Amorphous", idx_part: "Partial", idx_crys: "Perfect"}
-        colors = {
-            "Amorphous": (100, 100, 100), # Gray
-            "Partial": (0, 165, 255),     # Orange
-            "Perfect": (255, 0, 0)        # Blue
-        }
-        
-        # 4. Visualization & Stats
+        # 3. Visualization (Segmentation Map by Dominant Component)
         overlay = img_bgr.copy()
         mask_layer = np.zeros_like(img_bgr)
-        stats = {"Amorphous":0, "Partial":0, "Perfect":0}
         
-        # Dominant Component Selection
-        labels = np.argmax(W, axis=1)
+        # Get 10 distinct colors from matplotlib colormap
+        cmap = cm.get_cmap('tab10', n_components)
+        colors = [tuple(int(c*255) for c in cmap(i)[:3][::-1]) for i in range(n_components)] # RGB -> BGR
         
-        for idx, label in enumerate(labels):
+        stats = {f"Pattern {i}": 0 for i in range(n_components)}
+        
+        # Assign dominant component index to each patch area
+        dominant_labels = np.argmax(W, axis=1)
+        
+        for idx, label in enumerate(dominant_labels):
             x, y = coords[idx]
-            cat = mapping[label]
-            stats[cat] += 1
+            stats[f"Pattern {label}"] += 1
+            color = colors[label]
             
-            # Weighted Alpha based on confidence (W value)
-            confidence = W[idx, label]
+            # Draw colored patch (Simple overwrite for now, overlap handled by order)
+            cv2.rectangle(mask_layer, (x, y), (x+patch_size, y+patch_size), color, -1)
             
-            cv2.rectangle(mask_layer, (x, y), (x+patch_size, y+patch_size), colors[cat], -1)
-            
-        alpha = 0.4
+        # Blend
+        alpha = 0.5
         mask_idx = np.any(mask_layer > 0, axis=-1)
         overlay[mask_idx] = (overlay[mask_idx]*(1-alpha) + mask_layer[mask_idx]*alpha).astype(np.uint8)
         
-        # Rich Stats for LLM
-        total = len(labels)
-        ratio_crys = round(stats['Perfect']/total * 100, 1)
-        ratio_part = round(stats['Partial']/total * 100, 1)
-        ratio_amor = round(stats['Amorphous']/total * 100, 1)
-        
-        log.append(f"NMF Result: Crystal={ratio_crys}%, Partial={ratio_part}%, Amor={ratio_amor}%")
-        
-        # Detailed Stats Dictionary for LLM Prompt
-        rich_stats = {
-            "Total Regions": total,
-            "Crystallinity": f"{ratio_crys}% (Perfect) + {ratio_part}% (Partial)",
-            "Amorphous Ratio": f"{ratio_amor}%",
-            "Dominant Phase": max(stats, key=stats.get)
-        }
+        # Simplified Stats for LLM
+        log.append(f"Patterns found: {n_components}")
         
         def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
-        return {"type": "image", "raw_b64": to_b64(img_bgr), "proc_b64": to_b64(overlay), "stats": rich_stats, "log": log}
+        return {"type": "image", "raw_b64": to_b64(img_bgr), "proc_b64": to_b64(overlay), "stats": stats, "log": log}
 
     # --- [F] Diffraction ---
     @staticmethod
@@ -468,22 +427,22 @@ class ScienceProcessorNV7:
 
     # --- Router ---
     @staticmethod
-    def process_image_nv7(img_bytes, equipment, data_type, mode, goal, user_center=None):
+    def process_image_nv8(img_bytes, equipment, data_type, mode, goal, user_center=None):
         nparr = np.frombuffer(img_bytes, np.uint8)
         img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img_raw is None: return {}
         
-        body, footer = ScienceProcessorNV7.separate_footer(img_raw)
+        body, footer = ScienceProcessorNV8.separate_footer(img_raw)
         footer_b64 = None
         if footer is not None:
             footer_b64 = base64.b64encode(cv2.imencode('.jpg', footer)[1]).decode('utf-8')
 
-        # [NV7] NMF Clustering
+        # [NV8] Raw NMF Clustering
         if data_type == "Crystal Structure (FFT)":
-            return {**ScienceProcessorNV7.analyze_crystal_nmf(body), "footer_b64": footer_b64}
+            return {**ScienceProcessorNV8.analyze_crystal_nmf(body), "footer_b64": footer_b64}
             
         if data_type == "2D Diffraction":
-            return {**ScienceProcessorNV7.analyze_diffraction_nv7(body, user_center), "footer_b64": footer_b64}
+            return {**ScienceProcessorNV8.analyze_diffraction_nv7(body, user_center), "footer_b64": footer_b64}
         
         if mode == "None":
              def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
@@ -500,7 +459,7 @@ class ScienceProcessorNV7:
             try:
                 masks = mask_generator.generate(img_rgb)
                 log.append(f"SAM: {len(masks)} Segments")
-                overlay, stats, sam_log = ScienceProcessorNV7.analyze_sam_results_nv7(img_rgb, masks, data_type)
+                overlay, stats, sam_log = ScienceProcessorNV8.analyze_sam_results_nv7(img_rgb, masks, data_type)
                 log.extend(sam_log)
                 overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
             except Exception as e:
@@ -529,7 +488,7 @@ async def interpret_spectrum_data(raw_context: str, equipment: str) -> str:
     except: return ""
 
 # [5] App
-app = FastAPI(title="Analyst NV7 NMF", lifespan=lifespan)
+app = FastAPI(title="Analyst NV8 Raw NMF", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class TranslateReq(BaseModel): text: str
@@ -595,15 +554,15 @@ async def process_analysis_job(job_id: str, files_map: Dict, configs: Dict):
 
             elif fname_lower.endswith(('.xlsx', '.xls', '.csv', '.txt')):
                 try:
-                    dfs = ScienceProcessorNV7.read_universal_dataframe(content, filename)
+                    dfs = ScienceProcessorNV8.read_universal_dataframe(content, filename)
                     for i, df in enumerate(dfs):
-                        v_blocks = ScienceProcessorNV7.detect_structured_blocks(df)
+                        v_blocks = ScienceProcessorNV8.detect_structured_blocks(df)
                         for v_block in v_blocks:
-                            h_blocks = ScienceProcessorNV7.split_horizontal_blocks(v_block)
+                            h_blocks = ScienceProcessorNV8.split_horizontal_blocks(v_block)
                             for h_block in h_blocks:
-                                series_list = ScienceProcessorNV7.extract_series_from_df(h_block)
+                                series_list = ScienceProcessorNV8.extract_series_from_df(h_block)
                                 for s in series_list:
-                                    res = ScienceProcessorNV7.process_spectrum(s['x'], s['y'], mode, goal)
+                                    res = ScienceProcessorNV8.process_spectrum(s['x'], s['y'], mode, goal)
                                     step = max(1, len(s['x'])//100)
                                     chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(s['x']), step)]
                                     ctx = f"Data: {s['name']}\nStats: {res['stats']}"
@@ -618,7 +577,7 @@ async def process_analysis_job(job_id: str, files_map: Dict, configs: Dict):
             elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
                 try:
                     JOBS[job_id]["step"] = f"Vision Analysis: {filename}..."
-                    vis_res = await asyncio.to_thread(ScienceProcessorNV7.process_image_nv7, content, eq, data_type, mode, goal, user_center)
+                    vis_res = await asyncio.to_thread(ScienceProcessorNV8.process_image_nv8, content, eq, data_type, mode, goal, user_center)
                     if vis_res:
                         scale_info = "Unknown"
                         if vis_res.get("footer_b64"):
@@ -631,10 +590,10 @@ async def process_analysis_job(job_id: str, files_map: Dict, configs: Dict):
                         stats_str = json.dumps(vis_res.get('stats',{}), indent=2)
                         desc_prompt = f"""
                         Analyze this {eq} image ({data_type}).
-                        Quantitative Analysis: {stats_str}
+                        Quantitative Analysis (NMF Patterns): {stats_str}
                         Scale Bar: {scale_info}
                         Goal: {goal}
-                        Please provide a detailed scientific interpretation in Korean, focusing on the crystallinity ratio, dominant phases, and structural features based on the NMF statistics provided above.
+                        Please provide a detailed scientific interpretation in Korean, focusing on the distribution of the 10 identified patterns and what they might represent structurally.
                         """
                         desc = await analyze_vision_ollama(base64.b64decode(vis_res["proc_b64"]), desc_prompt)
                         
@@ -685,7 +644,7 @@ async def get_status(job_id: str): return JOBS.get(job_id, {"status": "Not Found
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     if os.path.exists("index.html"): return FileResponse("index.html")
-    return "<h1>NV7 NMF Backend</h1>"
+    return "<h1>NV8 Raw NMF Backend</h1>"
 
 if __name__ == "__main__":
     import uvicorn
@@ -21904,697 +21863,4 @@ class ScienceProcessor:
             cv2.line(overlay, (0, y_pos), (img_crop.shape[1], y_pos), (0, 0, 255), 2)
             
         return overlay, {
-            "type": "Thin Film", "angle": best_angle, "layers": len(interfaces),
-            "thickness_px": thicknesses, "avg_thickness": float(np.mean(thicknesses)) if thicknesses else 0
-        }, log
-
-    @staticmethod
-    def detect_footer_boundary(img_array):
-        try:
-            h, w = img_array.shape[:2]
-            if h < 100 or w < 100: return None
-            search_h = int(h * 0.25)
-            roi = img_array[h-search_h:, :]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
-            sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            row_sums = np.sum(np.uint8(np.absolute(sobel_y)), axis=1)
-            if np.max(row_sums) < (w * 30): return None
-            split_idx = np.argmax(row_sums)
-            if split_idx > search_h * 0.98: return None
-            return (h - search_h) + split_idx
-        except: return None
-
-    @staticmethod
-    def process_image(img_bytes, equipment, mode, goal):
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img_raw is None: return None, {}
-        
-        process_log = []
-        body_img, footer_img = img_raw, None
-        split_y = ScienceProcessor.detect_footer_boundary(img_raw)
-        if split_y:
-            body_img = img_raw[:split_y, :]
-            footer_img = img_raw[split_y:, :]
-            process_log.append("Footer Removed")
-        
-        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
-        b64_raw = to_b64(body_img)
-        b64_footer = to_b64(footer_img) if footer_img is not None else None
-
-        if mode == "None":
-            return {"raw_b64": b64_raw, "proc_b64": b64_raw, "footer_b64": b64_footer, "stats": {"info": "Raw"}, "log": process_log}
-
-        gray = cv2.cvtColor(body_img, cv2.COLOR_BGR2GRAY)
-        kwd = (equipment + " " + goal).lower()
-        overlay = body_img.copy()
-        stats = {}
-        
-        if any(x in kwd for x in ["film", "layer", "thick", "박막", "두께"]):
-            overlay, stats, l = ScienceProcessor.analyze_thin_film(gray)
-            process_log.extend(l)
-        else:
-            is_bright = np.mean(gray) > 127
-            gray_proc = cv2.bitwise_not(gray) if is_bright else gray
-            gray_blur = cv2.GaussianBlur(gray_proc, (5, 5), 0)
-            
-            detect_atoms = mode=="AI-Adaptive" and any(x in kwd for x in ["atom", "원자"])
-            detect_parts = mode=="AI-Adaptive" and any(x in kwd for x in ["particle", "입자"])
-            if mode == "Auto":
-                if equipment in ["STEM","TEM"]: detect_atoms = True
-                if equipment in ["SEM","Optical"]: detect_parts = True
-
-            if detect_atoms:
-                blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, threshold=0.1)
-                for y, x, r in blobs: cv2.circle(overlay, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
-                stats["count"] = len(blobs)
-            elif detect_parts:
-                _, th = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-                cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(overlay, cnts, -1, (0, 255, 0), 2)
-                stats["count"] = len(cnts)
-
-        return {"raw_b64": b64_raw, "proc_b64": to_b64(overlay), "footer_b64": b64_footer, "stats": stats, "log": process_log}
-
-    @staticmethod
-    def gaussian(x, amp, cen, wid): return amp * np.exp(-(x-cen)**2 / (2*wid**2))
-
-    @staticmethod
-    def fit_peaks(x, y, peaks):
-        fits = []
-        for p in peaks:
-            try:
-                p0 = [y[p], x[p], 1.0]
-                win = 20
-                s, e = max(0, p-win), min(len(x), p+win)
-                if len(x[s:e]) > 3:
-                    popt, _ = curve_fit(ScienceProcessor.gaussian, x[s:e], y[s:e], p0=p0, maxfev=1000)
-                    fits.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
-            except: pass
-        return fits
-
-    @staticmethod
-    def simple_baseline(y):
-        w = max(5, len(y)//10)
-        s = pd.Series(y).rolling(window=w, center=True).min().bfill().ffill().values
-        if len(s) > 51: s = savgol_filter(s, 51, 3)
-        return s
-
-    @staticmethod
-    def process_spectrum(x, y, mode, goal):
-        log = []
-        y_raw = y.copy()
-        if mode == "None":
-            peaks, _ = find_peaks(y, height=np.max(y)*0.05)
-            return {"x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y), "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], "log": ["Raw"], "fits": []}
-        
-        win = 15
-        do_fit = False
-        if mode == "AI-Adaptive":
-            if "noise" in goal.lower(): win = 31
-            if "fit" in goal.lower(): do_fit = True
-        
-        base = ScienceProcessor.simple_baseline(y)
-        y_proc = np.maximum(y - base, 0)
-        if len(y_proc) > win: y_proc = savgol_filter(y_proc, win, 3)
-        
-        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
-        fits = ScienceProcessor.fit_peaks(x, y_proc, peaks) if do_fit else []
-        
-        return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], "log": log, "fits": fits}
-
-# [4] 헬퍼
-def detect_excel_blocks(df):
-    blocks = []; mask = ~df.isnull().to_numpy()
-    if df.empty: return blocks
-    labeled, n = label(mask, structure=[[0,1,0],[1,1,1],[0,1,0]])
-    for sl in find_objects(labeled):
-        b = df.iloc[sl]
-        if b.shape[0]>=3 and b.shape[1]>=2: blocks.append(b.reset_index(drop=True))
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    try:
-        b64 = base64.b64encode(image_bytes).decode('utf-8')
-        res = await asyncio.to_thread(ollama_client.chat, model=VISION_MODEL, messages=[{'role':'user','content':prompt,'images':[b64]}])
-        c = res['message']['content']
-        if "<script" in c: return "Blocked"
-        return c
-    except Exception as e: return str(e)
-
-# [5] App
-app = FastAPI(title="Analyst V15.3")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-class TranslateReq(BaseModel): text: str
-
-@app.post("/api/translate")
-async def translate_text(req: TranslateReq):
-    try:
-        res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':'Translate to English.'}, {'role':'user','content':req.text}])
-        return {"translated": res['message']['content']}
-    except Exception as e: return {"translated": str(e)}
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(files: List[UploadFile] = File(...), file_configs: str = Form(...)):
-    configs = json.loads(file_configs)
-    print(f"🚀 V15.3 Start. Files: {len(files)}")
-    
-    tasks = []
-    final_results = []
-    file_map = {f.filename: await f.read() for f in files}
-    
-    for filename, config in configs.items():
-        if filename not in file_map: continue
-        content = file_map[filename]
-        eq, goal, mode = config.get("equipment", "General"), config.get("goal", ""), config.get("mode", "Auto")
-        fname_lower = filename.lower()
-        
-        # [A] Document Path (Literature)
-        if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
-            async def proc_doc(c, n, e):
-                try:
-                    if n.lower().endswith('.pdf'):
-                        images = convert_from_bytes(c, dpi=150, fmt='jpeg')[:10]
-                        full_txt = ""; pages = []
-                        for idx, img in enumerate(images):
-                            buf = io.BytesIO(); img.save(buf, format="JPEG")
-                            b64 = base64.b64encode(buf.getvalue()).decode()
-                            desc = await analyze_vision_ollama(buf.getvalue(), "한글 요약.")
-                            full_txt += f"\nPage {idx+1}: {desc}"
-                            pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
-                        return {"type": "pdf", "filename": n, "equipment": "Lit", "raw_context": full_txt, "pages": pages}
-                    elif n.lower().endswith(('.ppt', '.pptx')):
-                        prs = Presentation(io.BytesIO(c))
-                        slides = []; full_txt = ""
-                        for i, slide in enumerate(prs.slides):
-                            txt = ""; imgs = []
-                            for s in slide.shapes:
-                                if hasattr(s, "text"): txt += s.text + "\n"
-                                if s.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                                    try:
-                                        ib64 = base64.b64encode(s.image.blob).decode('utf-8')
-                                        desc = await analyze_vision_ollama(s.image.blob, "한글 설명.")
-                                        imgs.append({"b64": ib64, "desc": desc})
-                                    except: pass
-                            full_txt += f"Slide {i+1}: {txt}\n"
-                            slides.append({"slide_num": i+1, "text": txt, "images": imgs})
-                        return {"type": "ppt", "filename": n, "equipment": "Lit", "raw_context": full_txt, "slides": slides}
-                except Exception as e: return {"type": "error", "filename": n, "msg": str(e)}
-            tasks.append(proc_doc(content, filename, eq))
-
-        # [B] Spectrum Path (Excel/CSV) - Fix: elif 사용
-        elif fname_lower.endswith(('.xlsx', '.xls', '.csv', '.txt')):
-            async def proc_spec(c, n, e, g, m):
-                try:
-                    blocks = []; sheet_name = "Data"
-                    if n.endswith(('.csv', '.txt')):
-                        success = False
-                        for enc in ['utf-8', 'cp949', 'latin1']:
-                            if success: break
-                            for sep in [None, ',', '\t', ';']:
-                                try:
-                                    df = pd.read_csv(io.BytesIO(c), sep=sep, encoding=enc, engine='python', header=None)
-                                    # 숫자만 있는지 체크
-                                    num = df.apply(pd.to_numeric, errors='coerce').dropna(how='all')
-                                    if num.shape[0] > 2:
-                                        blocks = [df]; success = True; break
-                                except: pass
-                        if not blocks: return {"type": "error", "filename": n, "msg": "CSV Read Failed"}
-                        sheet_name = "CSV"
-                    else:
-                        xls = pd.ExcelFile(io.BytesIO(c))
-                        df = pd.read_excel(xls, sheet_name=xls.sheet_names[0], header=None)
-                        blocks = detect_excel_blocks(df)
-                        sheet_name = xls.sheet_names[0]
-
-                    res_list = []
-                    for i, block in enumerate(blocks):
-                        try:
-                            num_block = block.apply(pd.to_numeric, errors='coerce').dropna(how='all').dropna(how='all', axis=1)
-                            if not num_block.empty and num_block.shape[0] > 5:
-                                x = num_block.iloc[:, 0].fillna(0).values; y = num_block.iloc[:, 1].fillna(0).values
-                                res = ScienceProcessor.process_spectrum(x, y, mode, g)
-                                step = max(1, len(x)//100)
-                                chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(x), step)]
-                                res_list.append({
-                                    "type": "spectrum", "filename": f"{n} ({sheet_name}-{i+1})", "equipment": e,
-                                    "raw_context": f"Peaks: {len(res['peaks'])}", "chart_data": chart, "log": res["log"], "fits": res["fits"]
-                                })
-                        except: pass
-                    
-                    if not res_list: return {"type": "error", "filename": n, "msg": "No valid data"}
-                    return res_list[0] if len(res_list)==1 else res_list
-                except Exception as ex: return [{"type": "error", "filename": n, "msg": str(ex)}]
-            tasks.append(proc_spec(content, filename, eq, goal, mode))
-
-        # [C] Image Path - Fix: elif 사용
-        elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
-            async def proc_img(c, n, e, g, m):
-                try:
-                    vis_res = ScienceProcessor.process_image(c, e, m, g)
-                    if not vis_res: return {"type": "error", "filename": n, "msg": "Fail"}
-                    meta = ""
-                    if vis_res.get("footer_b64"):
-                        fb = base64.b64decode(vis_res["footer_b64"])
-                        meta = await analyze_vision_ollama(fb, "Read scale/HV.")
-                    body = base64.b64decode(vis_res["proc_b64"])
-                    desc = await analyze_vision_ollama(body, f"한글 분석. {e}. 목표:{g}. 통계:{vis_res.get('stats',{})}")
-                    return {
-                        "type": "image", "filename": n, "equipment": e, "summary": desc,
-                        "raw_context": f"Img {e}: {desc}\nMeta: {meta}",
-                        "raw_b64": vis_res["raw_b64"], "proc_b64": vis_res["proc_b64"], "footer_b64": vis_res.get("footer_b64"),
-                        "stats": vis_res.get("stats",{}), "log": vis_res.get("log", [])
-                    }
-                except Exception as ex: return {"type": "error", "filename": n, "msg": str(ex)}
-            tasks.append(proc_img(content, filename, eq, goal, mode))
-
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, list): final_results.extend(r)
-            elif isinstance(r, dict): final_results.append(r)
-
-    data_ctx, lit_ctx = "", ""
-    has_data = False
-    for r in final_results:
-        if r.get("type") != "error":
-            has_data = True
-            raw = r.get("raw_context") or ""
-            blk = f"\n=== File: {r['filename']} ===\n{raw[:3000]}\n"
-            if r.get("equipment") in ["Literature","Lit"]: lit_ctx += blk
-            else: data_ctx += blk
-    
-    final_report = "Fail"
-    if has_data and (data_ctx or lit_ctx):
-        try:
-            res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':'수석 연구원. 한글. 표 활용.'}, {'role':'user','content':f"Data:\n{data_ctx}\n\nLit:\n{lit_ctx}"}])
-            final_report = res['message']['content']
-        except Exception as e: final_report = str(e)
-
-    return {"results": final_results, "final_report": final_report}
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    if os.path.exists("index.html"): return FileResponse("index.html")
-    return "<h1>Upload index.html</h1>"
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
-브이15
-import os
-import io
-import asyncio
-import base64
-import json
-import re
-import math
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
-
-# [1] 보안 설정
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
-if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
-if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
-
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-import pandas as pd
-import numpy as np
-
-# 과학 연산
-from scipy.signal import find_peaks, savgol_filter
-from scipy.optimize import curve_fit
-from scipy.ndimage import label, find_objects, gaussian_filter, rotate
-from skimage.feature import blob_log
-import cv2
-
-from ollama import Client 
-from PIL import Image
-from pdf2image import convert_from_bytes
-from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-
-# [2] 설정
-OLLAMA_HOST = "http://127.0.0.1:11434"
-ollama_client = Client(host=OLLAMA_HOST)
-VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
-TEXT_MODEL = "llama3:70b"
-
-# ==========================================
-# [3] V15 과학 엔진 (Interface Metrology)
-# ==========================================
-class ScienceProcessorV15:
-    
-    @staticmethod
-    def crop_valid_rotated_region(img_rotated, angle_deg):
-        h, w = img_rotated.shape[:2]
-        if abs(angle_deg) < 1.0: return img_rotated # 작은 각도는 무시
-        
-        # 간단한 중앙부 Crop (마름모 문제 회피)
-        # 안전하게 중앙 70% 영역만 사용 (복잡한 기하학 계산 대신 안정성 택함)
-        cy, cx = h // 2, w // 2
-        crop_h, crop_w = int(h * 0.7), int(w * 0.7)
-        y1 = max(0, cy - crop_h // 2)
-        x1 = max(0, cx - crop_w // 2)
-        y2 = min(h, y1 + crop_h)
-        x2 = min(w, x1 + crop_w)
-        return img_rotated[y1:y2, x1:x2]
-
-    @staticmethod
-    def analyze_thin_film(img_gray):
-        """
-        [V15] 계면 추적 및 거칠기/두께 정밀 분석
-        """
-        h_orig, w_orig = img_gray.shape
-        log = []
-        
-        # 1. Auto-Rotation
-        scale = min(1.0, 512 / max(h_orig, w_orig))
-        small = cv2.resize(img_gray, None, fx=scale, fy=scale)
-        best_angle = 0
-        max_var = -1
-        
-        for ang in range(-90, 91, 2):
-            rot = rotate(small, ang, reshape=False, order=1)
-            prof = np.mean(rot, axis=1)
-            var = np.var(np.abs(np.gradient(prof)))
-            if var > max_var: max_var = var; best_angle = ang
-            
-        log.append(f"Auto-Rotation: {best_angle}°")
-        
-        # 2. Rotate & Valid Crop
-        img_rot = rotate(img_gray, best_angle, reshape=True, order=3, mode='constant', cval=np.mean(img_gray))
-        img_crop = ScienceProcessorV15.crop_valid_rotated_region(img_rot, best_angle)
-        h, w = img_crop.shape
-        
-        # 3. Global Peak Search (Approximate Locations)
-        img_blur = gaussian_filter(img_crop, sigma=3)
-        profile = np.mean(img_blur, axis=1)
-        gradient = np.abs(np.gradient(profile))
-        # 주요 계면 찾기
-        interfaces_approx, _ = find_peaks(gradient, height=np.max(gradient)*0.25, distance=30)
-        
-        log.append(f"Global Layers Found: {len(interfaces_approx)}")
-        
-        # 4. Local Interface Tracking (Pixel-wise)
-        # 각 x좌표마다 gradient가 최대인 y를 찾음 (Window Search)
-        interface_paths = [] # List of [y_0, y_1, ..., y_w]
-        
-        grad_img = np.abs(np.gradient(img_blur, axis=0)) # Y축 방향 미분 이미지
-        
-        for y_approx in interfaces_approx:
-            path = []
-            search_range = 15 # 상하 15픽셀 탐색
-            
-            for x in range(w):
-                # 검색 범위 설정
-                y_start = max(0, y_approx - search_range)
-                y_end = min(h, y_approx + search_range)
-                
-                # 해당 컬럼(x)의 로컬 영역에서 최대 Gradient 위치 찾기
-                local_col = grad_img[y_start:y_end, x]
-                if len(local_col) == 0: 
-                    path.append(y_approx)
-                    continue
-                    
-                local_max_idx = np.argmax(local_col)
-                real_y = y_start + local_max_idx
-                path.append(real_y)
-            
-            # 노이즈 제거 (Median Filter on Path)
-            path_smooth = savgol_filter(path, window_length=31, polyorder=2)
-            interface_paths.append(path_smooth)
-
-        # 5. Analysis: Roughness & Thickness
-        roughness_stats = []
-        thickness_stats = {}
-        overlay = cv2.cvtColor(img_crop, cv2.COLOR_GRAY2BGR)
-        
-        # Draw Paths
-        for idx, path in enumerate(interface_paths):
-            # A. Polynomial Fit (Trend) - 3차 함수
-            x_axis = np.arange(len(path))
-            coeffs = np.polyfit(x_axis, path, 3)
-            poly_func = np.poly1d(coeffs)
-            trend_line = poly_func(x_axis)
-            
-            # B. Roughness (Actual - Trend)
-            residuals = path - trend_line
-            rms = np.sqrt(np.mean(residuals**2)) # Rq
-            ra = np.mean(np.abs(residuals))      # Ra
-            roughness_stats.append(f"Layer {idx+1}: Rq={rms:.2f}px, Ra={ra:.2f}px")
-            
-            # C. Draw
-            # Actual Path (Green)
-            pts = np.array([np.transpose(np.vstack([x_axis, path]))], np.int32)
-            cv2.polylines(overlay, pts, isClosed=False, color=(0, 255, 0), thickness=2)
-            # Trend Line (Red Dashed - Simulated by drawing line)
-            pts_trend = np.array([np.transpose(np.vstack([x_axis, trend_line]))], np.int32)
-            cv2.polylines(overlay, pts_trend, isClosed=False, color=(0, 0, 255), thickness=1)
-
-        # Thickness Distribution
-        if len(interface_paths) >= 2:
-            # 두 계면 사이의 거리 (Point-to-Point)
-            t_dist = []
-            for i in range(len(interface_paths) - 1):
-                diff = np.array(interface_paths[i+1]) - np.array(interface_paths[i])
-                mean_t = np.mean(diff)
-                std_t = np.std(diff)
-                t_dist.append(f"L{i+1}-L{i+2}: Avg={mean_t:.1f}px (±{std_t:.2f})")
-                
-                # 시각화 (중간 지점에 텍스트)
-                mid_y = int((np.mean(interface_paths[i]) + np.mean(interface_paths[i+1])) / 2)
-                cv2.putText(overlay, f"{mean_t:.1f}px", (w//2, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            
-            thickness_stats["distribution"] = t_dist
-            
-        stats = {
-            "type": "Thin Film Metrology",
-            "angle": best_angle,
-            "roughness": roughness_stats,
-            "thickness": thickness_stats
-        }
-        
-        return overlay, stats, log
-
-    @staticmethod
-    def detect_footer_boundary(img_array):
-        # (기존 V14 동일)
-        try:
-            h, w = img_array.shape[:2]
-            if h < 100 or w < 100: return None
-            search_h = int(h * 0.25)
-            roi = img_array[h-search_h:, :]
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if len(roi.shape)==3 else roi
-            sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            row_sums = np.sum(np.uint8(np.absolute(sobel_y)), axis=1)
-            if np.max(row_sums) < (w * 30): return None
-            split_idx = np.argmax(row_sums)
-            if split_idx > search_h * 0.98: return None
-            return (h - search_h) + split_idx
-        except: return None
-
-    @staticmethod
-    def process_image(img_bytes, equipment, mode, goal):
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img_raw is None: return None, {}
-        
-        process_log = []
-        
-        # 1. Smart Crop
-        body_img, footer_img, split_y = img_raw, None, ScienceProcessorV15.detect_footer_boundary(img_raw)
-        if split_y:
-            body_img = img_raw[:split_y, :]
-            footer_img = img_raw[split_y:, :]
-            process_log.append("Smart Crop: Footer removed")
-        
-        # Helper Encoders
-        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
-        b64_raw = to_b64(body_img)
-        b64_footer = to_b64(footer_img) if footer_img is not None else None
-
-        if mode == "None":
-            return {"raw_b64": b64_raw, "proc_b64": b64_raw, "footer_b64": b64_footer, "stats": {"info": "Raw"}, "log": process_log}
-
-        # 2. Logic Branch
-        gray = cv2.cvtColor(body_img, cv2.COLOR_BGR2GRAY)
-        kwd = (equipment + " " + goal).lower()
-        
-        processed_overlay = body_img.copy()
-        stats = {}
-        
-        # [V15] Thin Film Metrology
-        is_film = any(x in kwd for x in ["film", "layer", "thick", "박막", "두께", "계면", "roughness", "거칠기"])
-        
-        if is_film:
-            processed_overlay, f_stats, f_log = ScienceProcessorV15.analyze_thin_film(gray)
-            stats.update(f_stats)
-            process_log.extend(f_log)
-        else:
-            # Particle / Atom
-            is_bright = np.mean(gray) > 127
-            gray_proc = cv2.bitwise_not(gray) if is_bright else gray
-            gray_blur = cv2.GaussianBlur(gray_proc, (5, 5), 0)
-            
-            detect_atoms = False
-            detect_particles = False
-            
-            if mode == "AI-Adaptive":
-                if any(x in kwd for x in ["atom", "원자"]): detect_atoms = True
-                if any(x in kwd for x in ["particle", "입자"]): detect_particles = True
-            elif mode == "Auto":
-                if equipment in ["STEM", "TEM"]: detect_atoms = True
-                if equipment in ["SEM", "Optical"]: detect_particles = True
-
-            if detect_atoms:
-                blobs = blob_log(gray_blur, min_sigma=3, max_sigma=15, threshold=0.1)
-                for y, x, r in blobs: cv2.circle(processed_overlay, (int(x), int(y)), int(r*1.414), (0, 0, 255), 2)
-                stats["count"] = len(blobs)
-                process_log.append(f"Atoms: {len(blobs)}")
-            elif detect_particles:
-                _, th = cv2.threshold(gray_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(processed_overlay, cnts, -1, (0, 255, 0), 2)
-                stats["count"] = len(cnts)
-                process_log.append(f"Particles: {len(cnts)}")
-
-        return {
-            "raw_b64": b64_raw,
-            "proc_b64": to_b64(processed_overlay),
-            "footer_b64": b64_footer,
-            "stats": stats,
-            "log": process_log
-        }
-
-    # --- Spectrum & Helper ---
-    @staticmethod
-    def gaussian(x, amp, cen, wid): return amp * np.exp(-(x-cen)**2 / (2*wid**2))
-
-    @staticmethod
-    def fit_peaks(x, y, peaks):
-        fits = []
-        for p in peaks:
-            try:
-                p0 = [y[p], x[p], 1.0]
-                win = 20
-                s, e = max(0, p-win), min(len(x), p+win)
-                if len(x[s:e]) > 3:
-                    popt, _ = curve_fit(ScienceProcessorV15.gaussian, x[s:e], y[s:e], p0=p0, maxfev=1000)
-                    fits.append({"amp": popt[0], "center": popt[1], "sigma": popt[2]})
-            except: pass
-        return fits
-
-    @staticmethod
-    def simple_baseline(y):
-        w = max(5, len(y)//10)
-        s = pd.Series(y).rolling(window=w, center=True).min().bfill().ffill().values
-        if len(s) > 51: s = savgol_filter(s, 51, 3)
-        return s
-
-    @staticmethod
-    def process_spectrum(x, y, mode, goal):
-        log = []
-        y_raw = y.copy()
-        if mode == "None":
-            peaks, _ = find_peaks(y, height=np.max(y)*0.05)
-            return {"x": x, "y_raw": y, "y_proc": y, "y_base": np.zeros_like(y), "peaks": [{"x": float(x[p]), "y": float(y[p])} for p in peaks], "log": ["Raw"], "fits": []}
-        
-        win = 15
-        do_fit = False
-        if mode == "AI-Adaptive":
-            if "noise" in goal.lower(): win = 31
-            if "fit" in goal.lower(): do_fit = True
-        
-        base = ScienceProcessorV15.simple_baseline(y)
-        y_proc = np.maximum(y - base, 0)
-        if len(y_proc) > win: y_proc = savgol_filter(y_proc, win, 3)
-        peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
-        fits = ScienceProcessorV15.fit_peaks(x, y_proc, peaks) if do_fit else []
-        
-        return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], "log": log, "fits": fits}
-
-def detect_excel_blocks(df):
-    blocks = []; mask = ~df.isnull().to_numpy()
-    if df.empty: return blocks
-    labeled, n = label(mask, structure=[[0,1,0],[1,1,1],[0,1,0]])
-    for sl in find_objects(labeled):
-        b = df.iloc[sl]
-        if b.shape[0]>=3 and b.shape[1]>=2: blocks.append(b.reset_index(drop=True))
-    return blocks
-
-async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
-    try:
-        b64 = base64.b64encode(image_bytes).decode('utf-8')
-        res = await asyncio.to_thread(ollama_client.chat, model=VISION_MODEL, messages=[{'role':'user','content':prompt,'images':[b64]}])
-        c = res['message']['content']
-        if "<script" in c: return "Blocked"
-        return c
-    except Exception as e: return str(e)
-
-# --- App ---
-app = FastAPI(title="Analyst V15")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-class TranslateReq(BaseModel): text: str
-
-@app.post("/api/translate")
-async def translate_text(req: TranslateReq):
-    try:
-        res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':'Translate to English.'}, {'role':'user','content':req.text}])
-        return {"translated": res['message']['content']}
-    except Exception as e: return {"translated": str(e)}
-
-@app.post("/api/analyze")
-async def analyze_orchestrator(files: List[UploadFile] = File(...), file_configs: str = Form(...)):
-    configs = json.loads(file_configs)
-    print(f"🚀 V15 Start. Files: {len(files)}")
-    
-    tasks = []
-    final_results = []
-    file_map = {f.filename: await f.read() for f in files}
-    
-    for filename, config in configs.items():
-        if filename not in file_map: continue
-        content = file_map[filename]
-        eq, goal, mode = config.get("equipment", "General"), config.get("goal", ""), config.get("mode", "Auto")
-        fname_lower = filename.lower()
-        
-        # [A] Document
-        if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
-            async def proc_doc(c, n, e):
-                try:
-                    if n.lower().endswith('.pdf'):
-                        images = convert_from_bytes(c, dpi=150, fmt='jpeg')[:10]
-                        full_txt = ""; pages = []
-                        for idx, img in enumerate(images):
-                            buf = io.BytesIO(); img.save(buf, format="JPEG")
-                            b64 = base64.b64encode(buf.getvalue()).decode()
-                            desc = await analyze_vision_ollama(buf.getvalue(), "한글 요약.")
-                            full_txt += f"\nPage {idx+1}: {desc}"
-                            pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
-                        return {"type": "pdf", "filename": n, "equipment": "Lit", "raw_context": full_txt, "pages": pages}
-                    elif n.lower().endswith(('.ppt', '.pptx')):
-                        prs = Presentation(io.BytesIO(c))
-                        slides = []; full_txt = ""
-                        for i, slide in enumerate(prs.slides):
-                            txt = ""; imgs = []
-                            for s in slide.shapes:
-                                if hasattr(s, "text"): txt += s.text + "\n"
-                                if s.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                                    try:
-                                        ib64 = base64.b64encode(s.image.blob).decode('utf-8')
-                                        desc = await analyze_vision_ollama(s.image.blob, "한글 설명.")
-                                        imgs.append({"b64": ib64, "desc": desc})
-                                    except: pass
-                            full_txt += f"Slide {i+1}: {txt}\n"
-                            slides.append({"slide_num": i+1, "text": txt, "images": imgs})
-                        return {"type": "ppt
+            "type": "Thin Film", "angle": best_angle, "layers": len(inter
