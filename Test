@@ -1,3 +1,997 @@
+엔브이5 웹 코드
+
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Analyst NV5 Physics</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .prose table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        .prose th, .prose td { border: 1px solid #cbd5e1; padding: 8px; font-size: 0.9rem; }
+        .prose th { background-color: #f1f5f9; }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+    <div id="app" class="min-h-screen p-6">
+        <header class="max-w-7xl mx-auto mb-6 flex items-center gap-3">
+            <div class="bg-emerald-600 p-2 rounded-lg shadow"><i data-lucide="atom" class="w-6 h-6 text-white"></i></div>
+            <div><h1 class="text-2xl font-bold">Analyst NV5 <span class="text-sm font-normal text-slate-500">Deep Physics & Diffraction</span></h1></div>
+        </header>
+
+        <main class="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div class="lg:col-span-4 space-y-4">
+                <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+                    <h2 class="font-bold mb-3 flex items-center gap-2"><i data-lucide="files" class="w-4 h-4"></i> Data Staging</h2>
+                    <div class="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:bg-emerald-50 cursor-pointer" @click="$refs.f.click()">
+                        <input type="file" ref="f" multiple class="hidden" @change="addFiles">
+                        <p class="text-sm font-semibold text-slate-600">Add Files</p>
+                    </div>
+                    <div v-if="stagedFiles.length" class="mt-4 space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+                        <div v-for="(item, i) in stagedFiles" :key="i" class="p-3 bg-slate-50 border rounded-lg text-sm">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="font-bold truncate w-2/3">{{ item.file.name }}</span>
+                                <button @click="removeFile(i)" class="text-red-400 hover:text-red-600"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                            <div class="grid grid-cols-1 gap-2">
+                                <select v-model="item.equipment" class="w-full p-1.5 border rounded text-xs bg-white font-semibold text-emerald-700">
+                                    <optgroup label="Spectroscopy (1D)">
+                                        <option value="XPS">XPS</option>
+                                        <option value="XRD">XRD (1D)</option>
+                                        <option value="EELS">EELS</option>
+                                        <option value="EDS">EDS</option>
+                                        <option value="FT-IR">FT-IR</option>
+                                        <option value="NMR">NMR</option>
+                                        <option value="UV-VIS">UV-VIS</option>
+                                        <option value="PL">Photo-luminescence</option>
+                                        <option value="Time-resolved">Time-resolved</option>
+                                    </optgroup>
+                                    <optgroup label="Microscopy (2D)">
+                                        <option value="SEM">SEM</option>
+                                        <option value="TEM">TEM</option>
+                                        <option value="AFM">AFM</option>
+                                        <option value="Optical">Optical</option>
+                                        <option value="2D Spectrum">2D Spectrum</option>
+                                    </optgroup>
+                                    <optgroup label="Diffraction (2D)">
+                                        <option value="Diffraction">Diffraction (2D)</option>
+                                    </optgroup>
+                                    <optgroup label="Literature">
+                                        <option value="Document">Document</option>
+                                    </optgroup>
+                                </select>
+                                
+                                <select v-if="isImage(item)" v-model="item.dataType" class="w-full p-1.5 border rounded text-xs bg-slate-50 font-bold">
+                                    <option v-if="item.equipment==='Diffraction'" value="2D Diffraction">2D Diffraction Analysis</option>
+                                    <option v-else value="General">General Object</option>
+                                    
+                                    <option v-if="item.equipment!=='Diffraction'" value="Particle">Particle Analysis (Border Excl.)</option>
+                                    <option v-if="item.equipment!=='Diffraction'" value="Thin Film">Thin Film (Roughness)</option>
+                                    <option v-if="item.equipment!=='Diffraction'" value="Crystal Structure (FFT)">Crystal Structure (FFT)</option>
+                                </select>
+
+                                <div v-if="item.dataType === '2D Diffraction'" class="flex gap-2">
+                                    <input v-model="item.centerX" type="number" placeholder="Center X" class="w-1/2 p-1.5 border rounded text-xs">
+                                    <input v-model="item.centerY" type="number" placeholder="Center Y" class="w-1/2 p-1.5 border rounded text-xs">
+                                </div>
+
+                                <select v-if="!isDoc(item)" v-model="item.mode" class="w-full p-1.5 border rounded text-xs bg-white">
+                                    <option value="Auto">✨ Auto Process</option>
+                                    <option value="None">🚫 Raw Data</option>
+                                    <option value="AI-Adaptive">🧠 Agent Mode</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <button @click="startAnalysis" :disabled="isAnalyzing || stagedFiles.length===0" class="w-full mt-4 py-3 bg-emerald-600 text-white rounded-lg font-bold flex justify-center gap-2 shadow hover:bg-emerald-700 disabled:opacity-50">
+                        <span>Generate Report</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="lg:col-span-8">
+                <div v-if="isAnalyzing" class="bg-white p-6 rounded-xl shadow border border-slate-200 text-center py-12">
+                    <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-600 mx-auto mb-4"></div>
+                    <h3 class="text-lg font-bold text-slate-700">Analyzing...</h3>
+                    <p class="text-sm text-slate-500 mb-4">{{ currentStep }}</p>
+                    <div class="w-full bg-slate-200 rounded-full h-2.5 mb-2">
+                        <div class="bg-emerald-600 h-2.5 rounded-full transition-all duration-500" :style="{width: progress + '%'}"></div>
+                    </div>
+                    <p class="text-xs text-right text-slate-400">{{ progress }}%</p>
+                </div>
+
+                <div v-if="result && !isAnalyzing" class="space-y-6 animate-fade-in">
+                    <div class="flex justify-between items-center bg-white p-2 rounded-xl shadow-sm border border-slate-200">
+                        <div class="flex gap-2">
+                            <button @click="setLang('ko')" :class="lang==='ko'?'bg-emerald-100 text-emerald-700 font-bold':'text-slate-500'" class="px-4 py-2 rounded text-sm">KR</button>
+                            <button @click="setLang('en')" :class="lang==='en'?'bg-blue-100 text-blue-700 font-bold':'text-slate-500'" class="px-4 py-2 rounded text-sm">EN</button>
+                        </div>
+                        <button @click="dlPDF" class="px-3 py-1.5 bg-slate-800 text-white text-xs rounded hover:bg-slate-700"><i class="lucide-file-down mr-1"></i> Save PDF</button>
+                    </div>
+
+                    <div id="report-view" class="bg-white p-8 rounded-xl shadow-sm border border-slate-200">
+                        <section class="mb-10">
+                            <h2 class="text-lg font-bold text-emerald-700 mb-3 border-b pb-1">1. Synthesis</h2>
+                            <div class="prose prose-sm text-slate-700 max-w-none" v-html="md(displayReport)"></div>
+                        </section>
+                        <section>
+                            <h2 class="text-lg font-bold text-slate-800 mb-5 border-b pb-1">2. Data Evidence</h2>
+                            <div v-for="(item, idx) in result.results" :key="idx" class="mb-8 p-4 bg-slate-50 rounded-lg border">
+                                <div class="flex items-center justify-between mb-3">
+                                    <div class="flex items-center gap-2">
+                                        <span class="px-2 py-0.5 bg-white border rounded text-[10px] font-bold uppercase text-slate-500">{{ item.equipment }}</span>
+                                        <h3 class="font-bold text-sm">{{ item.filename }}</h3>
+                                    </div>
+                                    <button @click="item.showDocs = !item.showDocs" class="text-xs text-emerald-600 font-bold hover:underline flex items-center gap-1">Info</button>
+                                </div>
+
+                                <div v-if="item.chart_data" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 justify-end mb-1">
+                                        <button @click="toggleTrace(idx, 0)" class="text-[10px] px-2 py-0.5 border rounded">Raw</button>
+                                        <button @click="toggleTrace(idx, 1)" class="text-[10px] px-2 py-0.5 border rounded bg-amber-50">Base</button>
+                                        <button @click="toggleTrace(idx, 2)" class="text-[10px] px-2 py-0.5 border rounded font-bold text-emerald-600">Proc</button>
+                                    </div>
+                                    <div :id="'chart-'+idx" class="w-full h-60"></div>
+                                    <div v-if="item.interpretation && item.showDocs" class="mt-3 p-3 bg-emerald-50 border border-emerald-100 rounded text-xs text-emerald-800">
+                                        <div class="prose prose-xs" v-html="md(item.interpretation)"></div>
+                                    </div>
+                                </div>
+
+                                <div v-if="item.raw_b64" class="bg-white p-2 rounded border mb-3">
+                                    <div class="flex gap-2 mb-2 text-xs justify-center">
+                                        <button @click="item.view='proc'" :class="item.view!=='raw'?'font-bold text-emerald-600':''">Processed</button>
+                                        <span class="text-slate-300">|</span>
+                                        <button @click="item.view='raw'" :class="item.view==='raw'?'font-bold text-emerald-600':''">Original</button>
+                                    </div>
+                                    <img :src="'data:image/jpeg;base64,' + (item.view==='raw' ? item.raw_b64 : item.proc_b64)" class="max-h-96 mx-auto object-contain bg-black">
+                                    <div v-if="item.stats" class="mt-2 p-2 bg-emerald-50 border border-emerald-100 rounded text-xs grid grid-cols-2 gap-2">
+                                        <div v-for="(v, k) in item.stats" :key="k">
+                                            <span class="font-bold text-emerald-700 capitalize">{{ k }}:</span> {{ v }}
+                                        </div>
+                                    </div>
+                                    <div v-if="item.summary" class="mt-2 text-xs text-slate-600 prose bg-slate-50 p-2" v-html="md(item.summary)"></div>
+                                </div>
+
+                                <div v-if="item.log && item.showDocs" class="mt-2 p-2 bg-gray-100 rounded border text-[10px] font-mono text-gray-600">
+                                    <ul class="list-disc pl-4 space-y-0.5"><li v-for="l in item.log">{{ l }}</li></ul>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const { createApp, ref, computed, nextTick } = Vue;
+        createApp({
+            setup() {
+                const stagedFiles = ref([]);
+                const isAnalyzing = ref(false);
+                const isTranslating = ref(false);
+                const progress = ref(0);
+                const currentStep = ref("");
+                const result = ref(null);
+                const lang = ref('ko');
+                const translatedReport = ref('');
+                const md = (t) => marked.parse(t||'');
+                const displayReport = computed(() => lang.value === 'en' && translatedReport.value ? translatedReport.value : (result.value ? result.value.final_report : ''));
+
+                const addFiles = (e) => {
+                    Array.from(e.target.files).forEach(f => {
+                        let eq = 'SEM'; let dt = 'General';
+                        if(f.name.match(/\.(pdf|ppt|pptx)$/i)) eq = 'Document';
+                        else if(f.name.match(/\.(xlsx|csv|txt)$/i)) eq = 'XPS';
+                        stagedFiles.value.push({ file: f, equipment: eq, dataType: dt, goal: '', mode: 'Auto', view: 'proc', showDocs: true, centerX: null, centerY: null });
+                    });
+                    e.target.value = ''; 
+                };
+                const removeFile = (i) => stagedFiles.value.splice(i, 1);
+                const isDoc = (item) => item.equipment === 'Document';
+                const isImage = (item) => ['SEM','TEM','AFM','Optical','Diffraction','2D Spectrum'].includes(item.equipment);
+
+                const startAnalysis = async () => {
+                    isAnalyzing.value = true; progress.value = 0; currentStep.value = "Init...";
+                    const fd = new FormData();
+                    const configs = {};
+                    stagedFiles.value.forEach(item => {
+                        fd.append('files', item.file);
+                        configs[item.file.name] = { 
+                            equipment: item.equipment, 
+                            data_type: item.equipment === 'Diffraction' ? '2D Diffraction' : item.dataType,
+                            goal: item.goal, mode: item.mode,
+                            center_coords: (item.centerX && item.centerY) ? `${item.centerX},${item.centerY}` : null
+                        };
+                    });
+                    fd.append('file_configs', JSON.stringify(configs));
+                    try {
+                        const initRes = await fetch('/api/analyze', { method: 'POST', body: fd });
+                        const { job_id } = await initRes.json();
+                        const poll = setInterval(async () => {
+                            const statusRes = await fetch(`/api/status/${job_id}`);
+                            const status = await statusRes.json();
+                            progress.value = status.progress || 0;
+                            currentStep.value = status.step || "Processing...";
+                            if (status.status === "Completed") {
+                                clearInterval(poll);
+                                result.value = status.results;
+                                if(result.value.results) result.value.results.forEach(r => r.showDocs = true);
+                                isAnalyzing.value = false;
+                                await nextTick();
+                                renderCharts(result.value.results);
+                            } else if (status.status === "Failed") {
+                                clearInterval(poll); alert("Error: " + status.error); isAnalyzing.value = false;
+                            }
+                        }, 1000);
+                    } catch(e) { alert(e); isAnalyzing.value = false; }
+                };
+
+                const renderCharts = (items) => {
+                    items.forEach((item, i) => {
+                        if(item.chart_data) {
+                            const raw = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_raw), mode:'lines', name:'Raw', line:{color:'#cbd5e1', width:1}, visible: true };
+                            const base = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_base), mode:'lines', name:'Base', line:{color:'#f59e0b', width:1, dash:'dot'}, visible: true };
+                            const proc = { x: item.chart_data.map(d=>d.x), y: item.chart_data.map(d=>d.y_proc), mode:'lines', name:'Proc', line:{color:'#059669', width:2}, visible: true };
+                            Plotly.newPlot('chart-'+i, [raw, base, proc], {margin:{t:10,b:30,l:40,r:10}, showlegend:false}, {displayModeBar:false});
+                        }
+                    });
+                    lucide.createIcons();
+                };
+
+                const toggleTrace = (idx, traceIdx) => {
+                    const el = document.getElementById('chart-'+idx);
+                    if(el) {
+                        const current = el.data[traceIdx].visible;
+                        const next = current === true ? 'legendonly' : true;
+                        Plotly.restyle(el, {'visible': next}, [traceIdx]);
+                    }
+                };
+
+                const dlPDF = () => {
+                    const now = new Date();
+                    const ts = now.toISOString().slice(2,10).replace(/-/g,'') + '_' + now.toTimeString().slice(0,4).replace(':','');
+                    const eqList = [...new Set(stagedFiles.value.map(f=>f.equipment))].join('-');
+                    html2pdf().set({ margin:10, filename:`${ts}_${eqList}_Report.pdf`, image:{type:'jpeg',quality:0.98}, html2canvas:{scale:2}, jsPDF:{unit:'mm',format:'a4'} }).from(document.getElementById('report-view')).save();
+                };
+
+                const setLang = async (target) => {
+                    if (target === 'ko') { lang.value = 'ko'; return; }
+                    if (target === 'en') {
+                        if (translatedReport.value) { lang.value = 'en'; return; }
+                        isTranslating.value = true;
+                        try {
+                            const res = await fetch('/api/translate', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ text: result.value.final_report })
+                            });
+                            const data = await res.json();
+                            translatedReport.value = data.translated;
+                            lang.value = 'en';
+                        } catch(e) { alert("Trans Error: " + e); }
+                        finally { isTranslating.value = false; }
+                    }
+                };
+
+                setTimeout(()=>lucide.createIcons(), 100);
+                return { stagedFiles, isAnalyzing, progress, currentStep, result, addFiles, removeFile, startAnalysis, md, toggleTrace, isDoc, isImage, dlPDF, setLang, lang, displayReport, isTranslating };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
+
+
+
+
+
+
+엔브이 5 코드
+
+import os
+import io
+import asyncio
+import base64
+import json
+import re
+import math
+import uuid
+import time
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+
+# [0] OMP 에러 방지
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# [1] 보안 설정
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,0.0.0.0,::1'
+if 'HTTP_PROXY' in os.environ: del os.environ['HTTP_PROXY']
+if 'HTTPS_PROXY' in os.environ: del os.environ['HTTPS_PROXY']
+
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+import pandas as pd
+import numpy as np
+
+# 과학/영상 연산
+from scipy.signal import find_peaks, savgol_filter
+from scipy.optimize import curve_fit
+from scipy.ndimage import center_of_mass, map_coordinates
+from skimage.feature import peak_local_max
+import cv2
+import torch
+
+# SAM & LLM & Docs
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+from ollama import Client 
+from pdf2image import convert_from_bytes
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+# [2] 설정
+OLLAMA_HOST = "http://127.0.0.1:11434"
+ollama_client = Client(host=OLLAMA_HOST)
+VISION_MODEL = "qwen3-vl:30b-a3b-instruct" 
+TEXT_MODEL = "llama3:70b"
+
+SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
+SAM_MODEL_TYPE = "vit_b"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+mask_generator = None 
+JOBS = {} 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mask_generator
+    if os.path.exists(SAM_CHECKPOINT):
+        print(f"Loading SAM ({SAM_MODEL_TYPE}) on {device}...")
+        try:
+            sam = sam_model_registry[SAM_MODEL_TYPE](checkpoint=SAM_CHECKPOINT)
+            sam.to(device=device)
+            mask_generator = SamAutomaticMaskGenerator(
+                model=sam, points_per_side=32, pred_iou_thresh=0.88,
+                stability_score_thresh=0.92, min_mask_region_area=100
+            )
+            print("SAM Loaded.")
+        except: print("SAM Load Failed.")
+    yield
+    JOBS.clear()
+
+def sanitize_json(obj):
+    if isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj): return 0.0
+        return obj
+    elif isinstance(obj, dict): return {k: sanitize_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list): return [sanitize_json(v) for v in obj]
+    elif isinstance(obj, (np.int64, np.int32)): return int(obj)
+    elif isinstance(obj, (np.float64, np.float32)):
+        if np.isnan(obj) or np.isinf(obj): return 0.0
+        return float(obj)
+    return obj
+
+# ==========================================
+# [3] NV5 과학 엔진
+# ==========================================
+class ScienceProcessorNV5:
+    
+    # --- [A] Universal Loader (NV2 Robust 유지) ---
+    @staticmethod
+    def read_universal_dataframe(content: bytes, filename: str) -> List[pd.DataFrame]:
+        dfs = []
+        fname = filename.lower()
+        if fname.endswith(('.xlsx', '.xls')):
+            try:
+                xls = pd.ExcelFile(io.BytesIO(content))
+                for s in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=s, header=None)
+                    num_count = df.apply(pd.to_numeric, errors='coerce').notna().sum().sum()
+                    if num_count < 5: raise Exception("Not enough numbers")
+                    if not df.empty: dfs.append(df)
+                if dfs: return dfs
+            except: pass
+        text_content = ""
+        for enc in ['utf-8', 'cp949', 'latin1', 'utf-16']:
+            try: text_content = content.decode(enc); break
+            except: continue
+        if text_content:
+            lines = text_content.splitlines()
+            data_start = -1; delimiter = None
+            separators = [',', '\t', ';', '\s+']
+            for i, line in enumerate(lines[:100]):
+                for sep in separators:
+                    parts = line.split() if sep=='\s+' else line.split(sep)
+                    nums = sum(1 for p in parts if re.match(r'^-?\d+(\.\d+)?(?:[eE][+-]?\d+)?$', p.strip()))
+                    if nums >= 2: data_start = i; delimiter = sep; break
+                if data_start != -1: break
+            if data_start != -1:
+                try:
+                    data_str = "\n".join(lines[data_start:])
+                    sep_arg = '\s+' if delimiter=='\s+' else delimiter
+                    df = pd.read_csv(io.StringIO(data_str), sep=sep_arg, header=None, engine='python')
+                    dfs.append(df)
+                except: pass
+        return dfs
+
+    # --- [B] Block Parser (NV2 Robust) ---
+    @staticmethod
+    def detect_structured_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+        blocks = []
+        if df.empty: return []
+        df_num = df.apply(pd.to_numeric, errors='coerce')
+        if df.shape[1] > 0: is_data_row = df_num.iloc[:, 0].notna()
+        else: is_data_row = df_num.notna().any(axis=1)
+        groups = (is_data_row != is_data_row.shift()).cumsum()
+        for _, group in df.groupby(groups):
+            if is_data_row.loc[group.index[0]]:
+                block = df_num.loc[group.index].dropna(how='all', axis=1)
+                if block.shape[0] >= 10: blocks.append(block.reset_index(drop=True))
+        return blocks
+
+    @staticmethod
+    def split_horizontal_blocks(df: pd.DataFrame) -> List[pd.DataFrame]:
+        sub_blocks = []
+        if df.empty: return []
+        col_counts = df.apply(pd.to_numeric, errors='coerce').notna().sum()
+        valid_col_indices = np.where(col_counts >= 2)[0]
+        if len(valid_col_indices) == 0: return []
+        split_points = np.where(np.diff(valid_col_indices) > 1)[0] + 1
+        groups = np.split(valid_col_indices, split_points)
+        for g in groups:
+            if len(g) > 0:
+                sub_df = df.iloc[:, g].reset_index(drop=True)
+                if sub_df.shape[1] >= 1 and sub_df.shape[0] >= 2: sub_blocks.append(sub_df)
+        return sub_blocks
+
+    @staticmethod
+    def extract_series_from_df(df: pd.DataFrame) -> List[Dict]:
+        series_list = []
+        try:
+            vals = df.values; rows, cols = vals.shape
+            if rows < 5: return []
+            if cols == 1:
+                y = vals[:, 0]; mask = ~np.isnan(y)
+                if np.sum(mask) > 5: series_list.append({"x": np.arange(len(y))[mask], "y": y[mask], "name": "Single"})
+                return series_list
+            
+            # Simple Axis Detection (NV4 Style)
+            def is_axis(arr):
+                arr = arr[~np.isnan(arr)]
+                if len(arr) < 5: return False
+                diff = np.diff(arr)
+                if np.all(diff >= 0) or np.all(diff <= 0): return True
+                return (np.sum(diff>0)/len(diff)>0.9) or (np.sum(diff<0)/len(diff)>0.9)
+
+            current_x = vals[:, 0]
+            if not is_axis(current_x): current_x = np.arange(rows)
+            for i in range(1, cols):
+                col_data = vals[:, i]
+                mask_valid = ~np.isnan(col_data)
+                if np.sum(mask_valid) < 5: continue
+                if is_axis(col_data): current_x = col_data; continue 
+                mask = ~np.isnan(current_x) & ~np.isnan(col_data)
+                if np.sum(mask) > 5:
+                    series_list.append({"x": current_x[mask], "y": col_data[mask], "name": f"Col-{i}"})
+        except: pass
+        return series_list
+
+    # --- [C] Spectrum Logic (Updated Log) ---
+    @staticmethod
+    def simple_baseline(y):
+        try:
+            w = max(5, len(y)//10)
+            s = pd.Series(y).rolling(window=w, center=True).min()
+            b = s.bfill().ffill().values 
+            if len(b) > 51: b = savgol_filter(b, 51, 3)
+            return b, w
+        except: return np.zeros_like(y), 0
+
+    @staticmethod
+    def process_spectrum(x, y, mode, goal):
+        log = []
+        y_raw = y.copy(); base = np.zeros_like(y); y_proc = y.copy()
+        peaks = []; fits = []; stats_txt = "Error"
+        try:
+            if mode == "None":
+                peaks, _ = find_peaks(y, height=np.max(y)*0.05)
+                log.append("Mode: Raw Data Only")
+                stats_txt = f"Raw Peaks: {len(peaks)}"
+            else:
+                win = 15; do_fit = False
+                if mode == "AI-Adaptive":
+                    log.append("Mode: AI-Adaptive")
+                    if "noise" in goal.lower(): win = 31; log.append("AI: Strong Smoothing")
+                    if "fit" in goal.lower(): do_fit = True; log.append("AI: Fitting On")
+                else: log.append("Mode: Auto")
+                
+                base, bw = ScienceProcessorNV5.simple_baseline(y)
+                y_proc = np.maximum(y - base, 0)
+                log.append(f"Baseline Removed (Rolling Min, Win={bw})")
+                
+                if len(y_proc) > win:
+                    y_proc = savgol_filter(y_proc, win, 3)
+                    log.append(f"Smoothing (Savitzky-Golay, Win={win}, Poly=3)")
+                
+                peaks, _ = find_peaks(y_proc, height=np.max(y_proc)*0.05, distance=10)
+                log.append(f"Peaks Found: {len(peaks)}")
+                
+                stats_txt = f"Range: {np.min(x):.1f}~{np.max(x):.1f}, Peaks: {len(peaks)}"
+            return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [{"x": float(x[p]), "y": float(y_proc[p])} for p in peaks], "log": log, "fits": fits, "stats": stats_txt}
+        except Exception as e: return {"x": x, "y_raw": y_raw, "y_proc": y_proc, "y_base": base, "peaks": [], "log": [str(e)], "fits": [], "stats": "Error"}
+
+    # --- [D] Image Utils (Footer Removal) ---
+    @staticmethod
+    def remove_footer(img_bgr):
+        h, w = img_bgr.shape[:2]
+        # Check bottom 15% for footer (usually black box or scale bar)
+        roi_h = int(h * 0.85)
+        roi = img_bgr[roi_h:, :]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Simple heuristic: if row variance is low (solid color) or very high intensity (white text on black)
+        # We assume footer is separated by a horizontal line or distinct block
+        # Sobel Y to find horizontal edges
+        sobel_y = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+        row_sums = np.sum(sobel_y, axis=1)
+        
+        # Find strongest edge in the footer region
+        split_idx = np.argmax(row_sums)
+        
+        if row_sums[split_idx] > w * 50: # Threshold for line detection
+            real_split = roi_h + split_idx
+            return img_bgr[:real_split, :], img_bgr[real_split:, :]
+        
+        return img_bgr, None
+
+    # --- [E] FFT Crystal Analysis (New) ---
+    @staticmethod
+    def analyze_crystal_structure(img_bgr):
+        log = []
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        tile_size = w // 10
+        if tile_size < 16: tile_size = 16
+        
+        overlay = img_bgr.copy()
+        mask_overlay = np.zeros_like(img_bgr)
+        
+        stats = {"partial_crystal_regions": 0}
+        
+        # Iterate grids
+        for y in range(0, h, tile_size):
+            for x in range(0, w, tile_size):
+                roi = gray[y:y+tile_size, x:x+tile_size]
+                if roi.shape[0] != tile_size or roi.shape[1] != tile_size: continue
+                
+                # 2D FFT
+                f = np.fft.fft2(roi)
+                fshift = np.fft.fftshift(f)
+                magnitude = 20 * np.log(np.abs(fshift) + 1e-9)
+                
+                # Analyze Pattern (Simplified)
+                # "Partial Crystal" typically shows anisotropy in ring
+                # We check angular variance at dominant frequency
+                
+                # 1. Radial Profile
+                center = tile_size // 2
+                y_grid, x_grid = np.ogrid[:tile_size, :tile_size]
+                r_grid = np.sqrt((x_grid - center)**2 + (y_grid - center)**2)
+                r_int = r_grid.astype(int)
+                
+                # Find dominant ring (ignore DC component at r=0)
+                tbin = np.bincount(r_int.ravel(), magnitude.ravel())
+                nr = np.bincount(r_int.ravel())
+                radial_profile = tbin / (nr + 1e-9)
+                
+                if len(radial_profile) > 5:
+                    peak_r = np.argmax(radial_profile[2:]) + 2 # Skip center
+                    
+                    # 2. Angular Variance at peak_r
+                    mask_r = (r_grid >= peak_r-1) & (r_grid <= peak_r+1)
+                    if np.sum(mask_r) > 0:
+                        ring_vals = magnitude[mask_r]
+                        variance = np.var(ring_vals)
+                        
+                        # Partial Crystal Criteria: High variance (broken ring) but not spots
+                        if 10 < variance < 100: # Heuristic range
+                            # Draw overlay (Yellow/Orange for Partial)
+                            stats["partial_crystal_regions"] += 1
+                            cv2.rectangle(mask_overlay, (x, y), (x+tile_size, y+tile_size), (0, 165, 255), -1)
+
+        # Blend
+        alpha = 0.4
+        mask_indices = np.any(mask_overlay > 0, axis=-1)
+        overlay[mask_indices] = (overlay[mask_indices] * (1 - alpha) + mask_overlay[mask_indices] * alpha).astype(np.uint8)
+        
+        log.append(f"Grid Size: {tile_size}px")
+        log.append(f"Found {stats['partial_crystal_regions']} partial crystal blocks (Orange)")
+        
+        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
+        return {"type": "image", "raw_b64": to_b64(img_bgr), "proc_b64": to_b64(overlay), "stats": stats, "log": log}
+
+    # --- [F] Diffraction (Updated Center) ---
+    @staticmethod
+    def analyze_diffraction_nv5(img_bgr, user_center=None):
+        log = []
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # 1. Center Logic
+        if user_center and len(user_center) == 2 and user_center[0] > 0:
+            cx, cy = user_center
+            log.append(f"Center: Manual ({cx}, {cy})")
+        else:
+            _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            cy_f, cx_f = center_of_mass(th)
+            if np.isnan(cy_f): cy_f, cx_f = gray.shape[0]//2, gray.shape[1]//2
+            cx, cy = int(cx_f), int(cy_f)
+            log.append(f"Center: Auto ({cx}, {cy})")
+
+        # 2. Background Removal (DoG relative to center?) -> Just DoG
+        g1 = cv2.GaussianBlur(gray, (3, 3), 0)
+        g2 = cv2.GaussianBlur(gray, (51, 51), 0)
+        diff = cv2.subtract(g1, g2)
+        
+        # 3. Peak Finding (Lattice Points)
+        coordinates = peak_local_max(diff, min_distance=10, threshold_abs=20)
+        
+        # 4. Visualization
+        enhanced = np.log1p(diff.astype(np.float32))
+        enhanced = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        result_vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        
+        # Draw Center
+        cv2.drawMarker(result_vis, (cx, cy), (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+        
+        # Draw Peaks
+        peak_list = []
+        for p in coordinates:
+            py, px = p
+            if abs(py-cy) < 5 and abs(px-cx) < 5: continue # Skip center itself
+            cv2.circle(result_vis, (px, py), 3, (0, 255, 0), 1)
+            peak_list.append(f"[{px},{py}]")
+
+        log.append(f"Lattice Points: {len(peak_list)}")
+        
+        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
+        return {
+            "type": "image", 
+            "raw_b64": to_b64(img_bgr), 
+            "proc_b64": to_b64(result_vis), 
+            "stats": {"center": [cx, cy], "spots": len(peak_list)}, 
+            "log": log
+        }
+
+    # --- [G] SAM Analysis (Updated Thin Film/Particle) ---
+    @staticmethod
+    def analyze_sam_results_nv5(img_rgb, masks, data_type):
+        overlay = img_rgb.copy()
+        mask_overlay = np.zeros_like(img_rgb)
+        h_img, w_img = img_rgb.shape[:2]
+        stats = {"count": 0}
+        log = []
+        
+        valid_masks = []
+        for ann in masks:
+            area = ann['area']
+            bbox = ann['bbox'] # x, y, w, h
+            x, y, w, h = [int(v) for v in bbox]
+            if area > h_img * w_img * 0.90 or area < 50: continue
+            
+            # [Update 1-2] Particle Border Kill
+            if data_type == "Particle":
+                if x <= 1 or y <= 1 or (x + w) >= w_img - 1 or (y + h) >= h_img - 1: continue 
+            valid_masks.append(ann)
+
+        # [Update 3] Thin Film Sort (Top to Bottom)
+        if data_type == "Thin Film":
+            # Sort by Y coordinate
+            sorted_masks = sorted(valid_masks, key=lambda x: x['bbox'][1])
+        else:
+            sorted_masks = sorted(valid_masks, key=lambda x: x['area'], reverse=True)
+
+        thickness_vals = []; roughness_vals = []; diameters = []
+
+        for i, ann in enumerate(sorted_masks):
+            m = ann['segmentation']
+            bbox = ann['bbox']
+            x, y, w, h = [int(v) for v in bbox]
+            cx, cy = int(x + w/2), int(y + h/2)
+            
+            color = (0, 255, 0)
+            
+            # [Update 3] Thin Film Logic
+            if data_type == "Thin Film":
+                is_boundary_layer = (i == 0 or i == len(sorted_masks)-1)
+                
+                if not is_boundary_layer:
+                    thk = ann['area'] / w
+                    thickness_vals.append(thk)
+                    color = (255, 0, 0) # Middle layers are Red
+                else:
+                    color = (100, 100, 100) # Top/Bottom are Gray (Ignored)
+
+                # Label Layer Number
+                cv2.putText(overlay, f"#{i+1}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Interface Roughness (Bottom of current layer)
+                if i < len(sorted_masks) - 1:
+                    ys, xs = np.where(m)
+                    if len(xs) > 10:
+                        # Bottom edge approx: max Y per X
+                        # Simplified: Use std dev of all Ys in mask as proxy for interface variance
+                        roughness = np.std(ys) 
+                        roughness_vals.append(roughness)
+                        # Draw Interface Line
+                        cv2.line(overlay, (x, y+h), (x+w, y+h), (0, 255, 255), 1)
+
+            elif data_type == "Particle":
+                equivalent_diameter = 2 * np.sqrt(ann['area'] / np.pi)
+                diameters.append(equivalent_diameter)
+
+            mask_overlay[m] = color
+            mask_uint8 = (m * 255).astype(np.uint8)
+            cnts, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts: cv2.drawContours(overlay, [cnts[0]], -1, color, 2)
+
+        alpha = 0.3
+        mask_indices = np.any(mask_overlay > 0, axis=-1)
+        overlay[mask_indices] = (overlay[mask_indices] * (1 - alpha) + mask_overlay[mask_indices] * alpha).astype(np.uint8)
+
+        if data_type == "Thin Film":
+            avg_thk = round(np.mean(thickness_vals), 2) if thickness_vals else 0
+            log.append(f"Layers: {len(sorted_masks)} (Top/Bottom Excl.)")
+            log.append(f"Avg Thickness: {avg_thk} px")
+            stats["thickness_avg"] = avg_thk
+        elif data_type == "Particle":
+            avg_dia = round(np.mean(diameters), 2) if diameters else 0
+            log.append(f"Particles: {len(sorted_masks)} (Inner Only)")
+            log.append(f"Avg Dia: {avg_dia} px")
+            stats["diameter_avg"] = avg_dia
+        else:
+            log.append(f"Detected: {len(sorted_masks)}")
+
+        return overlay, stats, log
+
+    # --- Main Process Router ---
+    @staticmethod
+    def process_image_nv5(img_bytes, equipment, data_type, mode, goal, user_center=None):
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_raw is None: return {}
+        
+        # [Update 1] Remove Footer
+        body, footer = ScienceProcessorNV5.remove_footer(img_raw)
+        
+        # Scale Logic (Placeholder for Vision LLM prompt later)
+        scale_info = "1 px" 
+        
+        # [Update 7] Crystal FFT
+        if data_type == "Crystal Structure (FFT)":
+            return ScienceProcessorNV5.analyze_crystal_structure(body)
+            
+        # [Update 8] 2D Diffraction
+        if data_type == "2D Diffraction":
+            return ScienceProcessorNV5.analyze_diffraction_nv5(body, user_center)
+        
+        # General SAM
+        if mode == "None":
+             def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
+             return {"type":"image", "raw_b64":to_b64(body), "proc_b64":to_b64(body), "stats":{}, "log":["Mode: Raw"]}
+
+        img_proc = body.copy()
+        log = []
+        if mode == "Auto" or mode == "AI-Adaptive":
+            img_proc = cv2.bilateralFilter(img_proc, 9, 75, 75)
+            log.append("Preproc: Denoise")
+
+        img_rgb = cv2.cvtColor(img_proc, cv2.COLOR_BGR2RGB)
+        
+        if mask_generator:
+            try:
+                masks = mask_generator.generate(img_rgb)
+                log.append(f"SAM: {len(masks)} Raw Segments")
+                overlay, stats, sam_log = ScienceProcessorNV5.analyze_sam_results_nv5(img_rgb, masks, data_type)
+                log.extend(sam_log)
+                overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                log.append(f"SAM Error: {str(e)}")
+                overlay = body
+                stats = {}
+        else:
+            log.append("SAM Error: Not Loaded")
+            overlay = body
+            stats = {}
+
+        def to_b64(im): return base64.b64encode(cv2.imencode('.jpg', im)[1]).decode('utf-8')
+        return {"type": "image", "raw_b64": to_b64(body), "proc_b64": to_b64(overlay), "stats": stats, "log": log}
+
+# [4] Helper Async Functions
+async def analyze_vision_ollama(image_bytes: bytes, prompt: str) -> str:
+    try:
+        b64 = base64.b64encode(image_bytes).decode('utf-8')
+        res = await asyncio.to_thread(ollama_client.chat, model=VISION_MODEL, messages=[{'role':'user','content':prompt,'images':[b64]}])
+        return res['message']['content']
+    except: return "Vision Error"
+
+async def interpret_spectrum_data(raw_context: str, equipment: str) -> str:
+    try:
+        prompt = f"Analyze spectrum ({equipment}). Brief interpretation in Korean. Data: {raw_context}"
+        res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'user','content':prompt}])
+        return res['message']['content']
+    except: return ""
+
+# [5] App & Job System
+app = FastAPI(title="Analyst NV5", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+class TranslateReq(BaseModel): text: str
+
+@app.post("/api/translate")
+async def translate_text(req: TranslateReq):
+    try:
+        res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':'Translate to English.'}, {'role':'user','content':req.text}])
+        return {"translated": res['message']['content']}
+    except Exception as e: return {"translated": str(e)}
+
+async def process_analysis_job(job_id: str, files_map: Dict, configs: Dict):
+    try:
+        JOBS[job_id]["status"] = "Processing"
+        JOBS[job_id]["progress"] = 10
+        final_results = []
+        total_files = len(configs)
+        processed_count = 0
+
+        for filename, config in configs.items():
+            if filename not in files_map: continue
+            content = files_map[filename]
+            eq = config.get("equipment", "General")
+            data_type = config.get("data_type", "General")
+            goal = config.get("goal", "")
+            mode = config.get("mode", "Auto")
+            
+            # [Update 8] Center Coordinates (String "x,y" -> List [x,y])
+            user_center = None
+            if config.get("center_coords"):
+                try: user_center = [int(v) for v in config["center_coords"].split(",")]
+                except: pass
+
+            fname_lower = filename.lower()
+            JOBS[job_id]["step"] = f"Analyzing {filename}..."
+            
+            # [A] Document
+            if eq == "Document" or fname_lower.endswith(('.pdf', '.ppt', '.pptx')):
+                try:
+                    if fname_lower.endswith('.pdf'):
+                        images = convert_from_bytes(content, dpi=150, fmt='jpeg')[:10]
+                        full_txt = ""; pages = []
+                        for idx, img in enumerate(images):
+                            buf = io.BytesIO(); img.save(buf, format="JPEG")
+                            b64 = base64.b64encode(buf.getvalue()).decode()
+                            desc = await analyze_vision_ollama(buf.getvalue(), "한글 요약.")
+                            full_txt += f"\nPage {idx+1}: {desc}"
+                            pages.append({"page_num": idx+1, "image_b64": b64, "desc": desc})
+                        final_results.append({"type": "pdf", "filename": filename, "equipment": "Lit", "raw_context": full_txt, "pages": pages})
+                    elif fname_lower.endswith(('.ppt', '.pptx')):
+                        prs = Presentation(io.BytesIO(content))
+                        slides = []
+                        for i, slide in enumerate(prs.slides):
+                            txt = ""; imgs = []
+                            for s in slide.shapes:
+                                if hasattr(s, "text"): txt += s.text + "\n"
+                                if s.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                                    try:
+                                        ib64 = base64.b64encode(s.image.blob).decode('utf-8')
+                                        desc = await analyze_vision_ollama(s.image.blob, "한글 설명.")
+                                        imgs.append({"b64": ib64, "desc": desc})
+                                    except: pass
+                            slides.append({"slide_num": i+1, "text": txt, "images": imgs})
+                        final_results.append({"type": "ppt", "filename": filename, "equipment": "Lit", "raw_context": "", "slides": slides})
+                except Exception as e: final_results.append({"type": "error", "filename": filename, "msg": str(e)})
+
+            # [B] Spectrum
+            elif fname_lower.endswith(('.xlsx', '.xls', '.csv', '.txt')):
+                try:
+                    dfs = ScienceProcessorNV5.read_universal_dataframe(content, filename)
+                    for i, df in enumerate(dfs):
+                        v_blocks = ScienceProcessorNV5.detect_structured_blocks(df)
+                        for v_block in v_blocks:
+                            h_blocks = ScienceProcessorNV5.split_horizontal_blocks(v_block)
+                            for h_block in h_blocks:
+                                series_list = ScienceProcessorNV5.extract_series_from_df(h_block)
+                                for s in series_list:
+                                    res = ScienceProcessorNV5.process_spectrum(s['x'], s['y'], mode, goal)
+                                    step = max(1, len(s['x'])//100)
+                                    chart = [{"x": float(res["x"][k]), "y_proc": float(res["y_proc"][k]), "y_raw": float(res["y_raw"][k]), "y_base": float(res["y_base"][k])} for k in range(0, len(s['x']), step)]
+                                    ctx = f"Data: {s['name']}\nStats: {res['stats']}"
+                                    interp = await interpret_spectrum_data(ctx, eq)
+                                    final_results.append({
+                                        "type": "spectrum", "filename": f"{filename} ({s['name']})", "equipment": eq,
+                                        "raw_context": f"{ctx}\nInterp: {interp}", 
+                                        "chart_data": chart, "log": res["log"], "interpretation": interp
+                                    })
+                except Exception as ex: final_results.append({"type": "error", "filename": filename, "msg": str(ex)})
+
+            # [C] Image (NV5)
+            elif fname_lower.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp')):
+                try:
+                    JOBS[job_id]["step"] = f"Vision Analysis: {filename}..."
+                    vis_res = await asyncio.to_thread(ScienceProcessorNV5.process_image_nv5, content, eq, data_type, mode, goal, user_center)
+                    
+                    if vis_res:
+                        # [Update 4] Scale Bar Info Request
+                        prompt = f"Analyze this {eq} image ({data_type}). Extract Scale Bar text (e.g. 100nm) and calc nm/px. Summary in Korean."
+                        desc = await analyze_vision_ollama(base64.b64decode(vis_res["proc_b64"]), prompt)
+                        final_results.append({
+                            "type": "image", "filename": filename, "equipment": eq, "summary": desc,
+                            "raw_context": f"Img {eq}: {desc}",
+                            "raw_b64": vis_res["raw_b64"], "proc_b64": vis_res["proc_b64"],
+                            "stats": vis_res.get("stats",{}), "log": vis_res.get("log", [])
+                        })
+                except Exception as ex: final_results.append({"type": "error", "filename": filename, "msg": str(ex)})
+            
+            processed_count += 1
+            JOBS[job_id]["progress"] = 10 + int((processed_count / total_files) * 80)
+
+        JOBS[job_id]["step"] = "Writing Report..."
+        final_results = sanitize_json(final_results)
+        
+        data_ctx = ""
+        for r in final_results:
+            if r.get("type") != "error":
+                raw = r.get("raw_context") or ""
+                data_ctx += f"\n=== {r['filename']} ===\n{raw[:1000]}\n"
+
+        final_report = "Fail"
+        if data_ctx:
+            try:
+                system_prompt = "You are a research assistant. Write a report in Korean. Summarize data and physics."
+                res = await asyncio.to_thread(ollama_client.chat, model=TEXT_MODEL, messages=[{'role':'system','content':system_prompt}, {'role':'user','content':f"Data:\n{data_ctx}"}])
+                final_report = res['message']['content']
+            except Exception as e: final_report = str(e)
+
+        JOBS[job_id]["results"] = {"results": final_results, "final_report": final_report}
+        JOBS[job_id]["status"] = "Completed"
+        JOBS[job_id]["progress"] = 100
+    except Exception as e:
+        JOBS[job_id]["status"] = "Failed"
+        JOBS[job_id]["error"] = str(e)
+
+@app.post("/api/analyze")
+async def start_analysis(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...), file_configs: str = Form(...)):
+    job_id = str(uuid.uuid4())
+    configs = json.loads(file_configs)
+    files_map = {f.filename: await f.read() for f in files}
+    JOBS[job_id] = {"status": "Pending", "progress": 0, "step": "Init", "results": None}
+    background_tasks.add_task(process_analysis_job, job_id, files_map, configs)
+    return {"job_id": job_id}
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str): return JOBS.get(job_id, {"status": "Not Found"})
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    if os.path.exists("index.html"): return FileResponse("index.html")
+    return "<h1>NV5 Backend</h1>"
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
+
 엔브리 4 픽스 파이널 2 웹 코드
 
 <!DOCTYPE html>
