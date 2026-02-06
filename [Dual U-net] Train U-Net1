@@ -539,3 +539,50 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+import os, json
+import torch
+import numpy as np
+
+def export_cache_only():
+    cfg = CFG()  # train_unet1.py에 정의된 CFG 그대로 사용
+    run_dir = os.path.join("runs", cfg.exp_name)
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    cache_dir = os.path.join(run_dir, "cache_u1_logits")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # load split/config
+    with open(os.path.join(run_dir, "split.json"), "r", encoding="utf-8") as f:
+        split = json.load(f)
+
+    train_folder = os.path.join(cfg.root, cfg.train_dir)
+    test_folder  = os.path.join(cfg.root, cfg.test_dir)
+
+    train_paths = [os.path.join(train_folder, fn) for fn in split["train_files"]]
+    val_paths   = [os.path.join(train_folder, fn) for fn in split["val_files"]]
+    test_paths  = [os.path.join(test_folder,  fn) for fn in split["test_files"]]
+
+    best_ckpt_path = os.path.join(ckpt_dir, "unet1_best.pth")
+    ckpt = torch.load(best_ckpt_path, map_location=cfg.device)
+
+    model = ResUNetGN(in_channels=1, out_channels=1, base=cfg.base, groups=cfg.gn_groups).to(cfg.device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    meta = {
+        "created_from_checkpoint": "unet1_best.pth",
+        "split": split,
+        "config": asdict(cfg),
+    }
+    with open(os.path.join(cache_dir, "u1_cache_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    export_u1_logits(model, train_paths, os.path.join(cache_dir, "train"), cfg)
+    export_u1_logits(model, val_paths,   os.path.join(cache_dir, "val"), cfg)
+    export_u1_logits(model, test_paths,  os.path.join(cache_dir, "test"), cfg)
+
+    print("Cache export done:", cache_dir)
+
+if __name__ == "__main__":
+    export_cache_only()
