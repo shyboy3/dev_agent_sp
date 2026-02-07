@@ -1,3 +1,611 @@
+뉴 트레인 유넷1
+
+import os, json, math, random, shutil
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import List, Tuple, Dict
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+# =========================
+# Config (edit here)
+# =========================
+@dataclass
+class CFG:
+    # dataset root
+    root: str = "./DATA"
+    train_dir: str = "TRAIN_SEM_IMAGE"
+    valid_dir: str = "VALID_SEM_IMAGE"
+    test_dir: str = "TEST_SEM_IMAGE"
+    train2_dir: str = "TRAIN_2_SEM_IMAGE"
+
+    # SEM valid area crop (bottom meta remove)
+    crop_h: int = 896
+    crop_w: int = 1280
+
+    # preprocessing
+    use_clahe: bool = True
+    clahe_clip: float = 2.0
+    clahe_tile: int = 8
+    bg_kernel: int = 49  # ~ grain size (48) conservative
+
+    robust_p_lo: float = 1.0
+    robust_p_hi: float = 99.0
+
+    # patching / augmentation
+    patch: int = 384
+    stride: int = 48
+    rot_aug: bool = True  # 0/90/180/270
+
+    # label extraction (red line)
+    r_thr: int = 150
+    g_thr: int = 120
+    b_thr: int = 120
+
+    # training
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    seed: int = 42
+    batch: int = 4
+    epochs: int = 30
+    lr: float = 1e-3
+    weight_decay: float = 1e-5
+
+    # model
+    base: int = 64  # 너가 예전에 쓰던 64 depth 반영
+    gn_groups: int = 16
+
+    # dataloader (Windows 안정)
+    num_workers: int = 0
+
+    # output
+    exp_name: str = "exp_unet1"
+
+    # metrics
+    thr_vis: float = 0.5
+    sweep_thr_min: float = 0.05
+    sweep_thr_max: float = 0.95
+    sweep_thr_steps: int = 19
+
+    # exports
+    export_all_images: bool = True  # val/test 모두 저장
+    export_max_images: int = 9999
+
+
+# =========================
+# Repro
+# =========================
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+# =========================
+# IO / utils
+# =========================
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def list_jpg(folder: str) -> List[str]:
+    files = [f for f in os.listdir(folder) if f.lower().endswith(".jpg")]
+    files.sort()
+    return [os.path.join(folder, f) for f in files]
+
+def read_gray(path: str) -> np.ndarray:
+    im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if im is None:
+        raise FileNotFoundError(path)
+    return im
+
+def read_bgr(path: str) -> np.ndarray:
+    im = cv2.imread(path, cv2.IMREAD_COLOR)
+    if im is None:
+        raise FileNotFoundError(path)
+    return im
+
+def crop_valid(img: np.ndarray, H: int, W: int) -> np.ndarray:
+    return img[:H, :W]
+
+def robust_rescale(x: np.ndarray, p_lo: float, p_hi: float) -> np.ndarray:
+    lo = np.percentile(x, p_lo)
+    hi = np.percentile(x, p_hi)
+    if hi <= lo + 1e-8:
+        return np.clip(x, 0, 1)
+    y = (x - lo) / (hi - lo)
+    return np.clip(y, 0, 1)
+
+def apply_clahe(img01: np.ndarray, clip: float, tile: int) -> np.ndarray:
+    img8 = np.clip(img01 * 255.0, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
+    out = clahe.apply(img8).astype(np.float32) / 255.0
+    return out
+
+def estimate_background(img01: np.ndarray, k: int) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    img8 = np.clip(img01 * 255.0, 0, 255).astype(np.uint8)
+    bg8 = cv2.morphologyEx(img8, cv2.MORPH_OPEN, kernel)
+    return bg8.astype(np.float32) / 255.0
+
+def preprocess_sem(gray: np.ndarray, cfg: CFG) -> np.ndarray:
+    x = crop_valid(gray, cfg.crop_h, cfg.crop_w).astype(np.float32) / 255.0
+    if cfg.use_clahe:
+        x = apply_clahe(x, cfg.clahe_clip, cfg.clahe_tile)
+    bg = estimate_background(x, cfg.bg_kernel)
+    x = x - bg
+    x = robust_rescale(x, cfg.robust_p_lo, cfg.robust_p_hi)
+    return x.astype(np.float32)
+
+def extract_red_mask(label_bgr: np.ndarray, cfg: CFG) -> np.ndarray:
+    lab = crop_valid(label_bgr, cfg.crop_h, cfg.crop_w)
+    B, G, R = lab[...,0], lab[...,1], lab[...,2]
+    m = (R > cfg.r_thr) & (G < cfg.g_thr) & (B < cfg.b_thr)
+    return m.astype(np.uint8)
+
+def compute_offsets(L: int, patch: int, stride: int) -> List[int]:
+    max0 = L - patch
+    if max0 < 0:
+        return [0]
+    offs = list(range(0, max0 + 1, stride))
+    if offs[-1] != max0:
+        offs.append(max0)
+    return offs
+
+def rot_k(a: np.ndarray, k: int) -> np.ndarray:
+    return np.rot90(a, k).copy()
+
+def to_u8(x01: np.ndarray) -> np.ndarray:
+    return np.clip(x01 * 255.0, 0, 255).astype(np.uint8)
+
+def overlay(gray01: np.ndarray, gt01: np.ndarray, pred01: np.ndarray) -> np.ndarray:
+    g = to_u8(gray01)
+    rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    rgb[gt01 > 0] = (0,0,255)
+    rgb[pred01 > 0] = (0,255,0)
+    return rgb
+
+
+# =========================
+# Metrics
+# =========================
+def soft_dice_score_np(prob: np.ndarray, gt: np.ndarray, eps: float = 1e-6) -> float:
+    prob = prob.astype(np.float64)
+    gt = gt.astype(np.float64)
+    num = 2.0 * np.sum(prob * gt)
+    den = np.sum(prob) + np.sum(gt) + eps
+    return float(num / den)
+
+def average_precision_np(y_true: np.ndarray, y_score: np.ndarray, eps: float = 1e-12) -> float:
+    y_true = y_true.astype(np.uint8)
+    y_score = y_score.astype(np.float64)
+    pos = int(y_true.sum())
+    if pos == 0:
+        return 0.0
+    order = np.argsort(-y_score)
+    y_true_sorted = y_true[order]
+    tp = np.cumsum(y_true_sorted == 1)
+    fp = np.cumsum(y_true_sorted == 0)
+    precision = tp / np.maximum(tp + fp, 1)
+    ap = float(np.sum(precision[y_true_sorted == 1]) / (pos + eps))
+    return ap
+
+def sweep_best_f1(y_true: np.ndarray, y_score: np.ndarray, thresholds: np.ndarray, eps: float = 1e-12) -> Tuple[float, float]:
+    y_true = y_true.astype(np.uint8)
+    y_score = y_score.astype(np.float64)
+    pos = y_true.sum()
+    if pos == 0:
+        return 0.0, float(thresholds[0])
+
+    best_f1, best_thr = 0.0, float(thresholds[0])
+    for thr in thresholds:
+        y_pred = (y_score >= thr).astype(np.uint8)
+        tp = int((y_pred & y_true).sum())
+        fp = int((y_pred & (1 - y_true)).sum())
+        fn = int(((1 - y_pred) & y_true).sum())
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        f1 = 2.0 * precision * recall / (precision + recall + eps)
+        if f1 > best_f1:
+            best_f1, best_thr = float(f1), float(thr)
+    return best_f1, best_thr
+
+
+# =========================
+# Model: ResUNet (GN)
+# =========================
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, groups=16):
+        super().__init__()
+        self.c1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.g1 = nn.GroupNorm(num_groups=min(groups, out_ch), num_channels=out_ch)
+        self.c2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.g2 = nn.GroupNorm(num_groups=min(groups, out_ch), num_channels=out_ch)
+        self.act = nn.SiLU(inplace=True)
+        self.skip = None
+        if in_ch != out_ch:
+            self.skip = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+
+    def forward(self, x):
+        h = self.act(self.g1(self.c1(x)))
+        h = self.g2(self.c2(h))
+        s = x if self.skip is None else self.skip(x)
+        return self.act(h + s)
+
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch, groups=16):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.block = ResBlock(in_ch, out_ch, groups)
+    def forward(self, x):
+        return self.block(self.pool(x))
+
+class Up(nn.Module):
+    def __init__(self, in_ch, out_ch, groups=16):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.block = ResBlock(in_ch, out_ch, groups)
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        dy = x2.size(2) - x1.size(2)
+        dx = x2.size(3) - x1.size(3)
+        x1 = F.pad(x1, [dx//2, dx-dx//2, dy//2, dy-dy//2])
+        return self.block(torch.cat([x2, x1], dim=1))
+
+class ResUNet(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, base=64, groups=16):
+        super().__init__()
+        self.inc = ResBlock(in_ch, base, groups)
+        self.d1 = Down(base, base*2, groups)
+        self.d2 = Down(base*2, base*4, groups)
+        self.d3 = Down(base*4, base*8, groups)
+        self.d4 = Down(base*8, base*16, groups)
+        self.u1 = Up(base*16 + base*8, base*8, groups)
+        self.u2 = Up(base*8 + base*4, base*4, groups)
+        self.u3 = Up(base*4 + base*2, base*2, groups)
+        self.u4 = Up(base*2 + base, base, groups)
+        self.outc = nn.Conv2d(base, out_ch, 1)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.d1(x1)
+        x3 = self.d2(x2)
+        x4 = self.d3(x3)
+        x5 = self.d4(x4)
+        x = self.u1(x5, x4)
+        x = self.u2(x, x3)
+        x = self.u3(x, x2)
+        x = self.u4(x, x1)
+        return self.outc(x)  # logits
+
+
+# =========================
+# Dataset (patches)
+# =========================
+class PatchDS(torch.utils.data.Dataset):
+    def __init__(self, jpg_paths: List[str], cfg: CFG):
+        self.jpg_paths = jpg_paths
+        self.cfg = cfg
+        self.cache: Dict[str, Dict[str, np.ndarray]] = {}
+        self.index: List[Tuple[int,int,int,int]] = []
+
+        for i, p in enumerate(jpg_paths):
+            img = preprocess_sem(read_gray(p), cfg)
+            ys = compute_offsets(img.shape[0], cfg.patch, cfg.stride)
+            xs = compute_offsets(img.shape[1], cfg.patch, cfg.stride)
+            for y in ys:
+                for x in xs:
+                    rots = (0,1,2,3) if cfg.rot_aug else (0,)
+                    for rk in rots:
+                        self.index.append((i,y,x,rk))
+
+    def __len__(self): return len(self.index)
+
+    def _load(self, i: int):
+        p = self.jpg_paths[i]
+        if p in self.cache:
+            return
+        img01 = preprocess_sem(read_gray(p), self.cfg)
+        lab = read_bgr(os.path.splitext(p)[0] + ".png")
+        gt = extract_red_mask(lab, self.cfg)
+        self.cache[p] = {"img": img01, "gt": gt}
+
+    def __getitem__(self, idx: int):
+        i,y,x,rk = self.index[idx]
+        self._load(i)
+        p = self.jpg_paths[i]
+        c = self.cache[p]
+
+        img = c["img"][y:y+self.cfg.patch, x:x+self.cfg.patch]
+        gt  = c["gt"][y:y+self.cfg.patch, x:x+self.cfg.patch]
+
+        img = rot_k(img, rk)
+        gt  = rot_k(gt, rk)
+
+        I = torch.from_numpy(img[None].astype(np.float32))
+        Y = torch.from_numpy(gt[None].astype(np.float32))
+        return I, Y
+
+
+# =========================
+# Loss
+# =========================
+def bce_dice_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    bce = F.binary_cross_entropy_with_logits(logits, target)
+    prob = torch.sigmoid(logits)
+    num = 2.0 * (prob * target).sum(dim=(2,3))
+    den = (prob * prob).sum(dim=(2,3)) + (target * target).sum(dim=(2,3)) + 1e-6
+    dice_loss = (1.0 - (num / den)).mean()
+    return bce + dice_loss
+
+
+# =========================
+# Full-image inference + exports
+# =========================
+@torch.no_grad()
+def infer_full_logits(model: nn.Module, img01: np.ndarray, device: str) -> np.ndarray:
+    t = torch.from_numpy(img01[None,None].astype(np.float32)).to(device)
+    logits = model(t)[0,0].detach().cpu().numpy().astype(np.float32)
+    return logits
+
+@torch.no_grad()
+def eval_and_collect(model: nn.Module, jpg_paths: List[str], cfg: CFG, device: str) -> Dict[str, float]:
+    model.eval()
+    all_prob = []
+    all_gt = []
+    losses = []
+
+    for p in jpg_paths:
+        img01 = preprocess_sem(read_gray(p), cfg)
+        lab = read_bgr(os.path.splitext(p)[0] + ".png")
+        gt = extract_red_mask(lab, cfg).astype(np.uint8)
+
+        logits = infer_full_logits(model, img01, device)
+        prob = 1.0 / (1.0 + np.exp(-logits))
+
+        # loss on full image (approx, for monitoring)
+        lt = torch.from_numpy(logits[None,None]).to(device)
+        yt = torch.from_numpy(gt[None,None].astype(np.float32)).to(device)
+        losses.append(float(bce_dice_loss(lt, yt).item()))
+
+        all_prob.append(prob.reshape(-1).astype(np.float32))
+        all_gt.append(gt.reshape(-1).astype(np.uint8))
+
+    prob = np.concatenate(all_prob, 0)
+    gt = np.concatenate(all_gt, 0)
+
+    thresholds = np.linspace(cfg.sweep_thr_min, cfg.sweep_thr_max, cfg.sweep_thr_steps)
+    ap = average_precision_np(gt, prob)
+    softdice = soft_dice_score_np(prob, gt)
+    best_f1, best_thr = sweep_best_f1(gt, prob, thresholds)
+
+    pred05 = (prob >= cfg.thr_vis).astype(np.uint8)
+    inter = 2.0 * float(np.sum(pred05 * gt))
+    den = float(np.sum(pred05) + np.sum(gt) + 1e-6)
+    dice05 = inter / den
+
+    return {
+        "loss": float(np.mean(losses)),
+        "ap": float(ap),
+        "softdice": float(softdice),
+        "dice05": float(dice05),
+        "best_f1": float(best_f1),
+        "best_thr": float(best_thr),
+    }
+
+@torch.no_grad()
+def save_paper_outputs(model: nn.Module, jpg_paths: List[str], out_dir: str, cfg: CFG, device: str, tag: str):
+    ensure_dir(out_dir)
+    model.eval()
+    for p in jpg_paths[:cfg.export_max_images]:
+        base = os.path.splitext(os.path.basename(p))[0]
+        img01 = preprocess_sem(read_gray(p), cfg)
+        lab = read_bgr(os.path.splitext(p)[0] + ".png")
+        gt = extract_red_mask(lab, cfg).astype(np.uint8)
+
+        logits = infer_full_logits(model, img01, device)
+        prob = 1.0 / (1.0 + np.exp(-logits))
+        pred = (prob >= cfg.thr_vis).astype(np.uint8)
+        ov = overlay(img01, gt, pred)
+
+        cv2.imwrite(os.path.join(out_dir, f"{base}_{tag}_I.png"), to_u8(img01))
+        cv2.imwrite(os.path.join(out_dir, f"{base}_{tag}_GT.png"), (gt*255).astype(np.uint8))
+        cv2.imwrite(os.path.join(out_dir, f"{base}_{tag}_P.png"), (pred*255).astype(np.uint8))
+        cv2.imwrite(os.path.join(out_dir, f"{base}_{tag}_overlay.png"), ov)
+        cv2.imwrite(os.path.join(out_dir, f"{base}_{tag}_prob.png"), to_u8(prob))
+
+def plot_curves(df_tr: pd.DataFrame, df_va: pd.DataFrame, out_png: str, title: str):
+    plt.figure()
+    plt.plot(df_tr["epoch"], df_tr["train_loss"], label="train loss")
+    plt.plot(df_va["epoch"], df_va["val_loss"], label="val loss")
+    plt.plot(df_va["epoch"], df_va["val_ap"], label="val AP")
+    plt.plot(df_va["epoch"], df_va["val_softdice"], label="val soft-dice")
+    plt.xlabel("epoch"); plt.legend(); plt.title(title); plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+def plot_scatter(df_tr: pd.DataFrame, df_va: pd.DataFrame, out_png: str):
+    plt.figure()
+    plt.scatter(df_tr["train_loss"], df_va["val_ap"])
+    plt.xlabel("train loss"); plt.ylabel("val AP")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+# =========================
+# Create TRAIN_2 (Pt png + npz)
+# =========================
+@torch.no_grad()
+def create_train2_from_valid(model: nn.Module, valid_jpgs: List[str], cfg: CFG, device: str, train2_dir_abs: str):
+    ensure_dir(train2_dir_abs)
+    model.eval()
+
+    for p in valid_jpgs:
+        base = os.path.splitext(os.path.basename(p))[0]
+        gt_path = os.path.splitext(p)[0] + ".png"
+
+        # copy sem + gt into TRAIN_2
+        shutil.copy2(p, os.path.join(train2_dir_abs, f"{base}.jpg"))
+        shutil.copy2(gt_path, os.path.join(train2_dir_abs, f"{base}.png"))
+
+        # infer
+        img01 = preprocess_sem(read_gray(p), cfg)
+        logits = infer_full_logits(model, img01, device)
+        pt = 1.0 / (1.0 + np.exp(-logits))  # Pt=P0
+
+        # save pt.png (8-bit)
+        pt_png = (np.clip(pt, 0, 1) * 255.0).astype(np.uint8)
+        cv2.imwrite(os.path.join(train2_dir_abs, f"{base}_pt.png"), pt_png)
+
+        # save pt.npz (float16 prob + logits)
+        np.savez_compressed(
+            os.path.join(train2_dir_abs, f"{base}_pt.npz"),
+            pt=pt.astype(np.float16),
+            logits=logits.astype(np.float16),
+            meta=np.array([cfg.crop_h, cfg.crop_w], dtype=np.int32),
+        )
+
+
+# =========================
+# Main
+# =========================
+def main():
+    cfg = CFG()
+    set_seed(cfg.seed)
+
+    train_folder = os.path.join(cfg.root, cfg.train_dir)
+    valid_folder = os.path.join(cfg.root, cfg.valid_dir)
+    test_folder  = os.path.join(cfg.root, cfg.test_dir)
+    train2_folder = os.path.join(cfg.root, cfg.train2_dir)
+
+    train_jpgs = list_jpg(train_folder)
+    valid_jpgs = list_jpg(valid_folder)
+    test_jpgs  = list_jpg(test_folder)
+
+    assert len(train_jpgs) > 0 and len(valid_jpgs) > 0 and len(test_jpgs) > 0, "Empty dataset folder(s)."
+
+    # ---- run dir (timestamp)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join("runs", cfg.exp_name, stamp)
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    ensure_dir(run_dir); ensure_dir(ckpt_dir)
+
+    # save config for reproducibility
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(asdict(cfg), f, indent=2)
+
+    print("[U1] Train:", len(train_jpgs), "Valid:", len(valid_jpgs), "Test:", len(test_jpgs))
+    print("[U1] Run dir:", run_dir)
+
+    ds_tr = PatchDS(train_jpgs, cfg)
+    dl_tr = torch.utils.data.DataLoader(
+        ds_tr, batch_size=cfg.batch, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=True
+    )
+
+    model = ResUNet(in_ch=1, out_ch=1, base=cfg.base, groups=cfg.gn_groups).to(cfg.device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    best_score = -1.0  # use VALID AP
+    rows = []
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        losses = []
+        for I, Y in dl_tr:
+            I = I.to(cfg.device)
+            Y = Y.to(cfg.device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(I)
+            loss = bce_dice_loss(logits, Y)
+            loss.backward()
+            opt.step()
+            losses.append(float(loss.item()))
+        train_loss = float(np.mean(losses))
+
+        # VALID evaluation (full images)
+        val_m = eval_and_collect(model, valid_jpgs, cfg, cfg.device)
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_m["loss"],
+            "val_ap": val_m["ap"],
+            "val_softdice": val_m["softdice"],
+            "val_dice05": val_m["dice05"],
+            "val_bestF1": val_m["best_f1"],
+            "val_bestThr": val_m["best_thr"],
+        }
+        rows.append(row)
+
+        # save last
+        torch.save({
+            "model": model.state_dict(),
+            "cfg": asdict(cfg),
+            "epoch": epoch,
+            "val_metric": val_m,
+        }, os.path.join(ckpt_dir, "unet1_last.pth"))
+
+        # save best by VALID AP
+        if val_m["ap"] > best_score:
+            best_score = val_m["ap"]
+            torch.save({
+                "model": model.state_dict(),
+                "cfg": asdict(cfg),
+                "epoch": epoch,
+                "val_metric": val_m,
+            }, os.path.join(ckpt_dir, "unet1_best.pth"))
+
+            # best-time paper outputs (so even if crash later, results exist)
+            save_paper_outputs(model, valid_jpgs, os.path.join(run_dir, "paper_u1_valid_best"), cfg, cfg.device, tag=f"U1_ep{epoch:03d}")
+            save_paper_outputs(model, test_jpgs,  os.path.join(run_dir, "paper_u1_test_best"),  cfg, cfg.device, tag=f"U1_ep{epoch:03d}")
+
+        print(
+            f"[U1][{epoch:03d}] train_loss={train_loss:.4f} "
+            f"val_loss={val_m['loss']:.4f} val_ap={val_m['ap']:.4f} "
+            f"val_softdice={val_m['softdice']:.4f} val_dice05={val_m['dice05']:.4f} "
+            f"val_bestF1={val_m['best_f1']:.4f}@{val_m['best_thr']:.2f}"
+        )
+
+    # ---- logs/plots
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(run_dir, "unet1_log.csv"), index=False)
+
+    # separate df for plot convenience
+    plot_curves(df[["epoch","train_loss"]], df.rename(columns={
+        "val_loss":"val_loss","val_ap":"val_ap","val_softdice":"val_softdice"
+    }), os.path.join(run_dir, "unet1_curves.png"), "U-Net1")
+    plot_scatter(df[["train_loss"]], df.rename(columns={"val_ap":"val_ap"}), os.path.join(run_dir, "unet1_scatter_loss_vs_valAP.png"))
+
+    # ---- load BEST and export final outputs + TRAIN_2 creation
+    ckpt = torch.load(os.path.join(ckpt_dir, "unet1_best.pth"), map_location=cfg.device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    save_paper_outputs(model, valid_jpgs, os.path.join(run_dir, "paper_u1_valid"), cfg, cfg.device, tag="U1")
+    save_paper_outputs(model, test_jpgs,  os.path.join(run_dir, "paper_u1_test"),  cfg, cfg.device, tag="U1")
+
+    # create TRAIN_2 from VALID using best U1
+    create_train2_from_valid(model, valid_jpgs, cfg, cfg.device, train2_folder)
+
+    print("[U1] Done.")
+    print("[U1] Artifacts:", run_dir)
+    print("[U1] TRAIN_2 created at:", train2_folder)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
 New Train U-net1
 
 import os, glob, json, math, random, hashlib
