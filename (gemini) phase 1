@@ -1,1 +1,99 @@
-zzz
+ver1
+import cv2
+import numpy as np
+
+def process_expert_label(label_img):
+    """
+    흰 바탕에 붉은 선인 라벨에서 Boundary와 Grain Area를 분리
+    """
+    # 1. 붉은색 선(Boundary)만 추출
+    # 흰색(255,255,255)과 붉은색(255,0,0)을 구분하기 위해 채널별 조건 부여
+    # Red는 200 이상, Green과 Blue는 100 이하인 영역
+    red_line = (label_img[:,:,2] > 200) & (label_img[:,:,1] < 100) & (label_img[:,:,0] < 100)
+    boundary = red_line.astype(np.uint8) * 255
+    
+    # 2. Grain 영역(Area) 정의
+    # 붉은 선이 아닌 모든 영역이 Grain (흰 바탕 부분)
+    # 하지만 Connected Components를 위해 선이 0, 배경이 255인 이미지가 필요
+    grain_mask = cv2.bitwise_not(boundary)
+    
+    return boundary, grain_mask
+
+# --- generate_augmented_patches 함수 내부에 적용될 부분 ---
+for s_path, l_path in zip(sem_paths, label_paths):
+    sem = cv2.imread(s_path, cv2.IMREAD_GRAYSCALE)[:896, :] / 255.0
+    label_bgr = cv2.imread(l_path)[:896, :, :] # OpenCV는 BGR로 읽음 (0:B, 1:G, 2:R)
+    
+    # 보정된 라벨 처리 함수 호출
+    boundary, grain_mask = process_expert_label(label_bgr)
+    
+    # 개별 Grain 분리 (Connected Component Labeling)
+    num_labels, labels = cv2.connectedComponents(grain_mask)
+    
+    # 이후 Grain별 평균 Intensity 계산 및 합성 로직은 동일...
+
+
+
+ver0
+import cv2
+import numpy as np
+import os
+
+def generate_augmented_patches(sem_paths, label_paths, save_dir):
+    # 메타 데이터 제외 영역 설정
+    H, W = 896, 1280
+    patch_size = 384
+    stride = 48
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. 기초 데이터 로드 및 분리 (Flattened Grain & Background)
+    flattened_list = []
+    bg_pattern_list = []
+    area_mask_list = []
+
+    for s_path, l_path in zip(sem_paths, label_paths):
+        sem = cv2.imread(s_path, cv2.IMREAD_GRAYSCALE)[:H, :] / 255.0
+        label = cv2.imread(l_path)[:H, :, :]
+        
+        # Grain Area 추출 및 내부 채우기 (Line=0, Area=1)
+        boundary = (label[:,:,2] > 200).astype(np.uint8)
+        grain_mask = cv2.bitwise_not(boundary * 255)
+        num_labels, labels = cv2.connectedComponents(grain_mask)
+        
+        flat_img = np.zeros_like(sem)
+        for i in range(1, num_labels):
+            m = labels == i
+            flat_img[m] = np.mean(sem[m])
+            
+        flattened_list.append(flat_img)
+        bg_pattern_list.append(sem - flat_img)
+        area_mask_list.append((labels > 0).astype(np.float32))
+
+    # 2. 14x14 조합 및 패치 생성
+    patch_idx = 0
+    for i in range(14): # Flattened Grain 선택
+        for j in range(14): # Background Pattern 선택
+            # 합성 영상 생성
+            synth_img = np.clip(flattened_list[i] + bg_pattern_list[j], 0, 1)
+            target_mask = area_mask_list[i]
+            
+            # 패치 슬라이딩
+            for y in range(0, H - patch_size + 1, stride):
+                for x in range(0, W - patch_size + 1, stride):
+                    img_patch = synth_img[y:y+patch_size, x:x+patch_size]
+                    mask_patch = target_mask[y:y+patch_size, x:x+patch_size]
+                    
+                    # 4방향 회전 증강
+                    for k in range(4):
+                        aug_img = np.rot90(img_patch, k)
+                        aug_mask = np.rot90(mask_patch, k)
+                        
+                        # 저장 (훈련 효율을 위해 npy 권장)
+                        np.save(f"{save_dir}/img_{patch_idx}.npy", aug_img)
+                        np.save(f"{save_dir}/mask_{patch_idx}.npy", aug_mask)
+                        patch_idx += 1
+    print(f"Total patches generated: {patch_idx}")
+
+
+
