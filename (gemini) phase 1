@@ -3,6 +3,44 @@ import numpy as np
 import os
 from tqdm import tqdm
 
+def generate_valid_patches(base_dir):
+    """
+    VALID SET용 패치 생성: 증강 없이 원본 이미지와 라벨 1:1 매칭
+    """
+    H_VALID, W_VALID = 896, 1280
+    PATCH_SIZE = 384
+    STRIDE = 192 # 검증용이므로 조금 더 넓게 잡아도 됩니다 (속도 향상)
+    
+    save_dir = os.path.join(base_dir, "VALID_PATCHES")
+    os.makedirs(save_dir, exist_ok=True)
+    
+    sem_files = sorted([f for f in os.listdir(base_dir) if f.lower().endswith('.jpg')])
+    
+    patch_idx = 0
+    for s_file in sem_files:
+        basename = os.path.splitext(s_file)[0]
+        l_file = basename + ".png"
+        
+        # 이미지 로드 및 전처리 (CLAHE 적용 권장)
+        sem_img = cv2.imread(os.path.join(base_dir, s_file), cv2.IMREAD_GRAYSCALE)[:H_VALID, :]
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        sem_norm = clahe.apply(sem_img) / 255.0
+        
+        label_bgr = cv2.imread(os.path.join(base_dir, l_file))[:H_VALID, :, :]
+        _, grain_mask = process_expert_label(label_bgr) # 기존에 만든 함수 사용
+        target_mask = (grain_mask > 0).astype(np.float32)
+        
+        # 패치 생성
+        for y in range(0, H_VALID - PATCH_SIZE + 1, STRIDE):
+            for x in range(0, W_VALID - PATCH_SIZE + 1, STRIDE):
+                img_p = sem_norm[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+                mask_p = target_mask[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+                
+                np.save(os.path.join(save_dir, f"val_{patch_idx:04d}_img.npy"), img_p.astype(np.float32))
+                np.save(os.path.join(save_dir, f"val_{patch_idx:04d}_mask.npy"), mask_p.astype(np.float32))
+                patch_idx += 1
+    print(f"Validation patches created: {patch_idx}")
+
 def process_expert_label(label_img):
     """
     흰 바탕(255,255,255)에 붉은 선(255,0,0)인 라벨 처리.
