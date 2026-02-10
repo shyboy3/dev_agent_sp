@@ -5,39 +5,46 @@ from tqdm import tqdm
 
 def process_expert_label(label_img):
     """
-    흰 바탕(255,255,255)에 붉은 선(255,0,0)인 라벨에서 Boundary와 Grain Area를 분리.
-    OpenCV는 BGR 순서로 읽으므로 (0:B, 1:G, 2:R) 임을 주의.
+    흰 바탕(255,255,255)에 붉은 선(255,0,0)인 라벨 처리.
+    OpenCV BGR 기준: (0:Blue, 1:Green, 2:Red)
     """
-    # 붉은 선 추출: Red 채널은 높고 Green/Blue 채널은 낮은 영역
+    # 붉은 선(Boundary) 추출: Red는 높고 나머지는 낮은 영역
     red_line = (label_img[:,:,2] > 200) & (label_img[:,:,1] < 100) & (label_img[:,:,0] < 100)
     boundary = red_line.astype(np.uint8) * 255
     
-    # Grain Area: 선이 0(검정), Grain 내부가 255(흰색)인 마스크
+    # Grain Area: 선이 0, 내부가 255인 마스크
     grain_mask = cv2.bitwise_not(boundary)
     return boundary, grain_mask
 
-def generate_augmented_dataset(sem_dir, label_dir, save_dir):
+def generate_augmented_dataset(base_dir):
     # 설정값
-    H_VALID, W_VALID = 896, 1280 # 메타 영역 제외 크기
+    H_VALID, W_VALID = 896, 1280
     PATCH_SIZE = 384
     STRIDE = 48
     
-    os.makedirs(save_dir, exist_ok=True)
-    
-    sem_files = sorted([f for f in os.listdir(sem_dir) if f.endswith('.jpg')])
-    label_files = sorted([f for f in os.listdir(label_dir) if f.endswith('.png')])
+    # SEM(jpg) 파일 목록 추출 후 파일명(basename)으로 정렬
+    sem_files = sorted([f for f in os.listdir(base_dir) if f.lower().endswith('.jpg')])
     
     flattened_list = []
     bg_pattern_list = []
     target_mask_list = []
 
-    print("Step 1: Analyzing 14 base images and labels...")
-    for s_file, l_file in zip(sem_files, label_files):
-        # 이미지 로드 및 Crop
-        sem = cv2.imread(os.path.join(sem_dir, s_file), cv2.IMREAD_GRAYSCALE)[:H_VALID, :] / 255.0
-        label_bgr = cv2.imread(os.path.join(label_dir, l_file))[:H_VALID, :, :]
+    print(f"Step 1: Analyzing {len(sem_files)} base images from {base_dir}...")
+    
+    for s_file in sem_files:
+        basename = os.path.splitext(s_file)[0]
+        l_file = basename + ".png"  # 확장자만 png로 교체
         
-        # 라벨 처리
+        l_path = os.path.join(base_dir, l_file)
+        if not os.path.exists(l_path):
+            print(f"Warning: Label file {l_file} not found. Skipping...")
+            continue
+            
+        # 이미지 로드 및 메타 영역 제거 (896x1280)
+        sem = cv2.imread(os.path.join(base_dir, s_file), cv2.IMREAD_GRAYSCALE)[:H_VALID, :] / 255.0
+        label_bgr = cv2.imread(l_path)[:H_VALID, :, :]
+        
+        # 라벨에서 Grain 추출
         _, grain_mask = process_expert_label(label_bgr)
         
         # 개별 Grain 분리 및 Intensity Flattening
@@ -50,35 +57,38 @@ def generate_augmented_dataset(sem_dir, label_dir, save_dir):
                 flat_img[m] = np.mean(sem[m])
         
         flattened_list.append(flat_img)
-        bg_pattern_list.append(sem - flat_img) # 배경 패턴 (노이즈/텍스처)
-        target_mask_list.append((labels > 0).astype(np.float32)) # Target: Grain=1, Line=0
+        bg_pattern_list.append(sem - flat_img)
+        target_mask_list.append((labels > 0).astype(np.float32))
 
     print("Step 2: Generating 14x14 Synthesis and Patches...")
+    # 증강 데이터가 저장될 하위 폴더 생성 (관리 용이성 위해 base_dir 내부에 생성)
+    save_dir = os.path.join(base_dir, "AUGMENTED_PATCHES")
+    os.makedirs(save_dir, exist_ok=True)
+    
     patch_idx = 0
-    # 14x14 조합 (A의 구조 + B의 배경 패턴)
-    for i in tqdm(range(len(flattened_list)), desc="Outer Loop (Structure)"):
+    # 14x14 조합 루프
+    for i in tqdm(range(len(flattened_list)), desc="Synthesizing"):
         for j in range(len(bg_pattern_list)):
-            # 합성 영상 생성 (Grain 내부 불균일성 억제 + 자연스러운 노이즈 합성)
             synth_img = np.clip(flattened_list[i] + bg_pattern_list[j], 0, 1)
             target_mask = target_mask_list[i]
             
-            # 패치 생성 루프
+            # 패치 슬라이딩
             for y in range(0, H_VALID - PATCH_SIZE + 1, STRIDE):
                 for x in range(0, W_VALID - PATCH_SIZE + 1, STRIDE):
-                    img_patch = synth_img[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
-                    mask_patch = target_mask[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+                    img_p = synth_img[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+                    mask_p = target_mask[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
                     
-                    # 90도 단위 회전 증강 (0, 90, 180, 270도)
+                    # 90, 180, 270도 회전
                     for k in range(4):
-                        aug_img = np.rot90(img_patch, k)
-                        aug_mask = np.rot90(mask_patch, k)
+                        aug_img = np.rot90(img_p, k)
+                        aug_mask = np.rot90(mask_p, k)
                         
-                        # 파일 저장 (추후 DataLoader에서 쉽게 로드 가능)
-                        np.save(os.path.join(save_dir, f"img_{patch_idx:06d}.npy"), aug_img.astype(np.float32))
-                        np.save(os.path.join(save_dir, f"mask_{patch_idx:06d}.npy"), aug_mask.astype(np.float32))
+                        # .npy 파일로 저장
+                        np.save(os.path.join(save_dir, f"patch_{patch_idx:06d}_img.npy"), aug_img.astype(np.float32))
+                        np.save(os.path.join(save_dir, f"patch_{patch_idx:06d}_mask.npy"), aug_mask.astype(np.float32))
                         patch_idx += 1
 
-    print(f"Success! Total {patch_idx} patches saved in {save_dir}")
+    print(f"Success! {patch_idx} patches saved in {save_dir}")
 
-# 실행 예시
-# generate_augmented_dataset('TRAIN_SEM_IMAGE', 'TRAIN_SEM_IMAGE', 'PROCESSED_PATCHES')
+# 실행: 경로만 넣어주면 됩니다.
+# generate_augmented_dataset('TRAIN_SEM_IMAGE')
