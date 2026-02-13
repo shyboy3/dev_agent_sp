@@ -3,6 +3,112 @@ Phase 5
 import torch
 import cv2
 import numpy as np
+import os
+import matplotlib.pyplot as plt
+from skimage import measure, segmentation
+from scipy import stats
+
+# [이전에 정의한 ResUNet_Deep 및 StandardUNet 클래스가 정의되어 있어야 합니다]
+
+def process_label_to_grain(label_path, H=896):
+    """ 전문가 라벨 이미지에서 Grain 영역(Area=1)만 추출 """
+    label_bgr = cv2.imread(label_path)[:H, :, :]
+    red_line = (label_bgr[:,:,2] > 200) & (label_bgr[:,:,1] < 100) & (label_bgr[:,:,0] < 100)
+    grain_mask = cv2.bitwise_not(red_line.astype(np.uint8) * 255)
+    return (grain_mask > 0).astype(np.uint8)
+
+def analyze_grain_sizes(mask, title=""):
+    """ 마스크에서 Grain별 크기를 추출 (경계에 걸린 것 제외) """
+    # 1. 라벨링
+    labels = measure.label(mask)
+    # 2. 이미지 경계에 닿은 객체 제거 (중요: 손실 없는 Grain만 측정)
+    cleared = segmentation.clear_border(labels)
+    # 3. 각 Grain의 면적(pixel) 계산
+    props = measure.regionprops(cleared)
+    areas = [p.area for p in props if p.area > 50] # 너무 작은 노이즈 제거
+    return areas
+
+def run_iterative_inference(sem_path, model1, model2, iterations=20):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    H, W = 896, 1280
+    
+    # 전처리
+    raw_img = cv2.imread(sem_path, cv2.IMREAD_GRAYSCALE)[:H, :]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(26, 18)) # 48x48 타일 반영
+    img_norm = clahe.apply(raw_img) / 255.0
+    input_tensor = torch.FloatTensor(img_norm).unsqueeze(0).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        # Step 1: Unet1 추론 (초안)
+        current_mask = torch.sigmoid(model1(input_tensor))
+        
+        # Step 2: Unet2 반복 추론
+        for i in range(iterations):
+            combined = torch.cat([input_tensor, current_mask], dim=1)
+            current_mask = torch.sigmoid(model2(combined))
+            
+    final_mask = (current_mask.cpu().numpy()[0, 0] > 0.5).astype(np.uint8)
+    return final_mask
+
+def visualize_results(gt_areas, pred_areas):
+    """ 정답과 예측의 크기 분포 비교 시각화 """
+    plt.figure(figsize=(15, 6))
+    
+    # 1. 히스토그램 비교
+    plt.subplot(1, 2, 1)
+    plt.hist(gt_areas, bins=30, alpha=0.5, label='Expert (GT)', color='blue')
+    plt.hist(pred_areas, bins=30, alpha=0.5, label='AI (Unet1+Unet2)', color='red')
+    plt.title("Grain Size Distribution")
+    plt.xlabel("Area (pixels)")
+    plt.ylabel("Frequency")
+    plt.legend()
+    
+    # 2. 통계 요약 비교 (Boxplot)
+    plt.subplot(1, 2, 2)
+    plt.boxplot([gt_areas, pred_areas], labels=['Expert', 'AI Model'])
+    plt.title("Grain Size Range & Median")
+    plt.ylabel("Area (pixels)")
+    
+    plt.tight_layout()
+    plt.show()
+
+    # 3. 텍스트 요약 출력
+    print(f"\n--- Statistics Summary ---")
+    print(f"Expert: Count={len(gt_areas)}, Mean={np.mean(gt_areas):.1f}, Std={np.std(gt_areas):.1f}")
+    print(f"AI Model: Count={len(pred_areas)}, Mean={np.mean(pred_areas):.1f}, Std={np.std(pred_areas):.1f}")
+    t_stat, p_val = stats.ttest_ind(gt_areas, pred_areas)
+    print(f"T-test p-value: {p_val:.4f} (0.05 이상이면 통계적으로 유의미한 차이 없음)")
+
+# --- 메인 실행 흐름 ---
+if __name__ == "__main__":
+    # 모델 로드 (경로를 실제 환경에 맞게 수정하세요)
+    u1_path = './train_results/train_unet1/best_model.pth'
+    u2_path = './train_results/train_unet2/unet2_final.pth'
+    test_img = './TEST_SEM_IMAGE/Test_Sem_img.jpg'
+    test_label = './TEST_SEM_IMAGE/Test_label_img.png'
+
+    device = torch.device('cuda')
+    m1 = ResUNet_Deep().to(device); m1.load_state_dict(torch.load(u1_path))
+    m2 = StandardUNet().to(device); m2.load_state_dict(torch.load(u2_path))
+
+    # 1. 추론 실행 (Unet2 20회 반복)
+    print("Running iterative refinement...")
+    pred_mask = run_iterative_inference(test_img, m1, m2, iterations=20)
+    
+    # 2. 정답 데이터 로드
+    gt_mask = process_label_to_grain(test_label)
+
+    # 3. Grain 크기 분석
+    gt_areas = analyze_grain_sizes(gt_mask, "Expert")
+    pred_areas = analyze_grain_sizes(pred_mask, "AI Model")
+
+    # 4. 시각화
+    visualize_results(gt_areas, pred_areas)
+
+
+import torch
+import cv2
+import numpy as np
 import matplotlib.pyplot as plt
 from skimage import measure, segmentation
 from scipy import stats
