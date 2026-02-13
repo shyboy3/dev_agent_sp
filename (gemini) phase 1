@@ -1,20 +1,142 @@
-class DiceBCELoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(DiceBCELoss, self).__init__()
+# GUI의 setup_ui 부분에 추가할 내용
+ttk.Label(control_frame, text="Threshold (T):").pack(side=tk.LEFT, padx=5)
+self.thresh_var = tk.DoubleVar(value=0.5) # 기본값 0.5
+ttk.Entry(control_frame, textvariable=self.thresh_var, width=5).pack(side=tk.LEFT, padx=5)
 
-    def forward(self, inputs, targets, smooth=1):
-        inputs = torch.sigmoid(inputs)       
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-        
-        intersection = (inputs * targets).sum()                            
-        dice_loss = 1 - (2.*intersection + smooth)/(inputs.sum() + targets.sum() + smooth)  
-        BCE = nn.functional.binary_cross_entropy(inputs, targets, reduction='mean')
-        
-        return BCE + dice_loss # BCE와 Dice를 합쳐서 사용
+# run_analysis 내부의 마스크 생성 부분 수정
+T = self.thresh_var.get()
+line_mask = (current_mask_t.cpu().numpy()[0, 0] > T).astype(np.uint8)
 
-# 학습 코드에서 교체
-criterion = DiceBCELoss()
+
+
+Overlay 효과: 필요하다면 ax3.imshow(self.raw_img, cmap='gray') 후 ax3.imshow(pred_grain_mask, alpha=0.5)를 추가하여 원본 대비 정확도를 체크할 수 있습니다.
+	
+
+신규 페이즈5
+
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import filedialog, ttk
+from skimage import measure, segmentation
+
+class GrainAnalyzerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SEM Grain Analysis Expert System")
+        self.root.geometry("1400x900")
+        
+        # --- 분석용 변수 ---
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model1 = None
+        self.model2 = None
+        self.raw_img = None
+        self.img_norm = None
+        self.gt_mask = None
+        
+        self.setup_ui()
+
+    def setup_ui(self):
+        # 상단 제어판
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(control_frame, text="Load Models (U1 & U2)", command=self.load_models).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="Load Test Image & Label", command=self.load_data).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="Iterations (N):").pack(side=tk.LEFT, padx=5)
+        self.iter_var = tk.IntVar(value=20)
+        ttk.Entry(control_frame, textvariable=self.iter_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(control_frame, text="▶ Run Analysis", command=self.run_analysis).pack(side=tk.LEFT, padx=20)
+
+        # 메인 캔버스 (Matplotlib 통합)
+        self.fig = plt.figure(figsize=(12, 8))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def load_models(self):
+        # 사용자님의 ResUNet_Deep 및 StandardUNet 클래스를 임포트한다고 가정
+        u1_path = filedialog.askopenfilename(title="Select Unet1 Model (.pth)")
+        u2_path = filedialog.askopenfilename(title="Select Unet2 Model (.pth)")
+        
+        if u1_path and u2_path:
+            # 모델 초기화 및 로드 (클래스 정의가 미리 되어 있어야 함)
+            self.model1 = ResUNet_Deep().to(self.device)
+            self.model1.load_state_dict(torch.load(u1_path))
+            self.model1.eval()
+            
+            self.model2 = StandardUNet().to(self.device)
+            self.model2.load_state_dict(torch.load(u2_path))
+            self.model2.eval()
+            print("Models loaded successfully.")
+
+    def load_data(self):
+        img_path = filedialog.askopenfilename(title="Select Test SEM Image")
+        label_path = filedialog.askopenfilename(title="Select Test Label Image")
+        
+        if img_path and label_path:
+            # 원본 및 전처리
+            self.raw_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)[:896, :]
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(26, 18))
+            self.img_norm = clahe.apply(self.raw_img) / 255.0
+            
+            # 정답 라벨 (Expert) - 선을 면으로 반전
+            label_bgr = cv2.imread(label_path)[:896, :, :]
+            red_line = (label_bgr[:,:,2] > 200) & (label_bgr[:,:,1] < 100) & (label_bgr[:,:,0] < 100)
+            self.gt_mask = cv2.bitwise_not(red_line.astype(np.uint8) * 255) // 255
+            print("Data loaded successfully.")
+
+    def run_analysis(self):
+        if self.model1 is None or self.img_norm is None: return
+
+        # 1. Iterative Inference (Line Detection)
+        N = self.iter_var.get()
+        input_t = torch.FloatTensor(self.img_norm).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            current_mask_t = torch.sigmoid(self.model1(input_t))
+            for _ in range(N):
+                combined = torch.cat([input_t, current_mask_t], dim=1)
+                current_mask_t = torch.sigmoid(self.model2(combined))
+        
+        # 2. 결과 처리 (Line -> Grain 반전)
+        line_mask = (current_mask_t.cpu().numpy()[0, 0] > 0.5).astype(np.uint8)
+        # 선을 면으로 반전 (중요!)
+        pred_grain_mask = cv2.bitwise_not(line_mask * 255) // 255
+        
+        # 3. 통계 계산
+        gt_areas = self.get_areas(self.gt_mask)
+        pred_areas = self.get_areas(pred_grain_mask)
+        
+        # 4. 시각화
+        self.fig.clear()
+        ax1 = self.fig.add_subplot(2, 3, 1); ax1.imshow(self.raw_img, cmap='gray'); ax1.set_title("Original SEM")
+        ax2 = self.fig.add_subplot(2, 3, 2); ax2.imshow(line_mask, cmap='gray'); ax2.set_title(f"AI Detected Lines (N={N})")
+        ax3 = self.fig.add_subplot(2, 3, 3); ax3.imshow(pred_grain_mask, cmap='jet'); ax3.set_title("Final Grain Inversion")
+        
+        ax4 = self.fig.add_subplot(2, 3, 4)
+        ax4.hist(gt_areas, bins=30, alpha=0.5, label='Expert'); ax4.hist(pred_areas, bins=30, alpha=0.5, label='AI')
+        ax4.legend(); ax4.set_title("Size Distribution")
+        
+        ax5 = self.fig.add_subplot(2, 3, 5)
+        ax5.boxplot([gt_areas, pred_areas], labels=['Expert', 'AI']); ax5.set_title("Area Comparison")
+        
+        self.canvas.draw()
+
+    def get_areas(self, mask):
+        labels = measure.label(mask)
+        cleared = segmentation.clear_border(labels)
+        return [p.area for p in measure.regionprops(cleared) if p.area > 50]
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GrainAnalyzerGUI(root)
+    root.mainloop()
+
 
 
 Phase 5
