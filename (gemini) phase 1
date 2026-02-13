@@ -1,41 +1,20 @@
-def train_unet2(patch_dir):
-    # ... (모델, 옵티마이저 설정 부분 동일) ...
+class DiceBCELoss(nn.Module):
+    def __init__(self, weight=None, size_average=True):
+        super(DiceBCELoss, self).__init__()
 
-    num_epochs = 100
-    history = []
-    best_train_loss = float('inf')  # 가장 낮은 Train Loss를 추적하기 위한 변수
-
-    print(f"Starting Unet2 Training: {len(dataset)} patches found.")
-
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = 0
-        for imgs, masks in tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            imgs, masks = imgs.to(device), masks.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(imgs), masks)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / len(loader)
-        history.append({'epoch': epoch+1, 'loss': avg_loss})
+    def forward(self, inputs, targets, smooth=1):
+        inputs = torch.sigmoid(inputs)       
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
         
-        # --- Best Model 저장 로직 추가 ---
-        if avg_loss < best_train_loss:
-            best_train_loss = avg_loss
-            # 가장 낮은 Train Loss를 기록한 모델 저장
-            torch.save(model.state_dict(), os.path.join(run_dir, "unet2_best_train.pth"))
-            print(f"Epoch {epoch+1}: New Best Train Loss {avg_loss:.6f} - Model Saved!")
+        intersection = (inputs * targets).sum()                            
+        dice_loss = 1 - (2.*intersection + smooth)/(inputs.sum() + targets.sum() + smooth)  
+        BCE = nn.functional.binary_cross_entropy(inputs, targets, reduction='mean')
+        
+        return BCE + dice_loss # BCE와 Dice를 합쳐서 사용
 
-        # 20 에포크마다 중간 점검용 저장 (기존 유지)
-        if (epoch + 1) % 20 == 0:
-            torch.save(model.state_dict(), os.path.join(run_dir, f"unet2_e{epoch+1}.pth"))
-
-    # 최종 결과물 저장
-    pd.DataFrame(history).to_csv(os.path.join(run_dir, "unet2_log.csv"), index=False)
-    torch.save(model.state_dict(), os.path.join(run_dir, "unet2_final.pth"))
-
+# 학습 코드에서 교체
+criterion = DiceBCELoss()
 
 
 Phase 5
