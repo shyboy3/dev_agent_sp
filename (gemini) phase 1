@@ -1,3 +1,134 @@
+Phae 4
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+from datetime import datetime
+import pandas as pd
+from tqdm import tqdm
+
+# 1. Unet2 전용 Standard UNet (입력 2채널, Up-sampling에 BN 포함)
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, use_bn=True):
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        ]
+        if use_bn:
+            layers.insert(1, nn.BatchNorm2d(out_channels))
+            layers.insert(4, nn.BatchNorm2d(out_channels))
+        self.conv = nn.Sequential(*layers)
+        self.dropout = nn.Dropout2d(p=0.15) # Unet1의 경험 반영
+
+    def forward(self, x):
+        return self.dropout(self.conv(x))
+
+class StandardUNet(nn.Module):
+    def __init__(self, in_channels=2, out_channels=1, filters=64):
+        super().__init__()
+        # Encoder (과거 경험을 살려 BN 생략 가능하나, 2채널 특성상 안정성을 위해 추가 권장)
+        self.enc1 = ConvBlock(in_channels, filters, use_bn=True)
+        self.enc2 = ConvBlock(filters, filters*2, use_bn=True)
+        self.enc3 = ConvBlock(filters*2, filters*4, use_bn=True)
+        self.enc4 = ConvBlock(filters*4, filters*8, use_bn=True)
+        self.pool = nn.MaxPool2d(2)
+        self.bridge = ConvBlock(filters*8, filters*16, use_bn=True)
+        
+        # Decoder (반드시 BN 포함하여 잡음 억제)
+        self.up4 = nn.ConvTranspose2d(filters*16, filters*8, kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(filters*16, filters*8, use_bn=True)
+        self.up3 = nn.ConvTranspose2d(filters*8, filters*4, kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(filters*8, filters*4, use_bn=True)
+        self.up2 = nn.ConvTranspose2d(filters*4, filters*2, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(filters*4, filters*2, use_bn=True)
+        self.up1 = nn.ConvTranspose2d(filters*2, filters, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(filters*2, filters, use_bn=True)
+        
+        self.final = nn.Conv2d(filters, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        s1 = self.enc1(x)
+        s2 = self.enc2(self.pool(s1))
+        s3 = self.enc3(self.pool(s2))
+        s4 = self.enc4(self.pool(s3))
+        b = self.bridge(self.pool(s4))
+        d4 = self.dec4(torch.cat([self.up4(b), s4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), s3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), s2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), s1], dim=1))
+        return self.final(d1)
+
+# 2. Dataset 및 DataLoader (Stride 48로 생성된 npy 로드)
+class Unet2Dataset(Dataset):
+    def __init__(self, patch_dir):
+        self.patch_dir = patch_dir
+        self.img_files = sorted([f for f in os.listdir(patch_dir) if f.endswith('_img.npy')])
+
+    def __len__(self): return len(self.img_files)
+
+    def __getitem__(self, idx):
+        img = np.load(os.path.join(self.patch_dir, self.img_files[idx])) # (2, 384, 384)
+        mask = np.load(os.path.join(self.patch_dir, self.img_files[idx].replace('_img.npy', '_mask.npy')))
+        return torch.from_numpy(img).float(), torch.from_numpy(mask).float().unsqueeze(0)
+
+# 3. 학습 루프
+def train_unet2(patch_dir):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    run_dir = f"./train_results/train_unet2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(run_dir, exist_ok=True)
+
+    # 49GB VRAM 활용: 배치 사이즈를 32 정도로 넉넉히 설정
+    dataset = Unet2Dataset(patch_dir)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=0) # 윈도우 에러 방지
+
+    model = StandardUNet().to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    
+    # 데이터가 1,200여 개로 적으므로 에포크는 100회 정도 권장
+    num_epochs = 100
+    history = []
+
+    print(f"Starting Unet2 Training: {len(dataset)} patches found.")
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+        for imgs, masks in tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            imgs, masks = imgs.to(device), masks.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(imgs), masks)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(loader)
+        history.append({'epoch': epoch+1, 'loss': avg_loss})
+        print(f"Loss: {avg_loss:.4f}")
+
+        if (epoch + 1) % 20 == 0:
+            torch.save(model.state_dict(), os.path.join(run_dir, f"unet2_e{epoch+1}.pth"))
+
+    pd.DataFrame(history).to_csv(os.path.join(run_dir, "unet2_log.csv"), index=False)
+    torch.save(model.state_dict(), os.path.join(run_dir, "unet2_final.pth"))
+
+if __name__ == "__main__":
+    train_unet2('./VALID_SEM_IMAGE/UNET2_PATCHES')
+
+
+
+
+
+
+
+신규 우넷 구조
+
 import torch
 import torch.nn as nn
 
