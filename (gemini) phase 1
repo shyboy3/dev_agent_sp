@@ -1,3 +1,103 @@
+Phase 5
+
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import measure, segmentation
+from scipy import stats
+
+def run_final_paper_visualization(sem_path, label_path, model1, model2, iterations=20):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    H, W = 896, 1280
+    
+    # 1. 원본 및 전처리 데이터 준비
+    raw_img = cv2.imread(sem_path, cv2.IMREAD_GRAYSCALE)[:H, :]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(26, 18))
+    img_norm = clahe.apply(raw_img) / 255.0
+    
+    # 2. AI 추론 (Unet1 + Unet2 Iterative Refinement)
+    input_tensor = torch.FloatTensor(img_norm).unsqueeze(0).unsqueeze(0).to(device)
+    with torch.no_grad():
+        current_mask_t = torch.sigmoid(model1(input_tensor))
+        for _ in range(iterations):
+            combined = torch.cat([input_tensor, current_mask_t], dim=1)
+            current_mask_t = torch.sigmoid(model2(combined))
+    
+    pred_mask = (current_mask_t.cpu().numpy()[0, 0] > 0.5).astype(np.uint8)
+    
+    # 3. 정답(Expert) 데이터 처리
+    gt_mask = process_label_to_grain(label_path, H) # 기존 정의 함수
+    
+    # 4. Grain 통계 분석 (경계 삭제 포함)
+    gt_areas = analyze_grain_sizes(gt_mask)
+    pred_areas = analyze_grain_sizes(pred_mask)
+    
+    # --- 시각화 시작 (2행 3열 레이아웃) ---
+    fig = plt.figure(figsize=(20, 12))
+    plt.suptitle(f"Phase 5: Grain Segmentation Analysis (Unet2 Iterations: {iterations})", fontsize=20, y=0.95)
+
+    # (Row 1, Col 1) Original SEM
+    ax1 = fig.add_subplot(2, 3, 1)
+    ax1.imshow(raw_img, cmap='gray')
+    ax1.set_title("1. Original SEM Image", fontsize=14)
+    ax1.axis('off')
+
+    # (Row 1, Col 2) Preprocessed (CLAHE)
+    ax2 = fig.add_subplot(2, 3, 2)
+    ax2.imshow(img_norm, cmap='gray')
+    ax2.set_title("2. Preprocessed SEM (CLAHE)", fontsize=14)
+    ax2.axis('off')
+
+    # (Row 1, Col 3) Expert Mask (Ground Truth)
+    # 전문가 라벨과 원본을 겹쳐서 보여줌 (Overlay)
+    ax3 = fig.add_subplot(2, 3, 3)
+    ax3.imshow(raw_img, cmap='gray')
+    ax3.imshow(gt_mask, cmap='jet', alpha=0.4)
+    ax3.set_title("3. Expert's Grain Mask (GT Overlay)", fontsize=14)
+    ax3.axis('off')
+
+    # (Row 2, Col 1) AI Model Mask (Final Result)
+    ax4 = fig.add_subplot(2, 3, 4)
+    ax4.imshow(raw_img, cmap='gray')
+    ax4.imshow(pred_mask, cmap='hot', alpha=0.4)
+    ax4.set_title("4. AI Model's Grain Mask (Overlay)", fontsize=14)
+    ax4.axis('off')
+
+    # (Row 2, Col 2) Size Distribution Histogram
+    ax5 = fig.add_subplot(2, 3, 5)
+    ax5.hist(gt_areas, bins=30, alpha=0.6, label='Expert', color='blue')
+    ax5.hist(pred_areas, bins=30, alpha=0.6, label='AI Model', color='red')
+    ax5.set_title("5. Grain Size Distribution", fontsize=14)
+    ax5.set_xlabel("Area (pixels)")
+    ax5.set_ylabel("Frequency")
+    ax5.legend()
+
+    # (Row 2, Col 3) Statistics Boxplot & T-test
+    ax6 = fig.add_subplot(2, 3, 6)
+    ax6.boxplot([gt_areas, pred_areas], labels=['Expert', 'AI Model'])
+    t_stat, p_val = stats.ttest_ind(gt_areas, pred_areas)
+    ax6.set_title(f"6. Grain Size Spread (p-value: {p_val:.4f})", fontsize=14)
+    ax6.set_ylabel("Area (pixels)")
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.92])
+    
+    # 논문용 고해상도 저장
+    plt.savefig("Final_Analysis_Figure.png", dpi=300)
+    plt.show()
+
+    # 텍스트 리포트
+    print(f"\n[Final Report]")
+    print(f"- Expert Grain Count: {len(gt_areas)} (Mean: {np.mean(gt_areas):.2f})")
+    print(f"- AI Model Grain Count: {len(pred_areas)} (Mean: {np.mean(pred_areas):.2f})")
+
+
+
+
+
+
+
+
 Phae 4
 
 import torch
