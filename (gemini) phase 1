@@ -1,3 +1,178 @@
+뉴 페이즈5
+
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import filedialog, ttk
+from skimage import measure, segmentation, morphology
+
+# ----------------------------------------------------------------
+# 1. 모델 구조 정의 (사용자님의 클래스 정의로 대체하세요)
+# ----------------------------------------------------------------
+# 여기서는 예시로 구조만 남깁니다. 실제 학습 시 사용한 클래스를 꼭 확인하세요.
+class ResUNet_Deep(nn.Module):
+    # 실제 Unet1 구조 코드를 여기에 삽입
+    pass
+
+class StandardUNet(nn.Module):
+    # 실제 Unet2 구조 코드를 여기에 삽입
+    pass
+
+# ----------------------------------------------------------------
+# 2. 메인 GUI 클래스
+# ----------------------------------------------------------------
+class GrainExpertSystem:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SEM 결정립 분석 통합 시스템 (Boundary-Centric)")
+        self.root.geometry("1600x950")
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.u1, self.u2 = None, None
+        self.img_norm, self.gt_grain_mask = None, None
+        self.raw_img = None
+        
+        self.setup_ui()
+
+    def setup_ui(self):
+        # 제어판
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(control_frame, text="파일 로드 (U1, U2, IMG, LBL)", command=self.load_all_files).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="Iterations (N):").pack(side=tk.LEFT, padx=5)
+        self.iter_var = tk.IntVar(value=5)
+        ttk.Entry(control_frame, textvariable=self.iter_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="Threshold (T):").pack(side=tk.LEFT, padx=5)
+        self.thresh_var = tk.DoubleVar(value=0.5)
+        ttk.Entry(control_frame, textvariable=self.thresh_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(control_frame, text="▶ 분석 실행", command=self.run_full_analysis, style='Accent.TButton').pack(side=tk.LEFT, padx=20)
+
+        # 그래프 영역
+        self.fig = plt.figure(figsize=(15, 10))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def load_all_files(self):
+        # 경로 선택
+        u1_p = filedialog.askopenfilename(title="Unet1 (Best Val) 선택")
+        u2_p = filedialog.askopenfilename(title="Unet2 선택")
+        im_p = filedialog.askopenfilename(title="테스트 SEM 이미지 선택")
+        lb_p = filedialog.askopenfilename(title="전문가 라벨 이미지 선택")
+        
+        if not all([u1_p, u2_p, im_p, lb_p]): return
+
+        try:
+            # 1. 모델 로드
+            self.u1 = ResUNet_Deep().to(self.device)
+            self.u1.load_state_dict(torch.load(u1_p))
+            self.u1.eval()
+
+            self.u2 = StandardUNet().to(self.device)
+            self.u2.load_state_dict(torch.load(u2_p))
+            self.u2.eval()
+
+            # 2. 이미지 로드 및 CLAHE 전처리
+            self.raw_img = cv2.imread(im_p, cv2.IMREAD_GRAYSCALE)[:896, :]
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            self.img_norm = clahe.apply(self.raw_img) / 255.0
+
+            # 3. 전문가 라벨 로드 (검은색 배경에 빨간 선 가정)
+            lbl_bgr = cv2.imread(lb_p)[:896, :, :]
+            # BGR에서 Gray로 변환 후, 배경(0)이 아닌 부분(선) 추출
+            lbl_gray = cv2.cvtColor(lbl_bgr, cv2.COLOR_BGR2GRAY)
+            _, boundary_mask = cv2.threshold(lbl_gray, 10, 255, cv2.THRESH_BINARY)
+            
+            # 선(255)을 반전시켜 면(1)으로 변환
+            self.gt_grain_mask = (cv2.bitwise_not(boundary_mask) > 0).astype(np.uint8)
+            
+            print(f"로드 완료: 라벨 내 결정립 픽셀 수 = {np.sum(self.gt_grain_mask)}")
+        except Exception as e:
+            print(f"오류 발생: {e}")
+
+    def run_full_analysis(self):
+        if self.u1 is None or self.img_norm is None: return
+        
+        N = self.iter_var.get()
+        T = self.thresh_var.get()
+        input_t = torch.FloatTensor(self.img_norm).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        self.fig.clear()
+        
+        # Iteration 결과 저장용
+        line_results = []
+        
+        with torch.no_grad():
+            # Iter 0: Unet1 추론
+            prob = torch.sigmoid(self.u1(input_t))
+            line_results.append(prob.cpu().numpy()[0,0])
+            
+            # Iter 1~N: Unet2 반복 추론
+            curr_prob = prob
+            for i in range(N):
+                combined = torch.cat([input_t, curr_prob], dim=1)
+                curr_prob = torch.sigmoid(self.u2(combined))
+                line_results.append(curr_prob.cpu().numpy()[0,0])
+
+        # --- 레이아웃 그리기 ---
+        cols = 4
+        rows = (len(line_results) + 3) // cols + 1
+        
+        # 1. 각 Iteration별 선(Line) 결과 시각화
+        for i, p_map in enumerate(line_results):
+            ax = self.fig.add_subplot(rows, cols, i+1)
+            line_bin = (p_map > T).astype(np.uint8)
+            ax.imshow(line_bin, cmap='gray')
+            ax.set_title(f"Line Iter {i}")
+            ax.axis('off')
+
+        # 2. 최종 결과 반전 (Line -> Grain)
+        final_line = (line_results[-1] > T).astype(np.uint8)
+        # 선을 면으로 반전
+        final_grain = (cv2.bitwise_not(final_line * 255) > 0).astype(np.uint8)
+        
+        # 3. 최종 Grain 시각화 (컬러 라벨링)
+        ax_final = self.fig.add_subplot(rows, cols, len(line_results)+1)
+        labeled_pred = measure.label(final_grain)
+        ax_final.imshow(labeled_pred, cmap='nipy_spectral')
+        ax_final.set_title("Final Grain (AI)")
+        ax_final.axis('off')
+
+        # 4. 통계 비교 히스토그램
+        ax_hist = self.fig.add_subplot(rows, 2, rows*2-1) # 아래쪽 배치
+        gt_areas = self.calculate_areas(self.gt_grain_mask)
+        pred_areas = self.calculate_areas(final_grain)
+        
+        ax_hist.hist(gt_areas, bins=40, color='blue', alpha=0.5, label=f'Expert (n={len(gt_areas)})')
+        ax_hist.hist(pred_areas, bins=40, color='red', alpha=0.5, label=f'AI (n={len(pred_areas)})')
+        ax_hist.set_title("Grain Size Distribution")
+        ax_hist.set_xlabel("Area (px^2)")
+        ax_hist.legend()
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def calculate_areas(self, mask):
+        labels = measure.label(mask)
+        # 이미지 테두리 결정립 제거
+        cleared = segmentation.clear_border(labels)
+        return [p.area for p in measure.regionprops(cleared) if p.area > 30]
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    # 테마 설정 (선택 사항)
+    style = ttk.Style()
+    root.mainloop()
+
+
+
 페이즈5
 
 import torch
