@@ -1,3 +1,59 @@
+    def load_all_files(self):
+        # ... (경로 선택 및 모델 로드 부분은 기존과 동일) ...
+
+        try:
+            # 1. 이미지 로드 및 전처리
+            self.raw_img = cv2.imread(im_p, cv2.IMREAD_GRAYSCALE)[:896, :]
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            self.img_norm = clahe.apply(self.raw_img) / 255.0
+
+            # 2. 전문가 라벨 로드 및 붉은 선 추출 (로직 보강)
+            lbl_bgr = cv2.imread(lb_p)[:896, :, :] # OpenCV는 BGR로 읽음
+            if lbl_bgr is None:
+                print("라벨 파일을 읽을 수 없습니다.")
+                return
+
+            # [수정된 붉은 선 추출 방식]
+            # B(0), G(1), R(2) 채널 중 R이 G와 B보다 확실히 큰 영역을 선으로 인식
+            # 혹은 Gray 변환 후 Threshold를 낮게 잡는 방식 사용
+            lbl_gray = cv2.cvtColor(lbl_bgr, cv2.COLOR_BGR2GRAY)
+            
+            # 빨간색 선은 Gray로 변환해도 배경(검정)보다 밝습니다.
+            # 배경이 0이라면 10 이상의 값을 모두 선으로 간주합니다.
+            _, line_mask = cv2.threshold(lbl_gray, 10, 255, cv2.THRESH_BINARY)
+            
+            # 3. 선(255)을 반전시켜 면(1)으로 변환
+            # uint8 타입 유지를 위해 255에서 뺍니다.
+            self.gt_grain_mask = (255 - line_mask) // 255  # 이제 배경(0)->1, 선(255)->0
+            
+            # 결과 확인용 로그
+            pixel_count = np.sum(self.gt_grain_mask == 1)
+            print(f"로드 완료: Grain 픽셀 수 = {pixel_count}")
+            
+        except Exception as e:
+            print(f"오류 발생: {e}")
+
+    def run_full_analysis(self):
+        # ... (Unet1, Unet2 추론 부분 동일) ...
+        
+        # [AI 결과 처리부]
+        # prob_map: Unet2가 내뱉은 0~1 사이의 '선' 확률 지도
+        final_line_prob = line_results[-1] 
+        T = self.thresh_var.get()
+        
+        # 1. 확률 지도를 이진화 (T보다 크면 선=1, 작으면 배경=0)
+        ai_line_binary = (final_line_prob > T).astype(np.uint8) * 255
+        
+        # 2. 선(255)을 반전시켜 면(1)으로 변환 (라벨과 동일 로직)
+        ai_grain_mask = (255 - ai_line_binary) // 255
+        
+        # 3. 시각화 및 면적 계산
+        labeled_ai = measure.label(ai_grain_mask)
+        # ... (이후 시각화 및 히스토그램 출력) ...
+
+
+
+
 뉴 페이즈5
 
 import torch
