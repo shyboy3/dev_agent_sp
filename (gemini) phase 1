@@ -1,3 +1,157 @@
+페이즈5
+
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import filedialog, ttk
+from skimage import measure, segmentation, morphology
+
+# 사용자 정의 모델 클래스 임포트 (기존 정의된 클래스명을 사용하세요)
+# from model_unet import ResUNet_Deep, StandardUNet 
+
+class GrainExpertGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Unet-Boundary 기반 결정립 분석 시스템 (Iteration 비교 모드)")
+        self.root.geometry("1500x900")
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.u1 = None
+        self.u2 = None
+        self.raw_img = None
+        self.img_norm = None
+        self.gt_grain_mask = None
+        
+        self.setup_ui()
+
+    def setup_ui(self):
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(control_frame, text="1. 모델 로드", command=self.load_models).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame, text="2. 데이터 로드", command=self.load_data).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="최대 Iteration (N):").pack(side=tk.LEFT, padx=5)
+        self.iter_var = tk.IntVar(value=10)
+        ttk.Entry(control_frame, textvariable=self.iter_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="Threshold (T):").pack(side=tk.LEFT, padx=5)
+        self.thresh_var = tk.DoubleVar(value=0.5)
+        ttk.Entry(control_frame, textvariable=self.thresh_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(control_frame, text="▶ 전체 비교 실행", command=self.run_full_analysis).pack(side=tk.LEFT, padx=20)
+
+        self.fig = plt.figure(figsize=(14, 8))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def load_models(self):
+        u1_path = filedialog.askopenfilename(title="Unet1(Boundary) 가중치 선택")
+        u2_path = filedialog.askopenfilename(title="Unet2(Refine) 가중치 선택")
+        if u1_path and u2_path:
+            # 모델 인스턴스화 (사용자님의 클래스명에 맞춰 수정 필요)
+            self.u1 = ResUNet_Deep().to(self.device) 
+            self.u1.load_state_dict(torch.load(u1_path))
+            self.u1.eval()
+            self.u2 = StandardUNet().to(self.device)
+            self.u2.load_state_dict(torch.load(u2_path))
+            self.u2.eval()
+            print("모델 로드 완료.")
+
+    def load_data(self):
+        img_path = filedialog.askopenfilename(title="테스트 SEM 이미지 선택")
+        label_path = filedialog.askopenfilename(title="전문가 라벨(빨간선) 선택")
+        if img_path and label_path:
+            self.raw_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)[:896, :]
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(26, 18))
+            self.img_norm = clahe.apply(self.raw_img) / 255.0
+            
+            # 전문가 라벨 처리: 선(Red) 추출 -> 반전하여 Grain(1)으로 변환
+            label_bgr = cv2.imread(label_path)[:896, :, :]
+            red_line = (label_bgr[:,:,2] > 200) & (label_bgr[:,:,1] < 100) & (label_bgr[:,:,0] < 100)
+            self.gt_grain_mask = cv2.bitwise_not(red_line.astype(np.uint8) * 255) // 255
+            print("데이터 로드 및 정답지 생성 완료.")
+
+    def run_full_analysis(self):
+        if not self.u1 or self.img_norm is None: return
+        
+        N = self.iter_var.get()
+        T = self.thresh_var.get()
+        input_t = torch.FloatTensor(self.img_norm).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        # 1. Iteration 과정 추적
+        results = []
+        with torch.no_grad():
+            # Iteration 0: Unet1 결과만
+            prob_map = torch.sigmoid(self.u1(input_t))
+            results.append(self.post_process(prob_map, T))
+            
+            # Iteration 1 ~ N: Unet2 반복
+            for i in range(N):
+                combined = torch.cat([input_t, prob_map], dim=1)
+                prob_map = torch.sigmoid(self.u2(combined))
+                if i == N-1 or i in [0, 4, 9]: # 주요 시점 저장 (0, 5, 10회 등)
+                    results.append(self.post_process(prob_map, T))
+
+        # 2. 통계 분석 (Expert vs 최종 결과)
+        final_grain_mask = results[-1]
+        gt_areas = self.calculate_areas(self.gt_grain_mask)
+        pred_areas = self.calculate_areas(final_grain_mask)
+
+        # 3. 시각화
+        self.fig.clear()
+        
+        # (Top Row) Iteration에 따른 선 추출 변화
+        ax1 = self.fig.add_subplot(2, 4, 1); ax1.imshow(self.raw_img, cmap='gray'); ax1.set_title("Original SEM")
+        ax2 = self.fig.add_subplot(2, 4, 2); ax2.imshow(results[0], cmap='gray'); ax2.set_title("Iter 0 (Unet1)")
+        ax3 = self.fig.add_subplot(2, 4, 3); ax3.imshow(results[-1], cmap='gray'); ax3.set_title(f"Iter {N} (Final)")
+        
+        # (Bottom Row) 통계 비교
+        ax4 = self.fig.add_subplot(2, 4, 4); ax4.imshow(final_grain_mask, cmap='nipy_spectral'); ax4.set_title("Labeled Grains")
+        
+        # 히스토그램 비교
+        ax5 = self.fig.add_subplot(2, 2, 3)
+        ax5.hist(gt_areas, bins=40, color='blue', alpha=0.5, label=f'Expert (Avg:{np.mean(gt_areas):.1f})')
+        ax5.hist(pred_areas, bins=40, color='red', alpha=0.5, label=f'AI (Avg:{np.mean(pred_areas):.1f})')
+        ax5.set_xlabel("Grain Area (px^2)"); ax5.set_ylabel("Frequency")
+        ax5.set_title("Grain Size Distribution Comparison")
+        ax5.legend()
+
+        # Scatter Plot (정량적 정확도 확인용)
+        ax6 = self.fig.add_subplot(2, 2, 4)
+        ax6.boxplot([gt_areas, pred_areas], labels=['Expert', 'AI Model'])
+        ax6.set_title("Area Range (Boxplot)")
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def post_process(self, prob_tensor, T):
+        """선 확률 지도를 받아 이진화 후 면(Grain)으로 반전"""
+        line_mask = (prob_tensor.cpu().numpy()[0, 0] > T).astype(np.uint8)
+        # 작은 노이즈 제거 및 끊긴 선 연결 (Morphology)
+        line_mask = morphology.remove_small_objects(line_mask.astype(bool), min_size=10).astype(np.uint8)
+        # 선(1)을 면(1)으로 반전
+        grain_mask = cv2.bitwise_not(line_mask * 255) // 255
+        return grain_mask
+
+    def calculate_areas(self, grain_mask):
+        """Grain 면적 계산 (경계에 걸린 것 제외)"""
+        labels = measure.label(grain_mask)
+        # 이미지 테두리에 닿은 결정립은 통계에서 제외 (정확도 확보)
+        cleared = segmentation.clear_border(labels)
+        props = measure.regionprops(cleared)
+        return [p.area for p in props if p.area > 30] # 너무 작은 노이즈 면적 제외
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GrainExpertGUI(root)
+    root.mainloop()
+
+
+
 # GUI의 setup_ui 부분에 추가할 내용
 ttk.Label(control_frame, text="Threshold (T):").pack(side=tk.LEFT, padx=5)
 self.thresh_var = tk.DoubleVar(value=0.5) # 기본값 0.5
