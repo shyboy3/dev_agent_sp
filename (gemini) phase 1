@@ -1,3 +1,189 @@
+뉴뉴뉴 페이즈5
+
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import filedialog, ttk
+from skimage import measure, segmentation, morphology
+
+# ----------------------------------------------------------------
+# 1. 모델 구조 정의 (사용자님의 실제 클래스 코드를 여기에 넣으세요)
+# ----------------------------------------------------------------
+class ResUNet_Deep(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 실제 모델 구조 입력 (예시: 1ch -> 1ch)
+    def forward(self, x):
+        return x 
+
+class StandardUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 실제 모델 구조 입력 (예시: 2ch -> 1ch)
+    def forward(self, x):
+        return x
+
+# ----------------------------------------------------------------
+# 2. 메인 분석 시스템 클래스
+# ----------------------------------------------------------------
+class GrainExpertSystem:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SEM Grain Analysis System (Legacy Logic Restored)")
+        self.root.geometry("1600x950")
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.u1, self.u2 = None, None
+        self.img_norm, self.gt_grain_mask = None, None
+        self.raw_img = None
+        
+        self.setup_ui()
+
+    def setup_ui(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(control_frame, text="1. 파일 로드 (U1, U2, IMG, LBL)", command=self.load_all_files).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="Iterations (N):").pack(side=tk.LEFT, padx=5)
+        self.iter_var = tk.IntVar(value=10)
+        ttk.Entry(control_frame, textvariable=self.iter_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(control_frame, text="Delta Weight:").pack(side=tk.LEFT, padx=5)
+        self.weight_var = tk.DoubleVar(value=0.1) # 과거 로직의 weight
+        ttk.Entry(control_frame, textvariable=self.weight_var, width=5).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(control_frame, text="▶ 과거 로직 추론 실행", command=self.run_legacy_analysis).pack(side=tk.LEFT, padx=20)
+
+        self.fig = plt.figure(figsize=(15, 10))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def imread_kor(self, path, flags=cv2.IMREAD_COLOR):
+        n = np.fromfile(path, np.uint8)
+        return cv2.imdecode(n, flags)
+
+    def load_all_files(self):
+        u1_p = filedialog.askopenfilename(title="Unet1 가중치 (.pth)")
+        u2_p = filedialog.askopenfilename(title="Unet2 가중치 (.pth)")
+        im_p = filedialog.askopenfilename(title="SEM 이미지 선택")
+        lb_p = filedialog.askopenfilename(title="전문가 라벨 선택")
+        
+        if not all([u1_p, u2_p, im_p, lb_p]): return
+
+        try:
+            # 모델 로드
+            self.u1 = ResUNet_Deep().to(self.device)
+            self.u1.load_state_dict(torch.load(u1_p, map_location=self.device))
+            self.u1.eval()
+
+            self.u2 = StandardUNet().to(self.device)
+            self.u2.load_state_dict(torch.load(u2_p, map_location=self.device))
+            self.u2.eval()
+
+            # [과거 방식 전처리 적용]
+            raw = self.imread_kor(im_p, cv2.IMREAD_GRAYSCALE)[:896, :]
+            # 1. CLAHE (tileGridSize = 48, 48)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(48, 48))
+            img_clahe = clahe.apply(raw) / 255.0
+            # 2. Clipping & Scaling (0.7 기준으로 대비 증폭)
+            self.img_norm = (1/0.7) * np.clip(img_clahe, 0, 0.7)
+            self.raw_img = raw
+
+            # 라벨 로드 (면적 비교용)
+            lbl_bgr = self.imread_kor(lb_p, cv2.IMREAD_COLOR)[:896, :, :]
+            lbl_gray = cv2.cvtColor(lbl_bgr, cv2.COLOR_BGR2GRAY)
+            _, boundary = cv2.threshold(lbl_gray, 10, 255, cv2.THRESH_BINARY)
+            self.gt_grain_mask = (255 - boundary) // 255
+            
+            print(f"과거 로직 전처리 완료. Grain 픽셀 수: {np.sum(self.gt_grain_mask)}")
+        except Exception as e:
+            print(f"로드 실패: {e}")
+
+    def run_legacy_analysis(self):
+        if self.u1 is None or self.img_norm is None: return
+        
+        N = self.iter_var.get()
+        W = self.weight_var.get()
+        img_t = torch.FloatTensor(self.img_norm).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        self.fig.clear()
+        all_steps = [] # 각 단계 마스크 저장용
+
+        with torch.no_grad():
+            # [Line 4-6] Unet1 추론 및 반전 (선 -> 면)
+            out1 = torch.sigmoid(self.u1(img_t))
+            out1_bin = (out1 / torch.max(out1) > 0.5).float()
+            out1_tmp = 1.0 - out1_bin # 면 정보로 변환
+
+            # [Line 7-9] Initial Unet2 Inference
+            input2 = torch.cat([img_t, out1_tmp], dim=1)
+            out2_init = torch.sigmoid(self.u2(input2))
+            out2_init = (out2_init > 0.5).float()
+            all_steps.append(out2_init.cpu().numpy()[0,0])
+
+            # [Line 10-17] Iterative Unet2 Inference
+            curr_out2 = out2_init
+            for i in range(N):
+                input_iter = torch.cat([img_t, curr_out2], dim=1)
+                out_next = torch.sigmoid(self.u2(input_iter))
+                
+                # 델타 가중치 업데이트 (Line 14-15)
+                delta = out_next - curr_out2
+                out_fin = out_next + W * delta
+                out_fin = torch.clamp(out_fin, 0, 1)
+                
+                # 후처리 (Line 13)
+                out_np = out_fin.cpu().numpy()[0,0]
+                out_clean = morphology.remove_small_objects(out_np > 0.5, min_size=100).astype(np.float32)
+                
+                curr_out2 = torch.FloatTensor(out_clean).unsqueeze(0).unsqueeze(0).to(self.device)
+                all_steps.append(out_clean)
+
+        # --- 시각화 ---
+        cols = 4
+        rows = (len(all_steps) + 3) // cols + 1
+        
+        for i, step_img in enumerate(all_steps):
+            ax = self.fig.add_subplot(rows, cols, i+1)
+            ax.imshow(step_img, cmap='gray')
+            ax.set_title(f"Iter {i}")
+            ax.axis('off')
+
+        # 통계 비교 히스토그램
+        ax_hist = self.fig.add_subplot(rows, 2, rows*2-1)
+        gt_areas = self.calculate_areas(self.gt_grain_mask)
+        pred_areas = self.calculate_areas(all_steps[-1])
+        
+        ax_hist.hist(gt_areas, bins=30, color='blue', alpha=0.5, label='Expert')
+        ax_hist.hist(pred_areas, bins=30, color='red', alpha=0.5, label='AI (Legacy)')
+        ax_hist.set_title(f"Legacy Logic Result (Expert Avg: {np.mean(gt_areas):.1f})")
+        ax_hist.legend()
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def calculate_areas(self, mask):
+        labels = measure.label(mask > 0.5)
+        cleared = segmentation.clear_border(labels)
+        return [p.area for p in measure.regionprops(cleared) if p.area > 50]
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    style = ttk.Style()
+    style.theme_use('clam')
+    app = GrainExpertSystem(root)
+    root.mainloop()
+
+
+
 뉴뉴 페이즈5
 
 import torch
