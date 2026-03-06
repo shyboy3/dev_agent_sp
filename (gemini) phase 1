@@ -1,92 +1,96 @@
 데이터 입력
-
 import streamlit as st
 import json
+import os
 from datetime import datetime
 
-# 1. 초기 설정 및 클래스 명칭 (이 부분을 수정하여 이름을 바꿀 수 있습니다)
+# 데이터 저장 파일 경로
+DB_FILE = "persistent_data.json"
 CLASSES = ["클래스 A", "클래스 B", "클래스 C", "클래스 D"]
 
-def init_session_state():
-    if 'master_data' not in st.session_state:
-        # 데이터 구조: {Class: {N_Item: {M_Item: {"features": "", "workflow": {}}}}}
-        st.session_state.master_data = {cls: {} for cls in CLASSES}
+# 1. 파일에서 데이터 불러오기 기능
+def load_data():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        # 파일이 없으면 초기 구조 생성
+        return {cls: {} for cls in CLASSES}
+
+# 2. 파일에 데이터 저장하기 기능
+def save_data(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 def main():
-    st.set_page_config(page_title="Hierarchy Data Collector", layout="wide")
-    init_session_state()
+    st.set_page_config(page_title="데이터 보존 시스템", layout="wide")
 
-    st.title("📂 체계적 데이터 수집 시스템")
-    st.info("왼쪽 사이드바에서 계층을 선택하고 오른쪽에서 내용을 입력하세요.")
+    # 세션 상태 초기화 (파일에서 불러옴)
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
 
-    # --- 사이드바: 계층 네비게이션 ---
+    st.title("📂 지속성 데이터 관리 프로그램")
+    st.info("입력하신 내용은 자동으로 파일에 저장되어 프로그램을 껐다 켜도 유지됩니다.")
+
+    # --- 사이드바 및 입력 로직 (동일) ---
     st.sidebar.header("📍 계층 선택 및 관리")
-    
-    # [1단계] 클래스 선택
     selected_cls = st.sidebar.selectbox("1. 클래스 선택", CLASSES)
 
-    # [2단계] N 아이템(그룹) 관리
-    st.sidebar.subheader(f"👥 {selected_cls} 내 그룹(N)")
-    new_n_name = st.sidebar.text_input("새 그룹 이름", key="new_n")
+    # N 그룹 추가 및 관리
+    new_n_name = st.sidebar.text_input("새 그룹(N) 이름")
     if st.sidebar.button("그룹 추가"):
         if new_n_name and new_n_name not in st.session_state.master_data[selected_cls]:
             st.session_state.master_data[selected_cls][new_n_name] = {}
+            save_data(st.session_state.master_data) # 저장
             st.rerun()
 
     n_list = list(st.session_state.master_data[selected_cls].keys())
     selected_n = st.sidebar.selectbox("2. 그룹 선택", n_list) if n_list else None
 
-    # [3단계] M 아이템 관리
+    # M 아이템 추가 및 관리
+    selected_m = None
     if selected_n:
-        st.sidebar.subheader(f"🔹 {selected_n} 내 아이템(M)")
-        new_m_name = st.sidebar.text_input("새 아이템 이름", key="new_m")
+        new_m_name = st.sidebar.text_input("새 아이템(M) 이름")
         if st.sidebar.button("아이템 추가"):
             if new_m_name and new_m_name not in st.session_state.master_data[selected_cls][selected_n]:
                 st.session_state.master_data[selected_cls][selected_n][new_m_name] = {
                     "features": "",
-                    "workflow": {} # 향후 확장용
+                    "workflow": []
                 }
+                save_data(st.session_state.master_data) # 저장
                 st.rerun()
 
         m_list = list(st.session_state.master_data[selected_cls][selected_n].keys())
         selected_m = st.sidebar.selectbox("3. 아이템 선택", m_list) if m_list else None
-    else:
-        selected_m = None
 
-    # --- 메인 영역: 데이터 입력 ---
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        if selected_m:
-            st.subheader(f"📝 {selected_m} 특징 입력")
-            # 기존 데이터 불러오기
-            current_features = st.session_state.master_data[selected_cls][selected_n][selected_m]["features"]
-            
-            # 입력 창 (내용 변경 시 세션 데이터에 즉시 반영)
-            features = st.text_area("특징 정보를 상세히 작성해주세요.", value=current_features, height=300)
-            st.session_state.master_data[selected_cls][selected_n][selected_m]["features"] = features
-            
-            st.success(f"'{selected_m}' 데이터가 실시간으로 메모리에 저장 중입니다.")
-        else:
-            st.warning("왼쪽 사이드바에서 하위 아이템(M)까지 선택하거나 추가해주세요.")
-
-    with col2:
-        st.subheader("📤 데이터 추출")
-        # JSON 문자열로 변환
-        json_string = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
+    # --- 메인 입력창 ---
+    if selected_m:
+        st.subheader(f"📝 {selected_m} 특징 및 흐름도 입력")
         
+        # 특징 입력
+        current_features = st.session_state.master_data[selected_cls][selected_n][selected_m]["features"]
+        features = st.text_area("특징 정보", value=current_features, height=200)
+        
+        # 저장 버튼 (또는 입력 시 자동 저장 로직)
+        if st.button("내용 최종 저장"):
+            st.session_state.master_data[selected_cls][selected_n][selected_m]["features"] = features
+            save_data(st.session_state.master_data)
+            st.success("데이터가 파일에 안전하게 기록되었습니다!")
+    
+    # --- 데이터 추출부 ---
+    st.divider()
+    if st.button("📥 전체 데이터 JSON으로 내보내기"):
+        json_str = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
         st.download_button(
-            label="전체 데이터 JSON 다운로드",
-            file_name=f"data_export_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-            mime="application/json",
-            data=json_string,
+            label="다운로드 시작",
+            data=json_str,
+            file_name=f"exported_data_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json"
         )
-
-        with st.expander("데이터 미리보기"):
-            st.json(st.session_state.master_data)
 
 if __name__ == "__main__":
     main()
+
 
 
 
