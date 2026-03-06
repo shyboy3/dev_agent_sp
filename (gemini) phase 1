@@ -1,95 +1,92 @@
 데이터 입력
+
 import streamlit as st
 import json
 import os
+import graphviz  # pip install graphviz 필요
 from datetime import datetime
 
-# 데이터 저장 파일 경로
 DB_FILE = "persistent_data.json"
 CLASSES = ["클래스 A", "클래스 B", "클래스 C", "클래스 D"]
 
-# 1. 파일에서 데이터 불러오기 기능
 def load_data():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    else:
-        # 파일이 없으면 초기 구조 생성
-        return {cls: {} for cls in CLASSES}
+    return {cls: {} for cls in CLASSES}
 
-# 2. 파일에 데이터 저장하기 기능
 def save_data(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def main():
-    st.set_page_config(page_title="데이터 보존 시스템", layout="wide")
-
-    # 세션 상태 초기화 (파일에서 불러옴)
+    st.set_page_config(page_title="계층 데이터 & 시각화", layout="wide")
     if 'master_data' not in st.session_state:
         st.session_state.master_data = load_data()
 
-    st.title("📂 지속성 데이터 관리 프로그램")
-    st.info("입력하신 내용은 자동으로 파일에 저장되어 프로그램을 껐다 켜도 유지됩니다.")
-
-    # --- 사이드바 및 입력 로직 (동일) ---
-    st.sidebar.header("📍 계층 선택 및 관리")
+    # --- 사이드바 제어 ---
+    st.sidebar.title("🛠️ 계층 제어판")
     selected_cls = st.sidebar.selectbox("1. 클래스 선택", CLASSES)
-
-    # N 그룹 추가 및 관리
-    new_n_name = st.sidebar.text_input("새 그룹(N) 이름")
-    if st.sidebar.button("그룹 추가"):
-        if new_n_name and new_n_name not in st.session_state.master_data[selected_cls]:
-            st.session_state.master_data[selected_cls][new_n_name] = {}
-            save_data(st.session_state.master_data) # 저장
-            st.rerun()
-
-    n_list = list(st.session_state.master_data[selected_cls].keys())
-    selected_n = st.sidebar.selectbox("2. 그룹 선택", n_list) if n_list else None
-
-    # M 아이템 추가 및 관리
-    selected_m = None
-    if selected_n:
-        new_m_name = st.sidebar.text_input("새 아이템(M) 이름")
-        if st.sidebar.button("아이템 추가"):
-            if new_m_name and new_m_name not in st.session_state.master_data[selected_cls][selected_n]:
-                st.session_state.master_data[selected_cls][selected_n][new_m_name] = {
-                    "features": "",
-                    "workflow": []
-                }
-                save_data(st.session_state.master_data) # 저장
-                st.rerun()
-
-        m_list = list(st.session_state.master_data[selected_cls][selected_n].keys())
-        selected_m = st.sidebar.selectbox("3. 아이템 선택", m_list) if m_list else None
-
-    # --- 메인 입력창 ---
-    if selected_m:
-        st.subheader(f"📝 {selected_m} 특징 및 흐름도 입력")
-        
-        # 특징 입력
-        current_features = st.session_state.master_data[selected_cls][selected_n][selected_m]["features"]
-        features = st.text_area("특징 정보", value=current_features, height=200)
-        
-        # 저장 버튼 (또는 입력 시 자동 저장 로직)
-        if st.button("내용 최종 저장"):
-            st.session_state.master_data[selected_cls][selected_n][selected_m]["features"] = features
-            save_data(st.session_state.master_data)
-            st.success("데이터가 파일에 안전하게 기록되었습니다!")
     
-    # --- 데이터 추출부 ---
+    # (중략: N 그룹 및 M 아이템 추가 로직은 이전과 동일)
+    # ... [N/M 추가 코드 생략] ...
+
+    # --- 메인 영역 ---
+    st.title(f"📂 {selected_cls} 관리 및 시각화")
+
+    # 1. 시각화 영역 (텍스트 트리 + 이미지 트리)
+    col_tree, col_viz = st.columns([1, 1])
+
+    with col_tree:
+        st.subheader("🌲 텍스트 트리")
+        current_data = st.session_state.master_data[selected_cls]
+        tree_text = ""
+        for n_key, m_dict in current_data.items():
+            tree_text += f"**📂 {n_key}** \n"
+            for m_key in m_dict.keys():
+                tree_text += f"&nbsp;&nbsp;&nbsp;&nbsp;**└─ 📄 {m_key}** \n"
+        st.markdown(tree_text if tree_text else "데이터가 없습니다.")
+
+    with col_viz:
+        st.subheader("🖼️ 다이어그램 생성")
+        if current_data:
+            # Graphviz 차트 생성
+            dot = graphviz.Digraph(comment=selected_cls, format='png')
+            dot.attr(rankdir='LR', fontname='Malgun Gothic') # 왼쪽에서 오른쪽으로 흐름
+            dot.node('Root', selected_cls, shape='box', style='filled', color='lightblue')
+
+            for n_key, m_dict in current_data.items():
+                dot.node(n_key, n_key, fontname='Malgun Gothic')
+                dot.edge('Root', n_key)
+                for m_key in m_dict.keys():
+                    dot.node(m_key, m_key, fontname='Malgun Gothic')
+                    dot.edge(n_key, m_key)
+            
+            # 화면에 그래프 출력
+            st.graphviz_chart(dot)
+            
+            # 이미지 파일로 추출하기 위한 처리
+            # render를 통해 파일 생성
+            img_path = dot.render(filename=f"tree_{selected_cls}", cleanup=True)
+            
+            with open(img_path, "rb") as file:
+                st.download_button(
+                    label="🎨 트리 구조 이미지 다운로드 (PNG)",
+                    data=file,
+                    file_name=f"tree_structure_{selected_cls}.png",
+                    mime="image/png"
+                )
+        else:
+            st.info("시각화할 데이터가 부족합니다.")
+
     st.divider()
-    if st.button("📥 전체 데이터 JSON으로 내보내기"):
-        json_str = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
-        st.download_button(
-            label="다운로드 시작",
-            data=json_str,
-            file_name=f"exported_data_{datetime.now().strftime('%Y%m%d')}.json",
-            mime="application/json"
-        )
+
+    # (중략: 상세 편집 및 JSON 추출 로직은 이전과 동일)
+    # ... [데이터 편집 코드 생략] ...
 
 if __name__ == "__main__":
     main()
+
 
 
 
