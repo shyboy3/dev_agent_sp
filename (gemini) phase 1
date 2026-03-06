@@ -3,8 +3,11 @@
 import streamlit as st
 import json
 import os
-import graphviz  # pip install graphviz 필요
+import graphviz
 from datetime import datetime
+
+# 1. 환경 변수 설정 (본인 설치 경로에 맞게 수정하세요)
+os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
 
 DB_FILE = "persistent_data.json"
 CLASSES = ["클래스 A", "클래스 B", "클래스 C", "클래스 D"]
@@ -20,69 +23,108 @@ def save_data(data):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def main():
-    st.set_page_config(page_title="계층 데이터 & 시각화", layout="wide")
+    st.set_page_config(page_title="데이터 관리 및 시각화", layout="wide")
+    
     if 'master_data' not in st.session_state:
         st.session_state.master_data = load_data()
 
-    # --- 사이드바 제어 ---
     st.sidebar.title("🛠️ 계층 제어판")
     selected_cls = st.sidebar.selectbox("1. 클래스 선택", CLASSES)
     
-    # (중략: N 그룹 및 M 아이템 추가 로직은 이전과 동일)
-    # ... [N/M 추가 코드 생략] ...
+    st.sidebar.divider()
+
+    # --- 추가 및 삭제 기능 (사이드바) ---
+    # N 그룹 관리
+    st.sidebar.subheader(f"👥 {selected_cls} 그룹(N) 관리")
+    new_n = st.sidebar.text_input("새 그룹 이름")
+    col_n1, col_n2 = st.sidebar.columns(2)
+    if col_n1.button("그룹 추가"):
+        if new_n and new_n not in st.session_state.master_data[selected_cls]:
+            st.session_state.master_data[selected_cls][new_n] = {}
+            save_data(st.session_state.master_data)
+            st.rerun()
+
+    n_list = list(st.session_state.master_data[selected_cls].keys())
+    target_n = st.sidebar.selectbox("삭제할 그룹 선택", ["선택 안 함"] + n_list)
+    if st.sidebar.button("❌ 그룹 삭제") and target_n != "선택 안 함":
+        del st.session_state.master_data[selected_cls][target_n]
+        save_data(st.session_state.master_data)
+        st.rerun()
+
+    st.sidebar.divider()
+
+    # M 아이템 관리
+    selected_n = st.sidebar.selectbox("2. 그룹(N) 선택", n_list) if n_list else None
+    if selected_n:
+        st.sidebar.subheader(f"🔹 {selected_n} 아이템(M) 관리")
+        new_m = st.sidebar.text_input("새 아이템 이름")
+        col_m1, col_m2 = st.sidebar.columns(2)
+        if col_m1.button("아이템 추가"):
+            if new_m and new_m not in st.session_state.master_data[selected_cls][selected_n]:
+                st.session_state.master_data[selected_cls][selected_n][new_m] = {"features": ""}
+                save_data(st.session_state.master_data)
+                st.rerun()
+
+        m_list = list(st.session_state.master_data[selected_cls][selected_n].keys())
+        target_m = st.sidebar.selectbox("삭제할 아이템 선택", ["선택 안 함"] + m_list)
+        if st.sidebar.button("❌ 아이템 삭제") and target_m != "선택 안 함":
+            del st.session_state.master_data[selected_cls][selected_n][target_m]
+            save_data(st.session_state.master_data)
+            st.rerun()
 
     # --- 메인 영역 ---
-    st.title(f"📂 {selected_cls} 관리 및 시각화")
+    st.title(f"📂 {selected_cls} 시각화 및 입력")
 
-    # 1. 시각화 영역 (텍스트 트리 + 이미지 트리)
-    col_tree, col_viz = st.columns([1, 1])
-
-    with col_tree:
-        st.subheader("🌲 텍스트 트리")
-        current_data = st.session_state.master_data[selected_cls]
-        tree_text = ""
-        for n_key, m_dict in current_data.items():
-            tree_text += f"**📂 {n_key}** \n"
-            for m_key in m_dict.keys():
-                tree_text += f"&nbsp;&nbsp;&nbsp;&nbsp;**└─ 📄 {m_key}** \n"
-        st.markdown(tree_text if tree_text else "데이터가 없습니다.")
-
-    with col_viz:
-        st.subheader("🖼️ 다이어그램 생성")
-        if current_data:
-            # Graphviz 차트 생성
-            dot = graphviz.Digraph(comment=selected_cls, format='png')
-            dot.attr(rankdir='LR', fontname='Malgun Gothic') # 왼쪽에서 오른쪽으로 흐름
-            dot.node('Root', selected_cls, shape='box', style='filled', color='lightblue')
-
-            for n_key, m_dict in current_data.items():
-                dot.node(n_key, n_key, fontname='Malgun Gothic')
-                dot.edge('Root', n_key)
-                for m_key in m_dict.keys():
-                    dot.node(m_key, m_key, fontname='Malgun Gothic')
-                    dot.edge(n_key, m_key)
+    # 1. 트리 시각화 (Unicode 오류 방지 로직 적용)
+    with st.expander("🌲 현재 계층 구조 이미지 보기", expanded=True):
+        if st.session_state.master_data[selected_cls]:
+            # DOT 언어로 직접 작성하여 인코딩 충돌 방지
+            dot_code = f'digraph G {{ rankdir=LR; fontname="Malgun Gothic"; node [fontname="Malgun Gothic"]; edge [fontname="Malgun Gothic"];'
+            dot_code += f'"{selected_cls}" [shape=box, style=filled, color=lightblue];'
             
-            # 화면에 그래프 출력
-            st.graphviz_chart(dot)
+            for n, ms in st.session_state.master_data[selected_cls].items():
+                dot_code += f'"{selected_cls}" -> "{n}";'
+                for m in ms.keys():
+                    dot_code += f'"{n}" -> "{m}";'
+            dot_code += '}'
             
-            # 이미지 파일로 추출하기 위한 처리
-            # render를 통해 파일 생성
-            img_path = dot.render(filename=f"tree_{selected_cls}", cleanup=True)
-            
-            with open(img_path, "rb") as file:
-                st.download_button(
-                    label="🎨 트리 구조 이미지 다운로드 (PNG)",
-                    data=file,
-                    file_name=f"tree_structure_{selected_cls}.png",
-                    mime="image/png"
-                )
+            # st.graphviz_chart에 dot 코드를 직접 전달
+            st.graphviz_chart(dot_code)
         else:
-            st.info("시각화할 데이터가 부족합니다.")
+            st.info("데이터를 추가하면 트리가 나타납니다.")
 
     st.divider()
 
-    # (중략: 상세 편집 및 JSON 추출 로직은 이전과 동일)
-    # ... [데이터 편집 코드 생략] ...
+    # 2. 아이템별 특징 입력 영역
+    if selected_n:
+        m_items = st.session_state.master_data[selected_cls][selected_n]
+        if m_items:
+            st.subheader(f"📝 {selected_n} 그룹 내 아이템 특징 입력")
+            for m_name, m_data in m_items.items():
+                with st.container():
+                    col_name, col_input = st.columns([1, 4])
+                    col_name.markdown(f"**📄 {m_name}**")
+                    
+                    # 아이템별 특징 입력 text_area
+                    feat_val = st.text_area(f"{m_name} 특징", value=m_data["features"], 
+                                            label_visibility="collapsed", key=f"feat_{selected_cls}_{selected_n}_{m_name}")
+                    
+                    # 값이 변경되었을 때 실시간 저장
+                    if feat_val != m_data["features"]:
+                        st.session_state.master_data[selected_cls][selected_n][m_name]["features"] = feat_val
+                        save_data(st.session_state.master_data)
+            
+            if st.button("💾 전체 저장 완료"):
+                save_data(st.session_state.master_data)
+                st.toast("모든 내용이 저장되었습니다!")
+        else:
+            st.warning("이 그룹에 등록된 아이템(M)이 없습니다.")
+
+    # 3. 데이터 추출
+    st.sidebar.divider()
+    if st.sidebar.button("📥 JSON 데이터 추출"):
+        final_json = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
+        st.sidebar.download_button("다운로드", final_json, "data.json", "application/json")
 
 if __name__ == "__main__":
     main()
