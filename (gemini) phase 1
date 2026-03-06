@@ -6,7 +6,7 @@ import os
 import graphviz
 from datetime import datetime
 
-# 1. 환경 변수 설정 (본인 설치 경로에 맞게 수정하세요)
+# 1. 환경 변수 설정 (설치 경로 확인 필수)
 os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
 
 DB_FILE = "persistent_data.json"
@@ -23,22 +23,20 @@ def save_data(data):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def main():
-    st.set_page_config(page_title="데이터 관리 및 시각화", layout="wide")
+    st.set_page_config(page_title="계층 데이터 마스터", layout="wide")
     
     if 'master_data' not in st.session_state:
         st.session_state.master_data = load_data()
 
+    # --- 사이드바: 관리 영역 ---
     st.sidebar.title("🛠️ 계층 제어판")
     selected_cls = st.sidebar.selectbox("1. 클래스 선택", CLASSES)
-    
     st.sidebar.divider()
 
-    # --- 추가 및 삭제 기능 (사이드바) ---
-    # N 그룹 관리
-    st.sidebar.subheader(f"👥 {selected_cls} 그룹(N) 관리")
-    new_n = st.sidebar.text_input("새 그룹 이름")
-    col_n1, col_n2 = st.sidebar.columns(2)
-    if col_n1.button("그룹 추가"):
+    # 그룹(N) 추가/삭제
+    st.sidebar.subheader(f"👥 {selected_cls} 그룹 관리")
+    new_n = st.sidebar.text_input("새 그룹 이름", key="add_n")
+    if st.sidebar.button("그룹 추가"):
         if new_n and new_n not in st.session_state.master_data[selected_cls]:
             st.session_state.master_data[selected_cls][new_n] = {}
             save_data(st.session_state.master_data)
@@ -53,13 +51,12 @@ def main():
 
     st.sidebar.divider()
 
-    # M 아이템 관리
+    # 아이템(M) 추가/삭제
     selected_n = st.sidebar.selectbox("2. 그룹(N) 선택", n_list) if n_list else None
     if selected_n:
-        st.sidebar.subheader(f"🔹 {selected_n} 아이템(M) 관리")
-        new_m = st.sidebar.text_input("새 아이템 이름")
-        col_m1, col_m2 = st.sidebar.columns(2)
-        if col_m1.button("아이템 추가"):
+        st.sidebar.subheader(f"🔹 {selected_n} 아이템 관리")
+        new_m = st.sidebar.text_input("새 아이템 이름", key="add_m")
+        if st.sidebar.button("아이템 추가"):
             if new_m and new_m not in st.session_state.master_data[selected_cls][selected_n]:
                 st.session_state.master_data[selected_cls][selected_n][new_m] = {"features": ""}
                 save_data(st.session_state.master_data)
@@ -73,61 +70,61 @@ def main():
             st.rerun()
 
     # --- 메인 영역 ---
-    st.title(f"📂 {selected_cls} 시각화 및 입력")
+    st.title(f"📂 {selected_cls} 시각화 현황")
 
-    # 1. 트리 시각화 (Unicode 오류 방지 로직 적용)
-    with st.expander("🌲 현재 계층 구조 이미지 보기", expanded=True):
+    # 1. 트리 시각화 (특징 포함)
+    with st.container():
         if st.session_state.master_data[selected_cls]:
-            # DOT 언어로 직접 작성하여 인코딩 충돌 방지
-            dot_code = f'digraph G {{ rankdir=LR; fontname="Malgun Gothic"; node [fontname="Malgun Gothic"]; edge [fontname="Malgun Gothic"];'
+            # DOT 언어 구성
+            dot_code = 'digraph G { rankdir=LR; fontname="Malgun Gothic"; node [fontname="Malgun Gothic", shape=record]; edge [fontname="Malgun Gothic"];'
             dot_code += f'"{selected_cls}" [shape=box, style=filled, color=lightblue];'
             
-            for n, ms in st.session_state.master_data[selected_cls].items():
-                dot_code += f'"{selected_cls}" -> "{n}";'
-                for m in ms.keys():
-                    dot_code += f'"{n}" -> "{m}";'
-            dot_code += '}'
+            for n_name, m_dict in st.session_state.master_data[selected_cls].items():
+                # 그룹 노드
+                dot_code += f'"{selected_cls}" -> "{n_name}";'
+                
+                for m_name, m_data in m_dict.items():
+                    # 특징 요약 (너무 길면 자름)
+                    feat_summary = (m_data["features"][:20] + '...') if len(m_data["features"]) > 20 else m_data["features"]
+                    feat_summary = feat_summary.replace('"', "'").replace('\n', ' ') # 특수문자 처리
+                    
+                    # 아이템 노드: 이름과 특징을 표 형태로 표시 (Graphviz record shape)
+                    m_node_label = f"{{ {m_name} | {feat_summary if feat_summary else '(특징 없음)'} }}"
+                    dot_code += f'"{m_name}_node" [label="{m_node_label}", color="#4f46e5"];'
+                    dot_code += f'"{n_name}" -> "{m_name}_node";'
             
-            # st.graphviz_chart에 dot 코드를 직접 전달
+            dot_code += '}'
             st.graphviz_chart(dot_code)
         else:
-            st.info("데이터를 추가하면 트리가 나타납니다.")
+            st.info("데이터를 입력하면 여기에 구조와 특징이 포함된 트리가 그려집니다.")
 
     st.divider()
 
-    # 2. 아이템별 특징 입력 영역
+    # 2. 특징 입력 섹션
     if selected_n:
+        st.subheader(f"📝 {selected_n} 그룹 상세 내용")
         m_items = st.session_state.master_data[selected_cls][selected_n]
-        if m_items:
-            st.subheader(f"📝 {selected_n} 그룹 내 아이템 특징 입력")
-            for m_name, m_data in m_items.items():
-                with st.container():
-                    col_name, col_input = st.columns([1, 4])
-                    col_name.markdown(f"**📄 {m_name}**")
-                    
-                    # 아이템별 특징 입력 text_area
-                    feat_val = st.text_area(f"{m_name} 특징", value=m_data["features"], 
-                                            label_visibility="collapsed", key=f"feat_{selected_cls}_{selected_n}_{m_name}")
-                    
-                    # 값이 변경되었을 때 실시간 저장
-                    if feat_val != m_data["features"]:
-                        st.session_state.master_data[selected_cls][selected_n][m_name]["features"] = feat_val
-                        save_data(st.session_state.master_data)
-            
-            if st.button("💾 전체 저장 완료"):
-                save_data(st.session_state.master_data)
-                st.toast("모든 내용이 저장되었습니다!")
-        else:
-            st.warning("이 그룹에 등록된 아이템(M)이 없습니다.")
+        
+        for m_name, m_data in m_items.items():
+            with st.expander(f"아이템: {m_name}", expanded=True):
+                feat_val = st.text_area("특징 입력", value=m_data["features"], 
+                                       key=f"input_{selected_cls}_{selected_n}_{m_name}", height=100)
+                
+                if feat_val != m_data["features"]:
+                    st.session_state.master_data[selected_cls][selected_n][m_name]["features"] = feat_val
+                    save_data(st.session_state.master_data)
+                    # 입력 즉시 트리 업데이트를 위해 st.rerun()을 쓸 수 있으나 
+                    # 타이핑 중 끊김 방지를 위해 저장만 하고 나중에 반영되게 함
 
-    # 3. 데이터 추출
+    # 3. 데이터 및 이미지 추출
     st.sidebar.divider()
-    if st.sidebar.button("📥 JSON 데이터 추출"):
+    if st.sidebar.button("📥 최종 데이터 JSON 추출"):
         final_json = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
-        st.sidebar.download_button("다운로드", final_json, "data.json", "application/json")
+        st.sidebar.download_button("JSON 다운로드", final_json, f"data_{datetime.now().strftime('%m%d')}.json")
 
 if __name__ == "__main__":
     main()
+
 
 
 
