@@ -1,5 +1,278 @@
 데이터 입력
 
+# ... (상단 시각화 및 로드 함수는 동일)
+
+    with col_wf:
+        st.subheader("⚙️ 워크플로우 편집기")
+        # (그룹/아이템 선택 로직 동일)
+        
+        if sel_f:
+            wf_list = current_data[sel_n][sel_m]["workflows"].get(sel_f, [])
+            
+            # --- [누락 보완 1] 수정 모드 해제 버튼 ---
+            c_header, c_reset = st.columns([3, 1])
+            c_header.write("📋 **단계 리스트 (클릭 시 수정)**")
+            if st.session_state.get('editing_step') and c_reset.button("🆕 신규 추가 모드", color="primary"):
+                if 'editing_step' in st.session_state:
+                    del st.session_state.editing_step
+                    st.rerun()
+
+            for i, s in enumerate(wf_list):
+                sc1, sc2 = st.columns([4, 1])
+                if sc1.button(f"Step {s['id']}: {s['name']}", key=f"edit_s_{i}", use_container_width=True):
+                    st.session_state.editing_step = s
+                    st.rerun()
+                if sc2.button("❌", key=f"del_s_{i}"):
+                    # --- [누락 보완 2] 삭제 시 수정 중인 상태면 초기화 ---
+                    if st.session_state.get('editing_step', {}).get('id') == s['id']:
+                        if 'editing_step' in st.session_state: del st.session_state.editing_step
+                    wf_list.pop(i)
+                    st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                    save_data(st.session_state.master_data); st.rerun()
+
+            # 수정 모드 데이터 로드
+            edit_data = st.session_state.get('editing_step', {})
+            
+            with st.form("wf_form", clear_on_submit=False):
+                form_title = f"🛠️ 단계 수정 중: {edit_data['id']}" if edit_data else "🛠️ 새 단계 추가"
+                st.write(f"**{form_title}**")
+                
+                c1, c2, c3 = st.columns([1, 2, 1])
+                # --- [누락 보완 3] 기본값 ID 추천 로직 ---
+                default_id = edit_data.get('id', f"1-{len(wf_list)+1}")
+                sid = c1.text_input("ID", value=default_id)
+                sname = c2.text_input("명칭", value=edit_data.get('name', ""))
+                sagent = c3.text_input("에이전트", value=edit_data.get('agent', ""))
+                stasks = st.text_area("Task (엔터 구분)", value="\n".join(edit_data.get('tasks', [])))
+                
+                lc1, lc2 = st.columns(2)
+                pid = lc1.text_input("부모 ID (분기 지점)", value=edit_data.get('parent_id', ""))
+                nid = lc2.text_input("Next ID (성공 시)", value=edit_data.get('next_id', ""))
+                
+                if st.form_submit_button("💾 저장 및 적용"):
+                    if not sid or not sname:
+                        st.error("ID와 명칭은 필수입니다.")
+                    else:
+                        new_step = {
+                            "id": sid, "name": sname, "agent": sagent,
+                            "tasks": [t.strip() for t in stasks.split('\n') if t.strip()],
+                            "parent_id": pid, "next_id": nid
+                        }
+                        # 업데이트 또는 추가
+                        wf_list = [s for s in wf_list if s['id'] != sid]
+                        wf_list.append(new_step)
+                        wf_list.sort(key=lambda x: str(x['id'])) # ID 기준 정렬
+                        st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                        save_data(st.session_state.master_data)
+                        if 'editing_step' in st.session_state: del st.session_state.editing_step
+                        st.rerun()
+
+# ... (하단 시각화 동일)
+
+
+
+
+
+
+import streamlit as st
+import json
+import os
+import datetime
+import textwrap
+
+# Graphviz 경로 설정
+os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
+
+DB_FILE = "integrated_agent_data.json"
+CLASSES = ["표면분석", "구조분석", "성분분석", "물성측정"]
+
+def load_data():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for cls in CLASSES:
+                    if cls not in data: data[cls] = {}
+                    for g in data[cls]:
+                        for i in list(data[cls][g].keys()):
+                            if not isinstance(data[cls][g][i], dict):
+                                data[cls][g][i] = {"features": str(data[cls][g][i]), "workflows": {}}
+                            if "workflows" not in data[cls][g][i]:
+                                data[cls][g][i]["workflows"] = {}
+                return data
+        except:
+            return {cls: {} for cls in CLASSES}
+    return {cls: {} for cls in CLASSES}
+
+def save_data(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def wrap_text(text, width=14):
+    if not text: return ""
+    return "<br/>".join(textwrap.wrap(text, width=width))
+
+# --- [시각화] 폰트 확대 및 간격 축소 ---
+def generate_main_tree(selected_cls, data):
+    dot = [
+        'digraph G { rankdir=LR; splines=ortho; nodesep=0.4; ranksep=0.8; fontname="Malgun Gothic";',
+        'node [fontname="Malgun Gothic", fontsize=12, style=filled, width=1.5, height=0.6, fixedsize=true];',
+        'edge [fontname="Malgun Gothic", arrowhead=vee, color="#7f8c8d", penwidth=1.2];'
+    ]
+    dot.append(f'  "root" [label=<{wrap_text(selected_cls)}>, shape=box, color="#1e3a8a", fontcolor=white];')
+    
+    for n_name, m_dict in data.items():
+        n_id = f"n_{hash(n_name)}"
+        dot.append(f'  "{n_id}" [label=<{wrap_text(n_name)}>, shape=parallelogram, color="#3b82f6", fontcolor=white];')
+        dot.append(f'  "root" -> "{n_id}":w;')
+        for m_name, m_data in m_dict.items():
+            m_id = f"m_{hash(n_name + m_name)}"
+            dot.append(f'  "{m_id}" [label=<{wrap_text(m_name)}>, shape=component, color="#10b981", fontcolor=white];')
+            dot.append(f'  "{n_id}" -> "{m_id}":w;')
+            feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+            for idx, feat in enumerate(feats):
+                f_id = f"f_{m_id}_{idx}"
+                has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                color = "#e67e22" if has_wf else "#f39c12"
+                dot.append(f'  "{f_id}" [label=<{wrap_text(feat, 12)}>, shape=note, color="{color}", fontcolor=white];')
+                dot.append(f'  "{m_id}" -> "{f_id}":w [style=dashed];')
+    dot.append('}')
+    return "\n".join(dot)
+
+def generate_wf_viz(steps):
+    dot = ['digraph W { rankdir=TB; splines=polyline; nodesep=0.4; ranksep=0.6; fontname="Malgun Gothic";',
+           'node [fontname="Malgun Gothic", shape=record, style=filled, width=2.2, height=0.6, fontsize=11];']
+    dot.append('  start [label="START", shape=ellipse, color="#2ecc71", fontcolor=white];')
+    
+    step_ids = [s['id'] for s in steps]
+    for s in steps:
+        s_id = f"s_{s['id'].replace('.','_').replace('-','_')}"
+        label = f"{{Step {s['id']}: {s['name']} | Agent: {s['agent']}}}"
+        dot.append(f'  {s_id} [label=<{label}>, color="#9b59b6", fontcolor=white];')
+
+    for s in steps:
+        curr_id = f"s_{s['id'].replace('.','_').replace('-','_')}"
+        if s.get('parent_id') and s['parent_id'] in step_ids:
+            parent_node = f"s_{s['parent_id'].replace('.','_').replace('-','_')}"
+            dot.append(f'  {parent_node} -> {curr_id} [color="#3498db", label="branch", fontsize=9];')
+        elif not s.get('parent_id'):
+            dot.append(f'  start -> {curr_id};')
+        if s.get('next_id') and s['next_id'] in step_ids:
+            next_node = f"s_{s['next_id'].replace('.','_').replace('-','_')}"
+            dot.append(f'  {curr_id} -> {next_node} [color=green, label="ok", fontsize=9];')
+    dot.append('}')
+    return "\n".join(dot)
+
+# --- [Main App] ---
+def main():
+    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
+
+    st.sidebar.title("🧬 Orchestration")
+    selected_cls = st.sidebar.selectbox("분석 클래스", CLASSES)
+    current_data = st.session_state.master_data[selected_cls]
+
+    # 트리 시각화
+    st.graphviz_chart(generate_main_tree(selected_cls, current_data))
+    st.divider()
+
+    col_manage, col_wf = st.columns([1, 1.4])
+
+    with col_manage:
+        st.subheader("📁 조직 계층 관리")
+        with st.expander("➕ 새 그룹 추가"):
+            new_n = st.text_input("그룹명")
+            if st.button("생성"):
+                if new_n:
+                    st.session_state.master_data[selected_cls][new_n] = {}
+                    save_data(st.session_state.master_data); st.rerun()
+
+        for n_name in list(current_data.keys()):
+            # 그룹 이름과 삭제 버튼을 한 줄에 배치
+            gc1, gc2 = st.columns([4, 1])
+            gc1.markdown(f"**📁 {n_name}**")
+            if gc2.button("🗑️", key=f"del_n_{n_name}"):
+                del st.session_state.master_data[selected_cls][n_name]
+                save_data(st.session_state.master_data); st.rerun()
+            
+            for m_name in list(current_data[n_name].keys()):
+                m_cols = st.columns([0.5, 3.5, 1])
+                m_cols[1].info(f"📄 {m_name}")
+                if m_cols[2].button("🗑️", key=f"del_m_{n_name}_{m_name}"):
+                    del st.session_state.master_data[selected_cls][n_name][m_name]
+                    save_data(st.session_state.master_data); st.rerun()
+            
+            with st.expander(f"➕ [{n_name}] 아이템 추가"):
+                new_m = st.text_input("아이템 명칭", key=f"in_m_{n_name}")
+                if st.button("추가", key=f"btn_m_{n_name}"):
+                    st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflows": {}}
+                    save_data(st.session_state.master_data); st.rerun()
+            st.divider()
+
+    with col_wf:
+        st.subheader("⚙️ 워크플로우 편집기")
+        sel_n = st.selectbox("그룹", list(current_data.keys())) if current_data else None
+        if sel_n:
+            sel_m = st.selectbox("아이템", list(current_data[sel_n].keys()))
+            if sel_m:
+                feat_str = current_data[sel_n][sel_m].get("features", "")
+                f_list = [f.strip() for f in feat_str.replace('\n',';').split(';') if f.strip()]
+                sel_f = st.selectbox("설계 특징 선택", f_list) if f_list else None
+                
+                if sel_f:
+                    wf_list = current_data[sel_n][sel_m]["workflows"].get(sel_f, [])
+                    
+                    # --- [스텝 수정/삭제 UI] ---
+                    st.write("📋 **단계 리스트 (클릭 시 수정)**")
+                    for i, s in enumerate(wf_list):
+                        sc1, sc2 = st.columns([4, 1])
+                        if sc1.button(f"Step {s['id']}: {s['name']} (Agent: {s['agent']})", key=f"edit_s_{i}"):
+                            st.session_state.editing_step = s
+                        if sc2.button("❌", key=f"del_s_{i}"):
+                            wf_list.pop(i)
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                            save_data(st.session_state.master_data); st.rerun()
+
+                    # 수정 모드 데이터 로드
+                    edit_data = st.session_state.get('editing_step', {})
+                    
+                    with st.form("wf_form", clear_on_submit=True):
+                        st.write("🛠️ **단계 상세 설정**" if not edit_data else f"🛠️ **단계 수정 중: {edit_data['id']}**")
+                        c1, c2, c3 = st.columns([1, 2, 1])
+                        sid = c1.text_input("ID", value=edit_data.get('id', f"1-{len(wf_list)+1}"))
+                        sname = c2.text_input("명칭", value=edit_data.get('name', ""))
+                        sagent = c3.text_input("에이전트", value=edit_data.get('agent', ""))
+                        stasks = st.text_area("Task (엔터 구분)", value="\n".join(edit_data.get('tasks', [])))
+                        
+                        lc1, lc2, lc3 = st.columns(3)
+                        pid = lc1.text_input("부모 ID (분기)", value=edit_data.get('parent_id', ""))
+                        nid = lc2.text_input("Next ID", value=edit_data.get('next_id', ""))
+                        
+                        if st.form_submit_button("💾 저장/적용"):
+                            new_step = {
+                                "id": sid, "name": sname, "agent": sagent,
+                                "tasks": stasks.split('\n'), "parent_id": pid, "next_id": nid
+                            }
+                            # ID 기준 업데이트 혹은 추가
+                            wf_list = [s for s in wf_list if s['id'] != sid]
+                            wf_list.append(new_step)
+                            wf_list.sort(key=lambda x: x['id'])
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                            save_data(st.session_state.master_data)
+                            if 'editing_step' in st.session_state: del st.session_state.editing_step
+                            st.rerun()
+                    
+                    if wf_list: st.graphviz_chart(generate_wf_viz(wf_list))
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
 import streamlit as st
 import json
 import os
