@@ -1,11 +1,66 @@
-f_list = [f.strip() for f in new_feat_str.replace('\n',';').split(';') if f.strip()]
-if f_list:
-    sel_f = st.selectbox(
-        "설계할 특징 선택", 
-        f_list,
-        # 화면에만 경로를 모두 붙여서 보여주는 센스!
-        format_func=lambda f_name: f"📁 {sel_n} ➔ 📄 {sel_m} ➔ 🎯 {f_name}"
-    )
+def generate_main_tree(selected_cls, data):
+    dot = [
+        'digraph G { rankdir=LR; splines=polyline; nodesep=0.5; ranksep=1.0; fontname="Malgun Gothic";',
+        'node [fontname="Malgun Gothic", fontsize=11, style=filled, width=1.5, height=0.5, fixedsize=true];',
+        'edge [fontname="Malgun Gothic", arrowhead=vee, color="#7f8c8d", penwidth=1.2];'
+    ]
+    
+    # --- 💡 [신규 추가] 상단 헤더(타이틀) 노드 생성 ---
+    # 도형 테두리를 없애고(plaintext) 글자만 굵게 표시합니다.
+    dot.append('  // Headers')
+    dot.append('  node [shape=plaintext, style="", fontcolor="#333333", fontsize=14, width=1.5, height=0.3];')
+    dot.append('  "H_Class" [label=<<b>[ 클래스 ]</b>>];')
+    dot.append('  "H_Group" [label=<<b>[ 그룹(N) ]</b>>];')
+    dot.append('  "H_Item" [label=<<b>[ 아이템(M) ]</b>>];')
+    dot.append('  "H_Feature" [label=<<b>[ 특징(Feature) ]</b>>];')
+    
+    # 헤더끼리 보이지 않는 선으로 연결해서 1, 2, 3, 4열의 순서를 강제합니다.
+    dot.append('  edge [style=invis];')
+    dot.append('  "H_Class" -> "H_Group" -> "H_Item" -> "H_Feature";')
+    
+    # 다시 실제 데이터를 그리기 위해 노드/엣지 스타일을 원래대로 복구합니다.
+    dot.append('  node [shape=box, style=filled, fontcolor=white, fontsize=11, width=1.5, height=0.5, fixedsize=true];')
+    dot.append('  edge [style=solid, arrowhead=vee, color="#7f8c8d", penwidth=1.2];')
+    # --------------------------------------------------
+
+    # 루트 노드 (클래스)
+    dot.append(f'  "root" [label=<{wrap_text(selected_cls)}>, color="#1e3a8a"];')
+    
+    # 💡 [핵심] 첫 번째 헤더와 루트 노드의 열(Rank)을 동일하게 맞춤
+    dot.append('  { rank=same; "H_Class"; "root"; }')
+
+    # 각 계층의 첫 번째 노드 ID를 기억해둘 변수
+    first_n, first_m, first_f = None, None, None
+
+    for n_name, m_dict in data.items():
+        n_id = f"n_{hash(n_name)}"
+        if not first_n: first_n = n_id # 첫 번째 그룹 기록
+        dot.append(f'  "{n_id}" [label=<{wrap_text(n_name)}>, shape=parallelogram, color="#3b82f6"];')
+        dot.append(f'  "root" -> "{n_id}";')
+        
+        for m_name, m_data in m_dict.items():
+            m_id = f"m_{hash(n_name + m_name)}"
+            if not first_m: first_m = m_id # 첫 번째 아이템 기록
+            dot.append(f'  "{m_id}" [label=<{wrap_text(m_name)}>, shape=component, color="#10b981"];')
+            dot.append(f'  "{n_id}" -> "{m_id}";')
+            
+            feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+            for idx, feat in enumerate(feats):
+                f_id = f"f_{m_id}_{idx}"
+                if not first_f: first_f = f_id # 첫 번째 특징 기록
+                has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                color = "#e67e22" if has_wf else "#f39c12"
+                dot.append(f'  "{f_id}" [label=<{wrap_text(feat, 12)}>, shape=note, color="{color}"];')
+                dot.append(f'  "{m_id}" -> "{f_id}" [style=dashed];')
+
+    # 💡 [핵심] 기록해둔 각 계층의 첫 번째 노드들을 상단 헤더와 같은 열(Rank)로 묶어줌
+    if first_n: dot.append(f'  {{ rank=same; "H_Group"; "{first_n}"; }}')
+    if first_m: dot.append(f'  {{ rank=same; "H_Item"; "{first_m}"; }}')
+    if first_f: dot.append(f'  {{ rank=same; "H_Feature"; "{first_f}"; }}')
+
+    dot.append('}')
+    return "\n".join(dot)
+
 
 
 데이터 입력
