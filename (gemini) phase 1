@@ -5,6 +5,215 @@ import json
 import os
 import datetime
 
+# Graphviz 경로 설정
+os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
+
+DB_FILE = "integrated_agent_data.json"
+CLASSES = ["표면분석", "구조분석", "성분분석", "물성측정"]
+
+# --- 1. 데이터 로드 및 마이그레이션 (호환성 유지) ---
+def load_data():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for cls in CLASSES:
+                    if cls not in data: data[cls] = {}
+                    for g in data[cls]:
+                        for i in list(data[cls][g].keys()):
+                            # 구버전(문자열) 데이터를 신규 객체 구조로 변환
+                            if not isinstance(data[cls][g][i], dict):
+                                data[cls][g][i] = {"features": str(data[cls][g][i]), "workflows": {}}
+                            if "workflows" not in data[cls][g][i]:
+                                data[cls][g][i]["workflows"] = {}
+                return data
+        except:
+            return {cls: {} for cls in CLASSES}
+    return {cls: {} for cls in CLASSES}
+
+def save_data(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+# --- 2. 시각화 엔진 (메인 트리 & 워크플로우) ---
+def generate_main_tree(selected_cls, data):
+    dot = [
+        'digraph G { rankdir=LR; splines=ortho; nodesep=0.5; ranksep=1.0; fontname="Malgun Gothic";',
+        'node [fontname="Malgun Gothic", fontsize=10, style=filled];',
+        'edge [fontname="Malgun Gothic", arrowhead=vee, color="#7f8c8d"];'
+    ]
+    dot.append(f'  "root" [label="{selected_cls}", shape=box, color="#1e3a8a", fontcolor=white];')
+    for n_name, m_dict in data.items():
+        n_id = f"n_{hash(n_name)}"
+        dot.append(f'  "{n_id}" [label="{n_name}", shape=parallelogram, color="#3b82f6", fontcolor=white];')
+        dot.append(f'  "root" -> "{n_id}":w;')
+        for m_name, m_data in m_dict.items():
+            m_id = f"m_{hash(n_name + m_name)}"
+            dot.append(f'  "{m_id}" [label="{m_name}", shape=component, color="#10b981", fontcolor=white];')
+            dot.append(f'  "{n_id}" -> "{m_id}":w;')
+            # 특징 표시
+            feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+            for idx, feat in enumerate(feats):
+                f_id = f"f_{m_id}_{idx}"
+                has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                color = "#e67e22" if has_wf else "#f39c12"
+                dot.append(f'  "{f_id}" [label="{feat}", shape=note, color="{color}", fontcolor=white];')
+                dot.append(f'  "{m_id}" -> "{f_id}":w [style=dashed];')
+    dot.append('}')
+    return "\n".join(dot)
+
+def generate_wf_viz(steps):
+    dot = ['digraph W { rankdir=TB; fontname="Malgun Gothic"; node [fontname="Malgun Gothic", shape=record, style=filled];']
+    dot.append('  start [label="START", shape=ellipse, color="#2ecc71", fontcolor=white];')
+    if steps:
+        for s in steps:
+            s_id = f"s{s['id']}"
+            tasks = "<br/>".join([f"- {t}" for t in s['tasks']])
+            label = f"{{Step {s['id']}: {s['name']} | {tasks} | Agent: {s['agent']}}}"
+            dot.append(f'  {s_id} [label=<{label}>, color="#9b59b6", fontcolor=white];')
+        dot.append(f'  start -> s{steps[0]["id"]};')
+        for s in steps:
+            if s.get('next_id'): dot.append(f'  s{s["id"]} -> s{s["next_id"]} [label="ok", color=green];')
+            else: dot.append(f'  s{s["id"]} -> end [color=green];')
+            if s.get('fail_id'): dot.append(f'  s{s["id"]} -> s{s["fail_id"]} [label="fail", color=red, style=dashed];')
+    dot.append('  end [label="END", shape=ellipse, color="#e74c3c", fontcolor=white];')
+    dot.append('}')
+    return "\n".join(dot)
+
+# --- 3. 메인 앱 로직 ---
+def main():
+    st.set_page_config(page_title="Agent Architecture Master", layout="wide")
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
+
+    st.title("🏗️ Integrated Agent Orchestration Designer")
+    selected_cls = st.sidebar.selectbox("분석 클래스 선택", CLASSES)
+    current_data = st.session_state.master_data[selected_cls]
+
+    # --- [섹션 1] 메인 시각화 ---
+    st.subheader(f"📊 {selected_cls} 조직 계층도")
+    if current_data:
+        st.graphviz_chart(generate_main_tree(selected_cls, current_data))
+    else:
+        st.warning("등록된 데이터가 없습니다. 아래에서 그룹을 추가하여 시작하세요.")
+
+    st.divider()
+
+    # --- [섹션 2] 계층 관리 (추가/삭제) ---
+    col_manage, col_workflow = st.columns([1, 1.2])
+
+    with col_manage:
+        st.subheader("📁 조직 및 계층 관리")
+        
+        # 신규 그룹 추가
+        with st.expander("➕ 새 그룹(N) 생성", expanded=not current_data):
+            new_n = st.text_input("그룹 명칭", key="new_n_input")
+            if st.button("그룹 생성"):
+                if new_n and new_n not in current_data:
+                    st.session_state.master_data[selected_cls][new_n] = {}
+                    save_data(st.session_state.master_data); st.rerun()
+
+        # 인라인 리스트 관리
+        for n_name in list(current_data.keys()):
+            with st.container():
+                c1, c2 = st.columns([4, 1])
+                c1.markdown(f"#### 📁 {n_name}")
+                if c2.button("🗑️", key=f"del_n_{n_name}"):
+                    del st.session_state.master_data[selected_cls][n_name]
+                    save_data(st.session_state.master_data); st.rerun()
+                
+                # 아이템 리스트 및 삭제
+                for m_name in list(current_data[n_name].keys()):
+                    ic1, ic2 = st.columns([4, 1])
+                    ic1.info(f"&nbsp;&nbsp;&nbsp;&nbsp;📄 {m_name}")
+                    if ic2.button("🗑️", key=f"del_m_{n_name}_{m_name}"):
+                        del st.session_state.master_data[selected_cls][n_name][m_name]
+                        save_data(st.session_state.master_data); st.rerun()
+                
+                # 아이템 추가 버튼 (그룹 바로 아래)
+                with st.expander(f"➕ [{n_name}] 아이템 추가"):
+                    new_m = st.text_input("아이템 명칭", key=f"in_m_{n_name}")
+                    if st.button("추가 완료", key=f"btn_m_{n_name}"):
+                        if new_m:
+                            st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflows": {}}
+                            save_data(st.session_state.master_data); st.rerun()
+                st.divider()
+
+    with col_workflow:
+        st.subheader("⚙️ 특징 및 워크플로우 설계")
+        # 편집 대상 선택
+        sel_n = st.selectbox("그룹 선택", list(current_data.keys()), key="sel_n") if current_data else None
+        if sel_n:
+            m_list = list(current_data[sel_n].keys())
+            sel_m = st.selectbox("아이템 선택", m_list, key="sel_m") if m_list else None
+            
+            if sel_m:
+                # 특징 입력 (세미콜론 구분)
+                curr_feat = current_data[sel_n][sel_m].get("features", "")
+                new_feat = st.text_area("특징 리스트 (세미콜론 ';' 구분)", value=curr_feat, height=80)
+                if st.button("✨ 특징 저장 및 반영"):
+                    st.session_state.master_data[selected_cls][sel_n][sel_m]["features"] = new_feat
+                    save_data(st.session_state.master_data); st.rerun()
+                
+                # 특징별 워크플로우 설계
+                feats = [f.strip() for f in new_feat.replace('\n',';').split(';') if f.strip()]
+                sel_f = st.selectbox("설계할 특징 선택", feats) if feats else None
+                
+                if sel_f:
+                    st.divider()
+                    wf_list = current_data[sel_n][sel_m]["workflows"].get(sel_f, [])
+                    
+                    # 워크플로우 스텝 추가 폼
+                    with st.form(f"wf_step_{sel_f}"):
+                        st.write(f"🎯 **[{sel_f}]** 에이전트 단계 설계")
+                        sid = st.number_input("Step ID", min_value=1, value=len(wf_list)+1)
+                        sname = st.text_input("단계 명칭")
+                        sagent = st.text_input("에이전트")
+                        stasks = st.text_area("Task 리스트 (엔터 구분)")
+                        c1, c2 = st.columns(2)
+                        next_id = c1.number_input("성공 시 Next ID", min_value=0)
+                        fail_id = c2.number_input("실패 시 Back ID", min_value=0)
+                        
+                        if st.form_submit_button("➕ 스텝 저장"):
+                            new_step = {
+                                "id": sid, "name": sname, "agent": sagent,
+                                "tasks": [t.strip() for t in stasks.split('\n') if t.strip()],
+                                "next_id": next_id if next_id > 0 else None,
+                                "fail_id": fail_id if fail_id > 0 else None
+                            }
+                            wf_list = [s for s in wf_list if s['id'] != sid]
+                            wf_list.append(new_step)
+                            wf_list.sort(key=lambda x: x['id'])
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                            save_data(st.session_state.master_data); st.rerun()
+
+                    if wf_list:
+                        st.graphviz_chart(generate_wf_viz(wf_list))
+                        if st.button("🗑️ 워크플로우 전체 삭제"):
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = []
+                            save_data(st.session_state.master_data); st.rerun()
+
+    # --- [섹션 3] 추출 ---
+    st.sidebar.divider()
+    if st.sidebar.button("📥 전체 데이터 추출 (JSON)"):
+        json_str = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
+        st.sidebar.download_button("다운로드", json_str, "agent_master_data.json")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+import streamlit as st
+import json
+import os
+import datetime
+
 # Graphviz 경로 (사용자 환경에 맞게 꼭 확인!)
 os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
 
