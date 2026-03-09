@@ -1,3 +1,30 @@
+def main():
+    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
+    
+    # 👇 [여기에 추가!] 전체 입력창 폰트와 크기를 키우는 CSS 마법
+    st.markdown("""
+        <style>
+        /* 텍스트 입력창, 텍스트 에어리어 폰트 키우기 */
+        .stTextInput input, .stTextArea textarea {
+            font-size: 16px !important;
+            padding: 10px !important;
+        }
+        /* 드롭다운(선택박스) 폰트 키우기 */
+        .stSelectbox div[data-baseweb="select"] {
+            font-size: 16px !important;
+        }
+        /* 라벨(제목) 폰트 키우기 */
+        .st-emotion-cache-10trnc2 {
+            font-size: 15px !important;
+            font-weight: bold !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # ... 기존 코드 계속 ...
+
+
+
 def generate_main_tree(selected_cls, data):
     dot = [
         'digraph G { rankdir=LR; splines=polyline; nodesep=0.5; ranksep=1.0; fontname="Malgun Gothic";',
