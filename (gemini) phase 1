@@ -1,3 +1,13 @@
+f_list = [f.strip() for f in new_feat_str.replace('\n',';').split(';') if f.strip()]
+if f_list:
+    sel_f = st.selectbox(
+        "설계할 특징 선택", 
+        f_list,
+        # 화면에만 경로를 모두 붙여서 보여주는 센스!
+        format_func=lambda f_name: f"📁 {sel_n} ➔ 📄 {sel_m} ➔ 🎯 {f_name}"
+    )
+
+
 데이터 입력
 import streamlit as st
 import json
