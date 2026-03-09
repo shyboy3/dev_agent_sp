@@ -1,27 +1,19 @@
-def main():
-    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
-    
-    # 👇 [여기에 추가!] 전체 입력창 폰트와 크기를 키우는 CSS 마법
-    st.markdown("""
-        <style>
-        /* 텍스트 입력창, 텍스트 에어리어 폰트 키우기 */
-        .stTextInput input, .stTextArea textarea {
-            font-size: 16px !important;
-            padding: 10px !important;
-        }
-        /* 드롭다운(선택박스) 폰트 키우기 */
-        .stSelectbox div[data-baseweb="select"] {
-            font-size: 16px !important;
-        }
-        /* 라벨(제목) 폰트 키우기 */
-        .st-emotion-cache-10trnc2 {
-            font-size: 15px !important;
-            font-weight: bold !important;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
-    # ... 기존 코드 계속 ...
+with st.expander("➕ 새 그룹 추가"):
+    c_in1, c_in2 = st.columns([3, 1])
+    # label_visibility="collapsed"로 위쪽 여백을 없애고 placeholder로 안내합니다.
+    new_n = c_in1.text_input("그룹명", key="new_n", label_visibility="collapsed", placeholder="그룹명 입력")
+    if c_in2.button("생성", use_container_width=True):
+        if new_n and new_n not in current_data:
+            st.session_state.master_data[selected_cls][new_n] = {}
+            save_data(st.session_state.master_data); st.rerun()
+
+with st.expander(f"➕ [{n_name}] 아이템 추가"):
+    c_m1, c_m2 = st.columns([3, 1])
+    new_m = c_m1.text_input("아이템 명칭", key=f"in_m_{n_name}", label_visibility="collapsed", placeholder="아이템 명칭 입력")
+    if c_m2.button("추가", key=f"btn_m_{n_name}", use_container_width=True):
+        if new_m and new_m not in current_data[n_name]:
+            st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflows": {}}
+            save_data(st.session_state.master_data); st.rerun()
 
 
 
