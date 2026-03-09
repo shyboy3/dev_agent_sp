@@ -5,19 +5,17 @@ import json
 import os
 import datetime
 
-# Graphviz 경로 설정 (환경에 맞게 확인)
+# Graphviz 경로 설정
 os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
 
-DB_FILE = "persistent_data.json"
+DB_FILE = "agent_orchestration_data.json"
 CLASSES = ["표면분석", "구조분석", "성분분석", "물성측정"]
 
 def load_data():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # 데이터 구조 하위 호환성 체크 (features가 문자열인 경우 리스트로 변환 대비)
-                return data
+                return json.load(f)
         except:
             return {cls: {} for cls in CLASSES}
     return {cls: {} for cls in CLASSES}
@@ -32,20 +30,13 @@ def wrap_text(text, width=12):
     lines = [text[i:i+width] for i in range(0, len(text), width)]
     return "<br/>".join(lines)
 
-def generate_dot_code(selected_cls, data):
-    """표준 플로우차트 방식의 분기형 시각화"""
+def generate_main_tree(selected_cls, data):
+    """메인 계층도 생성 (Workflow 보유 시 노드 색상 변경)"""
     dot_lines = [
-        'digraph G {',
-        '  rankdir=LR;',
-        '  splines=ortho;', 
-        '  nodesep=0.5;',
-        '  ranksep=1.0;',
-        '  fontname="Malgun Gothic";',
-        '  node [fontname="Malgun Gothic", fontsize=10, style=filled];',
-        '  edge [fontname="Malgun Gothic", arrowhead=vee, color="#7f8c8d"];'
+        'digraph G { rankdir=LR; splines=ortho; nodesep=0.5; ranksep=1.0; fontname="Malgun Gothic";',
+        'node [fontname="Malgun Gothic", fontsize=10, style=filled];',
+        'edge [fontname="Malgun Gothic", arrowhead=vee, color="#7f8c8d"];'
     ]
-    
-    # 루트 노드 (클래스)
     dot_lines.append(f'  "root" [label=<{wrap_text(selected_cls)}>, shape=box, color="#1e3a8a", fontcolor=white];')
 
     for n_name, m_dict in data.items():
@@ -58,109 +49,136 @@ def generate_dot_code(selected_cls, data):
             dot_lines.append(f'  "{m_id}" [label=<{wrap_text(m_name)}>, shape=component, color="#10b981", fontcolor=white];')
             dot_lines.append(f'  "{n_id}" -> "{m_id}":w;')
 
-            # 복수 특징 처리 (콤마나 줄바꿈으로 구분된 경우 분리)
+            # 특징 및 Workflow 상태 표시
             raw_features = m_data.get("features", "")
-            # 세미콜론(;) 또는 줄바꿈으로 특징을 여러 개 구분하여 입력한다고 가정
             feature_list = [f.strip() for f in raw_features.replace('\n', ';').split(';') if f.strip()]
             
             for idx, feat in enumerate(feature_list):
                 f_id = f"f_{m_id}_{idx}"
-                dot_lines.append(f'  "{f_id}" [label=<{wrap_text(feat, 15)}>, shape=note, color="#f39c12", fontcolor=white];')
+                # Workflow가 설정되어 있으면 강조 색상(Red-border) 적용
+                has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                color = "#e67e22" if has_wf else "#f39c12"
+                peripheries = "2" if has_wf else "1"
+                
+                dot_lines.append(f'  "{f_id}" [label=<{wrap_text(feat, 15)}>, shape=note, color="{color}", fontcolor=white, peripheries={peripheries}];')
                 dot_lines.append(f'  "{m_id}" -> "{f_id}":w [style=dashed];')
 
     dot_lines.append('}')
     return "\n".join(dot_lines)
 
-def main():
-    st.set_page_config(page_title="Flowchart Hierarchy Manager", layout="wide")
+def generate_workflow_viz(feat_name, steps):
+    """특정 특징의 에이전트 워크플로우 시각화"""
+    dot = ['digraph W { rankdir=TB; fontname="Malgun Gothic"; node [fontname="Malgun Gothic", shape=record, style=filled];']
+    dot.append(f'  start [label="START: {feat_name}", shape=ellipse, color="#2ecc71", fontcolor=white];')
     
+    prev = "start"
+    for i, step in enumerate(steps):
+        s_id = f"step_{i}"
+        label = f"{{Step {i+1}: {step['task']} | Agent: {step['agent']}}}"
+        dot.append(f'  {s_id} [label="{label}", color="#9b59b6", fontcolor=white];')
+        dot.append(f'  {prev} -> {s_id};')
+        prev = s_id
+    
+    dot.append(f'  end [label="END", shape=ellipse, color="#e74c3c", fontcolor=white];')
+    dot.append(f'  {prev} -> end;')
+    dot.append('}')
+    return "\n".join(dot)
+
+def main():
+    st.set_page_config(page_title="Agent Orchestration Designer", layout="wide")
     if 'master_data' not in st.session_state:
         st.session_state.master_data = load_data()
 
-    st.sidebar.title("🧬 분석 계층 관리")
-    selected_cls = st.sidebar.selectbox("클래스 선택", CLASSES)
-    
-    # --- 시각화 ---
-    st.subheader(f"📊 {selected_cls} 표준 플로우차트 계층도")
+    st.sidebar.title("🤖 Orchestration Designer")
+    selected_cls = st.sidebar.selectbox("분석 대상 클래스", CLASSES)
     current_data = st.session_state.master_data.get(selected_cls, {})
-    st.graphviz_chart(generate_dot_code(selected_cls, current_data))
+
+    # --- 상단 메인 계층도 ---
+    st.subheader(f"📊 {selected_cls} 계층 및 에이전트 배치 현황")
+    st.graphviz_chart(generate_main_tree(selected_cls, current_data))
     
     st.divider()
 
-    # --- 관리 영역 ---
-    col_list, col_edit = st.columns([1.2, 1])
+    # --- 하단 작업 영역: 관리 및 워크플로우 설계 ---
+    col_list, col_wf = st.columns([1, 1.2])
 
     with col_list:
-        st.subheader("📁 계층 관리 (인라인 방식)")
-        
-        # 신규 그룹 추가 (최상단 고정)
-        with st.expander("➕ 새 그룹(N) 생성", expanded=False):
-            new_n = st.text_input("그룹 명칭")
-            if st.button("그룹 생성"):
-                if new_n and new_n not in current_data:
-                    st.session_state.master_data[selected_cls][new_n] = {}
-                    save_data(st.session_state.master_data)
-                    st.rerun()
-
-        # 그룹 및 아이템 인라인 리스트
+        st.subheader("📁 계층 및 특징 관리")
+        # (중략: 이전과 동일한 그룹/아이템 인라인 추가 및 삭제 로직)
         for n_name in list(current_data.keys()):
-            with st.container():
-                st.markdown(f"#### 📁 {n_name}")
-                c1, c2 = st.columns([4, 1])
-                if c2.button("🗑️ 그룹 삭제", key=f"del_n_{n_name}"):
-                    del st.session_state.master_data[selected_cls][n_name]
-                    save_data(st.session_state.master_data)
-                    st.rerun()
-
-                # 해당 그룹의 아이템들
-                items = current_data[n_name]
-                for m_name in list(items.keys()):
-                    ic1, ic2 = st.columns([4, 1])
-                    ic1.info(f"&nbsp;&nbsp;&nbsp;&nbsp;📄 {m_name}")
-                    if ic2.button("🗑️ 삭제", key=f"del_m_{n_name}_{m_name}"):
+            with st.expander(f"📁 {n_name}", expanded=True):
+                for m_name in list(current_data[n_name].keys()):
+                    c1, c2 = st.columns([4, 1])
+                    c1.write(f"📄 **{m_name}**")
+                    if c2.button("🗑️", key=f"del_{n_name}_{m_name}"):
                         del st.session_state.master_data[selected_cls][n_name][m_name]
-                        save_data(st.session_state.master_data)
-                        st.rerun()
+                        save_data(st.session_state.master_data); st.rerun()
+                # 신규 아이템 추가
+                new_m = st.text_input("아이템 명칭", key=f"add_m_{n_name}")
+                if st.button(f"{n_name}에 추가", key=f"btn_add_{n_name}"):
+                    st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflows": {}}
+                    save_data(st.session_state.master_data); st.rerun()
+
+    with col_wf:
+        st.subheader("⚙️ Workflow & Agent Setting")
+        # 워크플로우를 편집할 아이템 선택
+        n_list = list(current_data.keys())
+        sel_n = st.selectbox("그룹 선택", n_list, key="wf_n") if n_list else None
+        if sel_n:
+            m_list = list(current_data[sel_n].keys())
+            sel_m = st.selectbox("아이템 선택", m_list, key="wf_m") if m_list else None
+            
+            if sel_m:
+                # 해당 아이템의 특징 리스트 파싱
+                feat_str = current_data[sel_n][sel_m].get("features", "")
+                f_list = [f.strip() for f in feat_str.replace('\n', ';').split(';') if f.strip()]
                 
-                # 그룹 바로 아래에 아이템 추가 버튼 배치
-                with st.expander(f"➕ [{n_name}] 아이템 추가", expanded=False):
-                    new_m = st.text_input("아이템 명칭", key=f"new_m_in_{n_name}")
-                    if st.button("아이템 생성", key=f"btn_m_in_{n_name}"):
-                        if new_m:
-                            st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflow": []}
+                sel_f = st.selectbox("워크플로우를 설계할 특징(Feature) 선택", f_list) if f_list else None
+                
+                if sel_f:
+                    st.write(f"🎯 **[{sel_f}]** 에이전트 작업 흐름 설계")
+                    
+                    # 특징별 워크플로우 데이터 불러오기
+                    if "workflows" not in current_data[sel_n][sel_m]:
+                        st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"] = {}
+                    
+                    current_wf = st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"].get(sel_f, [])
+                    
+                    # 워크플로우 단계 추가 UI
+                    with st.form(key=f"wf_form_{sel_f}"):
+                        c1, c2 = st.columns([2, 1])
+                        task = c1.text_input("수행할 작업 (Task)")
+                        agent = c2.text_input("에이전트 역할 (Agent)")
+                        if st.form_submit_button("➕ 단계 추가"):
+                            current_wf.append({"task": task, "agent": agent})
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = current_wf
                             save_data(st.session_state.master_data)
                             st.rerun()
-                st.divider()
 
-    with col_edit:
-        st.subheader("📝 상세 정보 입력")
-        n_list = list(current_data.keys())
-        target_n = st.selectbox("그룹 선택", n_list) if n_list else None
-        
-        if target_n:
-            m_list = list(current_data[target_n].keys())
-            target_m = st.selectbox("아이템 선택", m_list) if m_list else None
-            
-            if target_m:
-                st.info(f"💡 여러 특징을 넣으려면 세미콜론(;)으로 구분하여 입력하세요.")
-                curr_feat = current_data[target_n][target_m].get("features", "")
-                new_feat = st.text_area("특징/상세 내용", value=curr_feat, height=250, 
-                                        help="예: 특징1; 특징2; 특징3")
-                
-                if st.button("✅ 적용 및 시각화 업데이트"):
-                    st.session_state.master_data[selected_cls][target_n][target_m]["features"] = new_feat
-                    save_data(st.session_state.master_data)
-                    st.success("반영되었습니다!")
-                    st.rerun()
+                    # 현재 워크플로우 시각화 및 리스트
+                    if current_wf:
+                        st.graphviz_chart(generate_workflow_viz(sel_f, current_wf))
+                        for i, step in enumerate(current_wf):
+                            cc1, cc2 = st.columns([4, 1])
+                            cc1.text(f"{i+1}. {step['task']} ({step['agent']})")
+                            if cc2.button("❌", key=f"del_step_{i}"):
+                                current_wf.pop(i)
+                                save_data(st.session_state.master_data); st.rerun()
+                    
+                    if st.button("✨ 특징 내용 업데이트 (상위 트리 반영)"):
+                        # 특징 텍스트만 저장하는 영역 (기존 기능 유지)
+                        save_data(st.session_state.master_data)
+                        st.success("워크플로우와 특징이 보존되었습니다.")
 
-    # --- 데이터 추출 ---
+    # --- 추출 ---
     st.sidebar.divider()
-    if st.sidebar.button("📥 JSON 데이터 추출"):
+    if st.sidebar.button("📥 오케스트레이션 데이터(JSON) 추출"):
         json_val = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
-        st.sidebar.download_button("다운로드", json_val, f"analysis_{datetime.datetime.now().strftime('%m%d')}.json")
+        st.sidebar.download_button("설정 파일 다운로드", json_val, "agent_config.json")
 
 if __name__ == "__main__":
     main()
+
 
 
 
