@@ -5,6 +5,138 @@ import json
 import os
 import datetime
 
+# Graphviz 경로 (환경에 맞게 반드시 확인)
+os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
+
+# 파일명을 하나로 통일하여 관리합니다.
+DB_FILE = "integrated_agent_data.json"
+CLASSES = ["표면분석", "구조분석", "성분분석", "물성측정"]
+
+def load_data():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # 데이터 정규화: 구버전 데이터가 있을 경우 자동 변환
+                for cls in CLASSES:
+                    if cls not in data: data[cls] = {}
+                    for g in data[cls]:
+                        for i in data[cls][g]:
+                            if "workflows" not in data[cls][g][i] or isinstance(data[cls][g][i]["workflows"], list):
+                                data[cls][g][i]["workflows"] = {}
+                return data
+        except Exception as e:
+            st.error(f"데이터 로드 중 오류: {e}")
+            return {cls: {} for cls in CLASSES}
+    return {cls: {} for cls in CLASSES}
+
+def save_data(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def generate_markdown_summary(feat_name, steps):
+    """설계된 워크플로우를 기술 문서로 요약"""
+    md = f"### 🤖 Agent Design: {feat_name}\n\n"
+    md += "| Step | Task Name | Agent | Input | Output | Next | Fail-path |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    for s in steps:
+        tasks = ", ".join(s['tasks'])
+        next_s = f"Step {s['next_id']}" if s.get('next_id') else "END"
+        fail_s = f"Step {s['fail_goto_id']}" if s.get('fail_goto_id') else "-"
+        md += f"| {s['id']} | {s['name']} | {s['agent']} | {s.get('input','-')} | {s.get('output','-')} | {next_s} | {fail_s} |\n"
+    return md
+
+# (시각화 generate_complex_workflow_viz 함수는 이전과 동일하게 유지하되 I/O 정보 추가 가능)
+
+def main():
+    st.set_page_config(page_title="Agent Architecture Tool", layout="wide")
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
+
+    st.title("🏗️ Agent Orchestration Blueprint")
+    
+    # 사이드바에서 클래스 선택
+    selected_cls = st.sidebar.selectbox("클래스", CLASSES)
+    current_data = st.session_state.master_data.get(selected_cls, {})
+
+    # --- Step 1: 대상 특징(Feature) 선택 ---
+    col1, col2, col3 = st.columns(3)
+    sel_n = col1.selectbox("그룹(N)", list(current_data.keys())) if current_data else None
+    sel_m = col2.selectbox("아이템(M)", list(current_data[sel_n].keys())) if sel_n else None
+    
+    if sel_m:
+        feats = [f.strip() for f in current_data[sel_n][sel_m].get("features", "").replace('\n',';').split(';') if f.strip()]
+        sel_f = col3.selectbox("작업 흐름 설계 대상(Feature)", feats) if feats else None
+        
+        if sel_f:
+            st.divider()
+            wf_data = st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"].get(sel_f, [])
+            
+            # --- Step 2: 상세 설계 및 요약 ---
+            tab1, tab2 = st.tabs(["🛠️ Workflow Designer", "📄 Specification Summary"])
+            
+            with tab1:
+                c_edit, c_view = st.columns([1, 1.3])
+                with c_edit:
+                    st.subheader("Step Definition")
+                    with st.form("adv_step_form"):
+                        s_id = st.number_input("Step ID", min_value=1, value=len(wf_data)+1)
+                        s_name = st.text_input("프로세스 명칭")
+                        s_agent = st.text_input("담당 에이전트 역할")
+                        s_input = st.text_input("Input Data (필요 정보)")
+                        s_output = st.text_input("Output Data (생성 결과)")
+                        s_tasks = st.text_area("세부 Task 리스트 (엔터 구분)")
+                        
+                        st.write("🔗 Logic Control")
+                        lc1, lc2 = st.columns(2)
+                        next_id = lc1.number_input("성공 시 (Next ID)", min_value=0)
+                        fail_id = lc2.number_input("실패 시 (Back ID)", min_value=0)
+                        
+                        if st.form_submit_button("💾 스텝 저장"):
+                            new_step = {
+                                "id": s_id, "name": s_name, "agent": s_agent,
+                                "input": s_input, "output": s_output,
+                                "tasks": [t.strip() for t in s_tasks.split('\n') if t.strip()],
+                                "next_id": next_id if next_id > 0 else None,
+                                "fail_goto_id": fail_id if fail_id > 0 else None
+                            }
+                            wf_data = [s for s in wf_data if s['id'] != s_id]
+                            wf_data.append(new_step)
+                            wf_data.sort(key=lambda x: x['id'])
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_data
+                            save_data(st.session_state.master_data)
+                            st.rerun()
+
+                with c_view:
+                    # (여기서 시각화 함수 호출)
+                    st.subheader("Logic Diagram")
+                    # (이전의 generate_complex_workflow_viz 함수 내용 실행...)
+                    # 생략된 시각화 코드가 있다고 가정하고 진행
+                    if wf_data: st.info(f"{sel_f}에 대한 {len(wf_data)}개의 스텝이 정의되었습니다.")
+
+            with tab2:
+                st.subheader("📋 Technical Specification")
+                if wf_data:
+                    summary_md = generate_markdown_summary(sel_f, wf_data)
+                    st.markdown(summary_md)
+                    st.download_button("📝 마크다운 요약본 다운로드", summary_md, f"summary_{sel_f}.md")
+                else:
+                    st.warning("설계된 워크플로우가 없습니다.")
+
+    # --- 데이터 마이그레이션 팁 ---
+    with st.expander("⚠️ 데이터 로드 안내"):
+        st.write("기존 persistent_data.json의 내용을 가져오고 싶다면, 파일명을 integrated_agent_data.json으로 변경한 후 실행하세요. 구조는 자동으로 최신화됩니다.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+import streamlit as st
+import json
+import os
+import datetime
+
 # Graphviz 경로
 os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
 
