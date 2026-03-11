@@ -1,45 +1,35 @@
             feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
             
-            if feats:
-                # 💡 [핵심] 특징들을 2줄(Row)로 나누기 위한 파이썬 슬라이싱
-                row1 = feats[0::2] # 0, 2, 4... 번째 (첫 번째 줄)
-                row2 = feats[1::2] # 1, 3, 5... 번째 (두 번째 줄)
+            # 1. 모든 특징 노드를 개별적으로 생성하고, 아이템과 각각 연결합니다 (모양/연결선 복구)
+            for idx, feat in enumerate(feats):
+                f_id = f"f_{m_id}_{idx}"
+                if not first_f and idx == 0: first_f = f_id # 상단 헤더 정렬용
+                
+                has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                color = "#e67e22" if has_wf else "#f39c12"
+                dot.append(f'  "{f_id}" [label=<{wrap_text(feat, 12)}>, shape=note, color="{color}"];')
+                
+                # 무조건 아이템에서 개별 특징으로 선 연결!
+                dot.append(f'  "{m_id}" -> "{f_id}" [style=dashed];')
 
-                # HTML 스타일의 테이블 레이아웃 시작 (cellspacing으로 박스 간격을 띄움)
-                html_str = '<table border="0" cellborder="0" cellspacing="4" cellpadding="5">'
+            # 2. 투명한 뼈대를 세워 2행(Row) 다열(Column) 그리드 강제하기
+            for i in range(0, len(feats), 2):
+                f1 = f"f_{m_id}_{i}"
                 
-                # --- 첫 번째 줄 (Row 1) ---
-                html_str += '<tr>'
-                for feat in row1:
-                    has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
-                    bg = "#e67e22" if has_wf else "#f39c12"
-                    # 글자가 잘 보이도록 폰트 색상을 흰색으로 강제 지정
-                    html_str += f'<td bgcolor="{bg}"><font color="white">{wrap_text(feat, 12)}</font></td>'
-                html_str += '</tr>'
-                
-                # --- 두 번째 줄 (Row 2) ---
-                if row2:
-                    html_str += '<tr>'
-                    for i in range(len(row1)):
-                        if i < len(row2):
-                            feat = row2[i]
-                            has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
-                            bg = "#e67e22" if has_wf else "#f39c12"
-                            html_str += f'<td bgcolor="{bg}"><font color="white">{wrap_text(feat, 12)}</font></td>'
-                        else:
-                            # 윗줄보다 개수가 모자라면 빈칸으로 채워서 비율을 맞춤
-                            html_str += '<td></td>' 
-                    html_str += '</tr>'
+                # ① 세로 묶기: 위아래(같은 열)에 있는 두 노드를 나란히 세움
+                if i + 1 < len(feats):
+                    f2 = f"f_{m_id}_{i+1}"
+                    dot.append(f'  {{ rank=same; "{f1}"; "{f2}"; }}')
+
+                # ② 가로 밀어내기: 다음 열로 넘어갈 수 있도록 투명한 선(invis)으로 밀어줌
+                if i + 2 < len(feats):
+                    next_f1 = f"f_{m_id}_{i+2}"
+                    dot.append(f'  "{f1}" -> "{next_f1}" [style=invis];')
                     
-                html_str += '</table>'
-                
-                # 테이블을 담을 하나의 통합 노드 생성
-                f_group_id = f"f_group_{m_id}"
-                if not first_f: first_f = f_group_id # 헤더 정렬용 기록
-                
-                # shape=plaintext로 겉 테두리를 없애고 테이블 자체가 노드처럼 보이게 마법을 부림
-                dot.append(f'  "{f_group_id}" [label=<{html_str}>, shape=plaintext];')
-                dot.append(f'  "{m_id}" -> "{f_group_id}" [style=dashed];')
+                if i + 3 < len(feats):
+                    f2 = f"f_{m_id}_{i+1}"
+                    next_f2 = f"f_{m_id}_{i+3}"
+                    dot.append(f'  "{f2}" -> "{next_f2}" [style=invis];')
 
 
 
