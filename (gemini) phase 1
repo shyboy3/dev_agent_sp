@@ -1,19 +1,45 @@
-with st.expander("➕ 새 그룹 추가"):
-    c_in1, c_in2 = st.columns([3, 1])
-    # label_visibility="collapsed"로 위쪽 여백을 없애고 placeholder로 안내합니다.
-    new_n = c_in1.text_input("그룹명", key="new_n", label_visibility="collapsed", placeholder="그룹명 입력")
-    if c_in2.button("생성", use_container_width=True):
-        if new_n and new_n not in current_data:
-            st.session_state.master_data[selected_cls][new_n] = {}
-            save_data(st.session_state.master_data); st.rerun()
+            feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+            
+            if feats:
+                # 💡 [핵심] 특징들을 2줄(Row)로 나누기 위한 파이썬 슬라이싱
+                row1 = feats[0::2] # 0, 2, 4... 번째 (첫 번째 줄)
+                row2 = feats[1::2] # 1, 3, 5... 번째 (두 번째 줄)
 
-with st.expander(f"➕ [{n_name}] 아이템 추가"):
-    c_m1, c_m2 = st.columns([3, 1])
-    new_m = c_m1.text_input("아이템 명칭", key=f"in_m_{n_name}", label_visibility="collapsed", placeholder="아이템 명칭 입력")
-    if c_m2.button("추가", key=f"btn_m_{n_name}", use_container_width=True):
-        if new_m and new_m not in current_data[n_name]:
-            st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflows": {}}
-            save_data(st.session_state.master_data); st.rerun()
+                # HTML 스타일의 테이블 레이아웃 시작 (cellspacing으로 박스 간격을 띄움)
+                html_str = '<table border="0" cellborder="0" cellspacing="4" cellpadding="5">'
+                
+                # --- 첫 번째 줄 (Row 1) ---
+                html_str += '<tr>'
+                for feat in row1:
+                    has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                    bg = "#e67e22" if has_wf else "#f39c12"
+                    # 글자가 잘 보이도록 폰트 색상을 흰색으로 강제 지정
+                    html_str += f'<td bgcolor="{bg}"><font color="white">{wrap_text(feat, 12)}</font></td>'
+                html_str += '</tr>'
+                
+                # --- 두 번째 줄 (Row 2) ---
+                if row2:
+                    html_str += '<tr>'
+                    for i in range(len(row1)):
+                        if i < len(row2):
+                            feat = row2[i]
+                            has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                            bg = "#e67e22" if has_wf else "#f39c12"
+                            html_str += f'<td bgcolor="{bg}"><font color="white">{wrap_text(feat, 12)}</font></td>'
+                        else:
+                            # 윗줄보다 개수가 모자라면 빈칸으로 채워서 비율을 맞춤
+                            html_str += '<td></td>' 
+                    html_str += '</tr>'
+                    
+                html_str += '</table>'
+                
+                # 테이블을 담을 하나의 통합 노드 생성
+                f_group_id = f"f_group_{m_id}"
+                if not first_f: first_f = f_group_id # 헤더 정렬용 기록
+                
+                # shape=plaintext로 겉 테두리를 없애고 테이블 자체가 노드처럼 보이게 마법을 부림
+                dot.append(f'  "{f_group_id}" [label=<{html_str}>, shape=plaintext];')
+                dot.append(f'  "{m_id}" -> "{f_group_id}" [style=dashed];')
 
 
 
