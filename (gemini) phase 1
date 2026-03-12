@@ -1,58 +1,62 @@
 <script type="text/javascript">
-    // 1. 초기 설정: 완벽한 로컬 모드로 시작 (새 파일 만들기 해결)
-    window.DRAWIO_CONFIG = { "service": "none", "defaultLocalStorage": true };
+    // 1. 완벽한 로컬 모드로 설정 (새 파일 만들기 에러 해결)
     window.urlParams = { 'lang': 'ko', 'offline': '1', 'db': '0', 'local': '1' };
 
-    // 2. 브라우저의 파일 저장 기능을 가로채는 마법의 코드
+    // 2. 브라우저의 파일 생성(Blob) 기능을 가로채는 코드
     (function() {
-        var originalSaveAs = window.saveAs; // draw.io가 사용하는 저장 라이브러리
-        
-        window.saveAs = function(blob, name) {
-            // 파일을 서버로 전송하는 로직
-            var formData = new FormData();
-            formData.append('xml', blob, name);
-            formData.append('filename', name);
+        var originalBlob = window.Blob;
+        window.Blob = function(content, options) {
+            var blob = new originalBlob(content, options);
+            
+            // 파일 내용이 XML(다이어그램)인 경우에만 서버로 전송
+            if (options && options.type && options.type.indexOf('xml') !== -1) {
+                var reader = new FileReader();
+                reader.onload = function() {
+                    var formData = new FormData();
+                    formData.append('xml', reader.result);
+                    formData.append('filename', 'diagram_' + Date.now() + '.drawio');
 
-            fetch('/save', {
-                method: 'POST',
-                body: formData
-            }).then(response => {
-                console.log('서버 전송 완료');
-            }).catch(err => {
-                console.error('서버 전송 실패', err);
-            });
-
-            // 원래의 다운로드 기능도 수행 (사용자 PC 저장)
-            if (originalSaveAs) {
-                originalSaveAs(blob, name);
+                    fetch('/save', {
+                        method: 'POST',
+                        body: formData
+                    }).then(() => console.log("서버 백업 성공"));
+                };
+                reader.readAsText(blob);
             }
+            return blob;
         };
     })();
 </script>
 <script src="js/main.js"></script>
 
+from flask import Flask, request, send_from_directory
+import os
+
+app = Flask(__name__, static_folder='webapp')
+
+@app.route('/')
+def index():
+    return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/save', methods=['POST'])
 def save():
-    # 파일 객체로 넘어오는 경우와 일반 텍스트로 넘어오는 경우 모두 처리
-    file = request.files.get('xml')
+    # FormData로 들어온 데이터를 읽습니다.
+    xml_data = request.form.get('xml')
     filename = request.form.get('filename', 'diagram.drawio')
 
     if not os.path.exists('saves'):
         os.makedirs('saves')
 
     save_path = os.path.join('saves', filename)
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write(xml_data)
 
-    if file:
-        file.save(save_path)
-    else:
-        # 텍스트로 넘어올 경우 대비
-        xml_data = request.form.get('xml')
-        with open(save_path, "w", encoding="utf-8") as f:
-            f.write(xml_data)
-
-    print(f"저장 성공: {save_path}")
+    print(f"--- 서버 저장 완료: {filename} ---")
     return "OK", 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+
 
 
 
