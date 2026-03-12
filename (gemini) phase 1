@@ -1,3 +1,215 @@
+def generate_main_tree(selected_cls, data):
+    dot = [
+        # (기존에 좁혀둔 글로벌 간격 유지)
+        'digraph G { compound=true; rankdir=LR; splines=polyline; nodesep=0.15; ranksep=0.3; fontname="Malgun Gothic";',
+        'node [fontname="Malgun Gothic", fontsize=11, style=filled, width=1.5, height=0.5, fixedsize=true];',
+        'edge [fontname="Malgun Gothic", arrowhead=vee, color="#7f8c8d", penwidth=1.2];'
+    ]
+    
+    # --- [상단 헤더 정의 (투명 테이블로 좌우 정렬)] ---
+    dot.append('  // Headers')
+    dot.append('  node [shape=plaintext, style="", fontcolor="#333333", fontsize=14, width=1.5, height=0.3];')
+    dot.append('  "H_Class" [label=<<table border="0" cellborder="0"><tr><td width="10"></td><td><b>[ 클래스 ]</b></td></tr></table>>];')
+    dot.append('  "H_Group" [label=<<table border="0" cellborder="0"><tr><td><b>[ 그룹(N) ]</b></td><td width="10"></td></tr></table>>];')
+    dot.append('  "H_Item" [label=<<b>[ 아이템(M) ]</b>>];')
+    dot.append('  "H_Feature" [label=<<b>[ 특징(Feature) ]</b>>];')
+    dot.append('  edge [style=invis];')
+    dot.append('  "H_Class" -> "H_Group" -> "H_Item" -> "H_Feature";')
+    
+    # 기본 스타일 복구
+    dot.append('  node [shape=box, style=filled, fontcolor=white, fontsize=11, width=1.5, height=0.5, fixedsize=true];')
+    dot.append('  edge [style=solid, arrowhead=vee, color="#7f8c8d", penwidth=1.2];')
+
+    dot.append(f'  "root" [label=<{wrap_text(selected_cls)}>, color="#1e3a8a"];')
+    
+    first_n, first_m = None, None
+
+    for n_name, m_dict in data.items():
+        n_id = f"n_{hash(n_name)}"
+        if not first_n: first_n = n_id
+        dot.append(f'  "{n_id}" [label=<{wrap_text(n_name)}>, shape=parallelogram, color="#3b82f6"];')
+        dot.append(f'  "root" -> "{n_id}" [minlen=3];') # 밖으로 뻗는 선 길게 유지
+        
+        for m_name, m_data in m_dict.items():
+            m_id = f"m_{hash(n_name + m_name)}"
+            if not first_m: first_m = m_id
+            dot.append(f'  "{m_id}" [label=<{wrap_text(m_name)}>, shape=component, color="#10b981"];')
+            dot.append(f'  "{n_id}" -> "{m_id}" [minlen=3];') # 밖으로 뻗는 선 길게 유지
+            
+            feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+            
+            if feats:
+                cluster_id = f"cluster_{m_id}"
+                dot.append(f'  subgraph "{cluster_id}" {{')
+                dot.append('    style=rounded; color="#cbd5e1"; penwidth=2; bgcolor="#f8fafc"; margin=20.0;')
+                
+                for idx, feat in enumerate(feats):
+                    f_id = f"f_{m_id}_{idx}"
+                    
+                    has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                    color = "#e67e22" if has_wf else "#f39c12"
+                    
+                    # 💡 [새로 추가된 부분: 태그(Tag) 정보 텍스트 합성]
+                    tags = m_data.get("feature_meta", {}).get(feat, {}).get("tags", "")
+                    if tags:
+                        # 🔖 아이콘과 함께 노란색 작은 글씨로 태그 추가
+                        tag_html = f"<br/><font point-size='9' color='#fef08a'>🔖 {tags}</font>"
+                        label = f"<{wrap_text(feat, 12)}{tag_html}>"
+                    else:
+                        label = f"<{wrap_text(feat, 12)}>"
+
+                    dot.append(f'    "{f_id}" [label={label}, shape=note, color="{color}"];')
+
+                # 상자 안에서 투명 뼈대로 2xN 정렬
+                for i in range(len(feats)):
+                    f1 = f"f_{m_id}_{i}"
+                    if i % 2 == 0 and i + 1 < len(feats):
+                        f2 = f"f_{m_id}_{i+1}"
+                        dot.append(f'    {{ rank=same; "{f1}"; "{f2}"; }}')
+                    if i + 2 < len(feats):
+                        next_f = f"f_{m_id}_{i+2}"
+                        dot.append(f'    "{f1}" -> "{next_f}" [style=invis, weight=10, minlen=2];') # 가로 간격
+                
+                dot.append('  }')
+                
+                # 상자로 꽂히는 선 (느슨하게 1배수 유지)
+                first_f_id = f"f_{m_id}_0"
+                dot.append(f'  "{m_id}" -> "{first_f_id}" [style=dashed, lhead="{cluster_id}", minlen=1, weight=1];')
+
+    # --- [상단 헤더를 꼭대기로 끌어올리는 투명 핀 (기존 유지)] ---
+    dot.append('  { rank=same; "H_Class"; "root"; }')
+    if first_n: dot.append(f'  {{ rank=same; "H_Group"; "{first_n}"; }}')
+    if first_m: dot.append(f'  {{ rank=same; "H_Item"; "{first_m}"; }}')
+
+    dot.append('  "H_Class" -> "root" [style=invis, weight=100];')
+    if first_n: dot.append(f'  "H_Group" -> "{first_n}" [style=invis, weight=100];')
+    if first_m: dot.append(f'  "H_Item" -> "{first_m}" [style=invis, weight=100];')
+
+    dot.append('}')
+    return "\n".join(dot)
+
+
+
+------
+
+def main():
+    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
+    
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
+
+    # ( ... 사이드바 및 Graphviz 상단 출력 코드 생략 ... )
+
+    col_manage, col_wf = st.columns([1, 1.4])
+
+    with col_manage:
+        # ( ... 조직 계층 관리 로직, 그룹/아이템 추가 및 삭제 폼 유지 ... )
+        pass # 이 부분은 회원님의 기존 코드가 그대로 유지됩니다.
+
+    with col_wf:
+        st.subheader("⚙️ 워크플로우 편집기")
+        # current_data는 상단에서 정의되었다고 가정합니다.
+        if not current_data:
+            st.info("그룹과 아이템을 먼저 생성해주세요.")
+            return
+        
+        sel_n = st.selectbox("그룹 선택", list(current_data.keys()))
+        if sel_n and current_data[sel_n]:
+            sel_m = st.selectbox("아이템 선택", list(current_data[sel_n].keys()))
+            
+            if sel_m:
+                m_data = current_data[sel_n][sel_m]
+                
+                # ==========================================================
+                # 💡 [새로 추가된 부분 1]: 특징별 태그(Tag) 관리 폼
+                # ==========================================================
+                # 데이터베이스에 feature_meta 딕셔너리가 없으면 빈 공간을 만들어줍니다.
+                if "feature_meta" not in m_data:
+                    m_data["feature_meta"] = {}
+                    
+                with st.expander("🏷️ 특징(Feature) 태그 관리", expanded=False):
+                    feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+                    
+                    for f_name in feats:
+                        # 해당 특징의 메타 데이터 공간이 없으면 생성
+                        if f_name not in m_data["feature_meta"]:
+                            m_data["feature_meta"][f_name] = {"tags": ""}
+                            
+                        # 각 특징별로 태그를 입력받음
+                        tag_val = st.text_input(f"[{f_name}] 태그 (예: 가격:100, 시간:10m)", 
+                                                value=m_data["feature_meta"][f_name]["tags"], 
+                                                key=f"tag_{f_name}")
+                        m_data["feature_meta"][f_name]["tags"] = tag_val
+                    
+                    if st.button("💾 태그 일괄 저장", use_container_width=True):
+                        save_data(st.session_state.master_data); st.success("태그가 저장되었습니다!"); st.rerun()
+                # ==========================================================
+
+
+                # 기존 워크플로우 대상 특징 선택 로직
+                feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+                if feats:
+                    sel_f = st.selectbox("특징(워크플로우) 선택", feats)
+                    
+                    if sel_f:
+                        st.markdown(f"### 🎯 [{sel_f}] 워크플로우")
+                        
+                        # ==========================================================
+                        # 💡 [새로 추가된 부분 2]: draw.io XML 임포트 폼
+                        # ==========================================================
+                        with st.expander("📥 draw.io XML 임포트 (기존 데이터를 덮어씁니다)"):
+                            xml_input = st.text_area("draw.io에서 복사한 XML 코드를 붙여넣으세요.", height=150)
+                            
+                            if st.button("XML ➔ 워크플로우 변환 적용", use_container_width=True):
+                                # 이전에 제공해드린 drawio_to_wf_dict 함수를 호출합니다!
+                                imported_wf = drawio_to_wf_dict(xml_input) 
+                                
+                                if imported_wf:
+                                    m_data.setdefault("workflows", {})[sel_f] = imported_wf
+                                    save_data(st.session_state.master_data)
+                                    st.success("워크플로우가 성공적으로 변환 및 저장되었습니다!"); st.rerun()
+                                else:
+                                    st.error("XML 파싱에 실패했습니다. 코드를 다시 확인해주세요.")
+                        # ==========================================================
+
+                        st.divider()
+
+                        # --- 이 아래부터는 회원님이 원래 가지고 계시던 개별 워크플로우 Step 리스트(ID, 에이전트, Next ID, 수정 폼 등)와 세로형 워크플로우 다이어그램 생성 코드가 그대로 이어집니다! ---
+                        wf_dict = m_data.get("workflows", {}).get(sel_f, {})
+                        
+                        # if not wf_dict:
+                        #     st.info("워크플로우 데이터가 없습니다. 새로 추가하거나 XML을 임포트하세요.")
+                        # else:
+                        #     ... (기존 워크플로우 UI 렌더링 코드 유지) ...
+
+
+------
+
+                        # ==========================================================
+                        # 💡 [새로 추가된 부분 2]: draw.io 파일 업로드 폼
+                        # ==========================================================
+                        with st.expander("📥 draw.io 파일 임포트 (기존 데이터를 덮어씁니다)"):
+                            # 텍스트 에어리어 대신 파일 업로더를 사용합니다.
+                            uploaded_file = st.file_uploader("draw.io 파일(.drawio, .xml)을 업로드하세요", type=['xml', 'drawio'])
+                            
+                            if uploaded_file is not None:
+                                if st.button("파일에서 워크플로우 변환 적용", use_container_width=True):
+                                    # 업로드된 파일을 읽어서 문자열(UTF-8)로 변환합니다.
+                                    xml_content = uploaded_file.getvalue().decode("utf-8")
+                                    
+                                    # 이전에 제공해드린 파싱 함수로 전달!
+                                    imported_wf = drawio_to_wf_dict(xml_content) 
+                                    
+                                    if imported_wf:
+                                        m_data.setdefault("workflows", {})[sel_f] = imported_wf
+                                        save_data(st.session_state.master_data)
+                                        st.success("파일이 성공적으로 변환 및 저장되었습니다!"); st.rerun()
+                                    else:
+                                        st.error("파일 파싱에 실패했습니다. draw.io 형식이 맞는지 확인해주세요.")
+                        # ==========================================================
+
+
+
 import xmltodict
 import re
 import base64
