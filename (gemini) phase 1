@@ -1,3 +1,159 @@
+import xmltodict
+import re
+import base64
+import zlib
+from urllib.parse import unquote
+
+def clean_html(raw_html):
+    if not raw_html: return ""
+    clean_text = re.sub(r'<br\s*/?>|</div>|</p>', '\n', str(raw_html))
+    return re.sub(r'<[^>]+>', '', clean_text).strip()
+
+def decode_drawio_diagram(xml_string):
+    """draw.io의 압축된 다이어그램 문자열을 해독합니다."""
+    try:
+        data = xmltodict.parse(xml_string)
+        diagram = data['mxfile']['diagram']
+        
+        # 압축되어 있는 경우 해독
+        if isinstance(diagram, dict) and '#text' in diagram:
+            b64_data = diagram['#text']
+            decoded = base64.b64decode(b64_data)
+            decompressed = zlib.decompress(decoded, -15)
+            xml_string = unquote(decompressed.decode('utf-8'))
+            # 해독된 내용을 다시 최상위 <mxGraphModel>로 감싸서 반환
+            return xmltodict.parse(f"<root>{xml_string}</root>")['root']
+        else:
+            return data['mxfile']['diagram']['mxGraphModel']
+    except Exception as e:
+        return None
+
+def drawio_to_wf_dict(xml_content):
+    """draw.io XML을 프로그램 내부의 워크플로우 dict 형태로 변환합니다."""
+    graph_model = decode_drawio_diagram(xml_content)
+    if not graph_model: return None
+
+    try:
+        cells = graph_model['root']['mxCell']
+        if isinstance(cells, dict): cells = [cells] # 노드가 1개일 경우 리스트로 강제 변환
+    except KeyError:
+        return None
+
+    wf_dict = {}
+    
+    # 1. 노드(Vertex) 먼저 수집
+    for cell in cells:
+        if cell.get('@vertex') == '1':
+            node_id = cell.get('@id')
+            name = clean_html(cell.get('@value', '')) or f"Step_{node_id}"
+            
+            wf_dict[node_id] = {
+                "id": node_id,
+                "name": name,
+                "agent": "Auto",     # 기본 에이전트명 할당
+                "task": "draw.io에서 임포트됨",
+                "parent": "",
+                "next": "",
+                "fail": ""
+            }
+
+    # 2. 연결선(Edge)을 바탕으로 parent, next, fail 매핑
+    for cell in cells:
+        if cell.get('@edge') == '1':
+            source = cell.get('@source')
+            target = cell.get('@target')
+            label = clean_html(cell.get('@value', '')).lower()
+            
+            if source in wf_dict and target in wf_dict:
+                wf_dict[target]['parent'] = source
+                # 라벨에 fail, 실패, no 등이 들어가면 실패 분기로 처리
+                if any(x in label for x in ['fail', '실패', 'no', '아니오']):
+                    wf_dict[source]['fail'] = target
+                else:
+                    wf_dict[source]['next'] = target
+
+    return wf_dict
+
+
+
+    with col_wf:
+        st.subheader("⚙️ 워크플로우 & 태그 편집기")
+        
+        # ... (기존 계층 선택 로직) ...
+        
+        if sel_m:
+            m_data = st.session_state.master_data[selected_cls][sel_n][sel_m]
+            
+            # --- [새로 추가된 부분 1: 특징(Feature) 태그 편집기] ---
+            if "feature_meta" not in m_data:
+                m_data["feature_meta"] = {}
+                
+            with st.expander("🏷️ 특징(Feature) 태그 관리"):
+                feats = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+                for f_name in feats:
+                    if f_name not in m_data["feature_meta"]:
+                        m_data["feature_meta"][f_name] = {"tags": ""}
+                        
+                    # 태그 입력 (예: 가격:100, 시간:10m)
+                    tag_val = st.text_input(f"[{f_name}] 태그 입력 (콤마로 구분)", 
+                                            value=m_data["feature_meta"][f_name]["tags"], 
+                                            key=f"tag_{f_name}")
+                    m_data["feature_meta"][f_name]["tags"] = tag_val
+                
+                if st.button("태그 저장"):
+                    save_data(st.session_state.master_data); st.success("저장 완료!")
+
+            # ... (기존 특징 선택 로직 if sel_f:) ...
+            if sel_f:
+                st.markdown(f"### 🎯 [{sel_f}] 워크플로우")
+                
+                # --- [새로 추가된 부분 2: draw.io 연동 폼] ---
+                with st.expander("📥 draw.io XML 임포트"):
+                    xml_input = st.text_area("draw.io에서 복사한 XML 코드를 여기에 붙여넣으세요.", height=150)
+                    if st.button("XML ➔ 워크플로우 덮어쓰기"):
+                        imported_wf = drawio_to_wf_dict(xml_input)
+                        if imported_wf:
+                            # 내부 구조(JSON)로 저장
+                            m_data.setdefault("workflows", {})[sel_f] = imported_wf
+                            save_data(st.session_state.master_data)
+                            st.success("draw.io 워크플로우가 성공적으로 반영되었습니다!"); st.rerun()
+                        else:
+                            st.error("XML 파싱 실패! draw.io 구조를 확인해주세요.")
+
+                # 이 아래에는 기존의 개별 Step 수정 폼 코드가 그대로 위치합니다.
+                # (XML로 변환된 데이터도 기존 수정 폼에 똑같이 나타나서 수정 가능해집니다!)
+
+
+
+
+
+                for idx, feat in enumerate(feats):
+                    f_id = f"f_{m_id}_{idx}"
+                    
+                    has_wf = len(m_data.get("workflows", {}).get(feat, [])) > 0
+                    color = "#e67e22" if has_wf else "#f39c12"
+                    
+                    # 👇 [수정] 태그 데이터 가져오기 및 HTML 라벨 생성
+                    tags = m_data.get("feature_meta", {}).get(feat, {}).get("tags", "")
+                    if tags:
+                        # 태그가 있으면 글자를 두 줄로 분리 (HTML 테이블 사용)
+                        tag_html = f"<br/><font point-size='9' color='#f1c40f'>🔖 {tags}</font>"
+                        label = f"<{wrap_text(feat, 12)}{tag_html}>"
+                    else:
+                        label = f"<{wrap_text(feat, 12)}>"
+
+                    dot.append(f'    "{f_id}" [label={label}, shape=note, color="{color}"];')
+
+
+
+
+
+
+
+
+
+
+
 import re
 from graphviz import Digraph
 import xmltodict
