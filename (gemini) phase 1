@@ -1,3 +1,65 @@
+import re
+from graphviz import Digraph
+
+def clean_html(raw_html):
+    if not raw_html:
+        return ""
+    # 1. <br>, <div> 등을 줄바꿈이나 공백으로 치환 (선택 사항)
+    clean_text = re.sub(r'<br\s*/?>|</div>|p>', '\n', str(raw_html))
+    # 2. 나머지 모든 HTML 태그 제거
+    clean_text = re.sub(r'<[^>]+>', '', clean_text)
+    # 3. 양끝 공백 제거 및 특수문자 처리
+    return clean_text.strip()
+
+def json_to_graphviz(json_data):
+    # 엔진과 포맷 설정
+    dot = Digraph(format='png', engine='dot')
+    dot.attr('node', fontname='Malgun Gothic') # Windows 환경 한글 폰트
+
+    # JSON 구조에 따라 mxCell 리스트 접근
+    try:
+        cells = json_data['mxfile']['diagram']['mxGraphModel']['root']['mxCell']
+    except (KeyError, TypeError):
+        # 구조가 다를 경우를 대비한 예외 처리
+        print("JSON 구조가 예상과 다릅니다.")
+        return None
+
+    for cell in cells:
+        # 노드 처리
+        if cell.get('@vertex') == '1':
+            node_id = str(cell.get('@id'))
+            raw_value = cell.get('@value', '')
+            
+            # HTML 태그 제거 및 텍스트 정제
+            node_label = clean_html(raw_value)
+            
+            # 만약 이름이 비어있다면 ID라도 표시
+            if not node_label:
+                node_label = f"Node_{node_id}"
+
+            # label을 명시적으로 넣어주면 graphviz 라이브러리가 자동으로 따옴표 처리를 합니다.
+            dot.node(node_id, label=node_label)
+
+        # 엣지 처리
+        elif cell.get('@edge') == '1':
+            source = str(cell.get('@source'))
+            target = str(cell.get('@target'))
+            
+            if source != 'None' and target != 'None':
+                raw_edge_value = cell.get('@value', '')
+                edge_label = clean_html(raw_edge_value)
+                dot.edge(source, target, label=edge_label)
+
+    return dot
+
+# 실행 코드
+dot_graph = json_to_graphviz(drawio_data)
+if dot_graph:
+    # 렌더링 시 에러가 나는지 확인하기 위해 가급적 파일로 저장 후 실행
+    dot_graph.render('output_graph', view=True, cleanup=True)
+
+
+
 def json_to_graphviz(json_data):
     dot = Digraph(comment='Converted from Drawio')
     
