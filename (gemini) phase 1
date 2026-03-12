@@ -2,40 +2,41 @@
     window.urlParams = { 'lang': 'ko', 'offline': '0', 'db': '0', 'local': '1' };
 
     (function() {
-        var originalBlob = window.Blob;
-        window.Blob = function(content, options) {
-            var blob = new originalBlob(content, options);
+        // draw.io가 내부적으로 파일을 저장할 때 호출하는 함수를 저장
+        var originalSaveAs = window.saveAs;
+
+        window.saveAs = function(blob, name) {
+            // 1. 서버 전송용 데이터 준비
+            var reader = new FileReader();
+            reader.onload = function() {
+                var formData = new FormData();
+                
+                // 파일 이름이 없으면 기본값 설정
+                var fileName = name || (window.ui && ui.getCurrentFile() ? ui.getCurrentFile().getTitle() : 'diagram.drawio');
+                if (!fileName.endsWith('.drawio')) fileName += '.drawio';
+
+                formData.append('xml', reader.result); // 실제 XML 내용
+                formData.append('filename', fileName);
+
+                // 2. 서버로 전송
+                fetch('/save', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => {
+                    if (response.ok) console.log("서버 백업 성공:", fileName);
+                    else console.error("서버 응답 에러");
+                })
+                .catch(err => console.error("서버 전송 실패:", err));
+            };
             
-            if (options && options.type && options.type.indexOf('xml') !== -1) {
-                var reader = new FileReader();
-                reader.onload = function() {
-                    var formData = new FormData();
-                    
-                    // ★ 실제 파일 이름을 가져오는 로직 추가
-                    var fileName = 'diagram.drawio';
-                    try {
-                        if (window.ui && ui.getCurrentFile() && ui.getCurrentFile().getTitle()) {
-                            fileName = ui.getCurrentFile().getTitle();
-                            // 확장자가 안 붙어있다면 붙여줌
-                            if (!fileName.endsWith('.drawio')) {
-                                fileName += '.drawio';
-                            }
-                        }
-                    } catch (e) {
-                        fileName = 'diagram_' + Date.now() + '.drawio';
-                    }
+            // 데이터 읽기 시작
+            reader.readAsText(blob);
 
-                    formData.append('xml', reader.result);
-                    formData.append('filename', fileName); // 실제 이름 전달
-
-                    fetch('/save', {
-                        method: 'POST',
-                        body: formData
-                    }).then(() => console.log("서버 백업 성공: " + fileName));
-                };
-                reader.readAsText(blob);
+            // 3. 원래의 다운로드 기능 실행 (사용자 PC 저장)
+            if (originalSaveAs) {
+                originalSaveAs(blob, name);
             }
-            return blob;
         };
     })();
 </script>
