@@ -1,5 +1,23 @@
 import re
 from graphviz import Digraph
+import xmltodict
+import json
+import zlib
+import base64
+from urllib.parse import unquote
+
+def parse_drawio_xml(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = xmltodict.parse(f.read())
+    
+    # draw.io는 mxGraphModel 태그 안에 노드(mxCell) 정보를 담습니다.
+    # 만약 파일이 압축되어 있다면 복호화 과정이 필요할 수 있습니다.
+    return data
+
+# 파일 읽기 및 JSON 저장 예시
+drawio_data = parse_drawio_xml('my_diagram.drawio')
+with open('diagram_data.json', 'w', encoding='utf-8') as f:
+    json.dump(drawio_data, f, indent=4, ensure_ascii=False)
 
 def clean_html(raw_html):
     if not raw_html:
@@ -57,85 +75,6 @@ dot_graph = json_to_graphviz(drawio_data)
 if dot_graph:
     # 렌더링 시 에러가 나는지 확인하기 위해 가급적 파일로 저장 후 실행
     dot_graph.render('output_graph', view=True, cleanup=True)
-
-
-
-def json_to_graphviz(json_data):
-    dot = Digraph(comment='Converted from Drawio')
-    
-    # 폰트 깨짐 방지 (한글 설정)
-    dot.attr('node', fontname='NanumGothic') # 시스템에 설치된 한글 폰트명 지정
-
-    # 셀 데이터 추출 (경로는 JSON 구조에 따라 확인 필요)
-    # 보통 root 아래의 mxCell 리스트를 순회합니다.
-    cells = json_data['mxfile']['diagram']['mxGraphModel']['root']['mxCell']
-    
-    for cell in cells:
-        # 1. 노드(Vertex) 처리
-        if cell.get('@vertex') == '1':
-            node_id = cell.get('@id')
-            # 표시될 이름(@value)이 있으면 사용하고, 없으면 ID를 사용
-            node_label = cell.get('@value', '') 
-            
-            # HTML 태그 등이 섞여 있을 수 있으므로 정제(Clean)가 필요할 수 있음
-            dot.node(node_id, label=node_label)
-            
-        # 2. 엣지(Edge) 처리
-        elif cell.get('@edge') == '1':
-            source = cell.get('@source')
-            target = cell.get('@target')
-            
-            if source and target:
-                # 선 위에도 텍스트가 있다면 label 추가
-                edge_label = cell.get('@value', '')
-                dot.edge(source, target, label=edge_label)
-                
-    return dot
-
-
-import xmltodict
-import json
-import zlib
-import base64
-from urllib.parse import unquote
-
-def parse_drawio_xml(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = xmltodict.parse(f.read())
-    
-    # draw.io는 mxGraphModel 태그 안에 노드(mxCell) 정보를 담습니다.
-    # 만약 파일이 압축되어 있다면 복호화 과정이 필요할 수 있습니다.
-    return data
-
-# 파일 읽기 및 JSON 저장 예시
-drawio_data = parse_drawio_xml('my_diagram.drawio')
-with open('diagram_data.json', 'w', encoding='utf-8') as f:
-    json.dump(drawio_data, f, indent=4, ensure_ascii=False)
-
-
-from graphviz import Digraph
-
-def json_to_graphviz(json_data):
-    dot = Digraph(comment='Converted from Drawio')
-    
-    # draw.io XML 구조에 따라 접근 (버전에 따라 경로가 다를 수 있음)
-    cells = json_data['mxfile']['diagram']['mxGraphModel']['root']['mxCell']
-    
-    for cell in cells:
-        # 노드인 경우 (value가 있고 source/target이 없는 경우)
-        if 'value' in cell and '@vertex' in cell:
-            dot.node(cell['@id'], cell['@value'])
-            
-        # 연결선인 경우 (source와 target ID가 있는 경우)
-        elif '@edge' in cell and '@source' in cell and '@target' in cell:
-            dot.edge(cell['@source'], cell['@target'])
-            
-    return dot
-
-# 실행 및 이미지 생성
-dot_graph = json_to_graphviz(drawio_data)
-dot_graph.render('output_graph', format='png', view=True)
-
 
 
 
