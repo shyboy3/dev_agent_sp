@@ -1,3 +1,32 @@
+<script type="text/javascript">
+    // 1. 서버 경로 강제 지정 (절대 경로 사용)
+    window.SAVE_URL = '/save';
+    window.EXPORT_URL = '/save';
+    window.OPEN_URL = '/open';
+
+    // 2. draw.io가 내부적으로 참조하는 전역 설정 객체 생성
+    window.DRAWIO_CONFIG = {
+        "service": "none",
+        "defaultLocalStorage": true
+    };
+
+    // 3. 엔진이 실행되기 전 파라미터 강제 주입 함수
+    (function() {
+        var params = {};
+        params['offline'] = '1';
+        params['local'] = '1';
+        params['save'] = 'remote'; // 서버 전송 유도 핵심
+        params['db'] = '0';
+        params['gdrive'] = '0';
+        params['browser'] = '0';   // 브라우저 저장을 비활성화하여 서버 저장을 유도
+        
+        // draw.io 엔진이 읽는 변수명인 urlParams에 덮어쓰기
+        window.urlParams = params;
+    })();
+</script>
+
+
+
 <body class="geEditor geClassic">
 <div id="geInfo">
     </div>
