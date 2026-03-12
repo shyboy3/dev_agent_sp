@@ -1,3 +1,33 @@
+from flask import Flask, request, send_from_directory
+import os
+
+app = Flask(__name__, static_folder='webapp') # draw.io 소스 폴더 경로
+
+# 1. draw.io 화면을 보여주는 경로
+@app.route('/')
+def index():
+    return send_from_directory(app.static_folder, 'index.html')
+
+# 2. 파일을 서버에 저장하는 경로 (POST 요청)
+@app.route('/save', methods=['POST'])
+def save_file():
+    filename = request.form.get('filename', 'diagram.drawio')
+    xml_data = request.form.get('xml')
+    
+    # 서버의 'saves' 폴더에 저장
+    if not os.path.exists('saves'):
+        os.makedirs('saves')
+        
+    with open(f"saves/{filename}", "w", encoding="utf-8") as f:
+        f.write(xml_data)
+        
+    return "저장 완료!", 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+
+
+
 def generate_main_tree(selected_cls, data):
     dot = [
         'digraph G { compound=true; rankdir=LR; splines=polyline; nodesep=0.5; ranksep=1.0; fontname="Malgun Gothic";',
