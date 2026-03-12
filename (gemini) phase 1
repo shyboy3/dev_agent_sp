@@ -1,3 +1,36 @@
+def json_to_graphviz(json_data):
+    dot = Digraph(comment='Converted from Drawio')
+    
+    # 폰트 깨짐 방지 (한글 설정)
+    dot.attr('node', fontname='NanumGothic') # 시스템에 설치된 한글 폰트명 지정
+
+    # 셀 데이터 추출 (경로는 JSON 구조에 따라 확인 필요)
+    # 보통 root 아래의 mxCell 리스트를 순회합니다.
+    cells = json_data['mxfile']['diagram']['mxGraphModel']['root']['mxCell']
+    
+    for cell in cells:
+        # 1. 노드(Vertex) 처리
+        if cell.get('@vertex') == '1':
+            node_id = cell.get('@id')
+            # 표시될 이름(@value)이 있으면 사용하고, 없으면 ID를 사용
+            node_label = cell.get('@value', '') 
+            
+            # HTML 태그 등이 섞여 있을 수 있으므로 정제(Clean)가 필요할 수 있음
+            dot.node(node_id, label=node_label)
+            
+        # 2. 엣지(Edge) 처리
+        elif cell.get('@edge') == '1':
+            source = cell.get('@source')
+            target = cell.get('@target')
+            
+            if source and target:
+                # 선 위에도 텍스트가 있다면 label 추가
+                edge_label = cell.get('@value', '')
+                dot.edge(source, target, label=edge_label)
+                
+    return dot
+
+
 import xmltodict
 import json
 import zlib
