@@ -1,46 +1,46 @@
-<script type="text/javascript">
-    window.urlParams = { 'lang': 'ko', 'offline': '0', 'db': '0', 'local': '1' };
+import xmltodict
+import json
+import zlib
+import base64
+from urllib.parse import unquote
 
-    (function() {
-        // draw.io가 내부적으로 파일을 저장할 때 호출하는 함수를 저장
-        var originalSaveAs = window.saveAs;
+def parse_drawio_xml(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = xmltodict.parse(f.read())
+    
+    # draw.io는 mxGraphModel 태그 안에 노드(mxCell) 정보를 담습니다.
+    # 만약 파일이 압축되어 있다면 복호화 과정이 필요할 수 있습니다.
+    return data
 
-        window.saveAs = function(blob, name) {
-            // 1. 서버 전송용 데이터 준비
-            var reader = new FileReader();
-            reader.onload = function() {
-                var formData = new FormData();
-                
-                // 파일 이름이 없으면 기본값 설정
-                var fileName = name || (window.ui && ui.getCurrentFile() ? ui.getCurrentFile().getTitle() : 'diagram.drawio');
-                if (!fileName.endsWith('.drawio')) fileName += '.drawio';
+# 파일 읽기 및 JSON 저장 예시
+drawio_data = parse_drawio_xml('my_diagram.drawio')
+with open('diagram_data.json', 'w', encoding='utf-8') as f:
+    json.dump(drawio_data, f, indent=4, ensure_ascii=False)
 
-                formData.append('xml', reader.result); // 실제 XML 내용
-                formData.append('filename', fileName);
 
-                // 2. 서버로 전송
-                fetch('/save', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => {
-                    if (response.ok) console.log("서버 백업 성공:", fileName);
-                    else console.error("서버 응답 에러");
-                })
-                .catch(err => console.error("서버 전송 실패:", err));
-            };
+from graphviz import Digraph
+
+def json_to_graphviz(json_data):
+    dot = Digraph(comment='Converted from Drawio')
+    
+    # draw.io XML 구조에 따라 접근 (버전에 따라 경로가 다를 수 있음)
+    cells = json_data['mxfile']['diagram']['mxGraphModel']['root']['mxCell']
+    
+    for cell in cells:
+        # 노드인 경우 (value가 있고 source/target이 없는 경우)
+        if 'value' in cell and '@vertex' in cell:
+            dot.node(cell['@id'], cell['@value'])
             
-            // 데이터 읽기 시작
-            reader.readAsText(blob);
+        # 연결선인 경우 (source와 target ID가 있는 경우)
+        elif '@edge' in cell and '@source' in cell and '@target' in cell:
+            dot.edge(cell['@source'], cell['@target'])
+            
+    return dot
 
-            // 3. 원래의 다운로드 기능 실행 (사용자 PC 저장)
-            if (originalSaveAs) {
-                originalSaveAs(blob, name);
-            }
-        };
-    })();
-</script>
-<script src="js/main.js"></script>
+# 실행 및 이미지 생성
+dot_graph = json_to_graphviz(drawio_data)
+dot_graph.render('output_graph', format='png', view=True)
+
 
 
 
