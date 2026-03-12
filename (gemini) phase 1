@@ -1,4 +1,56 @@
 <script type="text/javascript">
+    // 1. 기본값: 저장 주소를 모두 비워둡니다 (로컬 저장 활성화)
+    window.SAVE_URL = null;
+    window.EXPORT_URL = null; 
+
+    window.DRAWIO_CONFIG = {
+        "service": "none",
+        "defaultLocalStorage": true
+    };
+
+    (function() {
+        var params = {};
+        params['lang'] = 'ko';
+        params['offline'] = '1'; // ★ 다시 1로 설정 (새 파일 만들기/저장 가능해짐)
+        params['db'] = '0';
+        params['local'] = '1';
+        window.urlParams = params;
+    })();
+
+    // 2. 핵심 트릭: 사용자가 '내보내기' 메뉴를 누르는 순간만 서버 주소를 주입합니다.
+    // 이 방식은 draw.io의 내부 로직을 방해하지 않으면서 통신망만 잠시 뚫어줍니다.
+    var originalExport = null;
+
+    window.addEventListener('load', function() {
+        // draw.io UI 객체가 로드될 때까지 잠시 기다린 후 실행
+        var checkEditor = setInterval(function() {
+            if (window.EditorUi && EditorUi.prototype.exportFile) {
+                clearInterval(checkEditor);
+                
+                // 내보내기 함수를 가로챕니다.
+                var oldExport = EditorUi.prototype.exportFile;
+                EditorUi.prototype.exportFile = function() {
+                    // 내보내기 창이 뜨기 직전에만 EXPORT_URL을 서버 주소로 할당
+                    window.EXPORT_URL = '/save';
+                    
+                    // 내보내기가 실행되는 동안 일시적으로 오프라인 모드를 해제하는 트릭
+                    var originalOffline = window.urlParams['offline'];
+                    window.urlParams['offline'] = '0';
+                    
+                    oldExport.apply(this, arguments);
+                    
+                    // 실행 후 다시 로컬 모드로 복구
+                    window.urlParams['offline'] = originalOffline;
+                };
+            }
+        }, 500);
+    });
+</script>
+<script src="js/main.js"></script>
+
+
+
+<script type="text/javascript">
     // 1. 서버 경로 강제 지정 (절대 경로 사용)
     window.SAVE_URL = '/save';
     window.EXPORT_URL = '/save';
