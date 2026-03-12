@@ -1,52 +1,58 @@
 <script type="text/javascript">
-    // 1. 기본값: 저장 주소를 모두 비워둡니다 (로컬 저장 활성화)
-    window.SAVE_URL = null;
-    window.EXPORT_URL = null; 
+    // 1. 초기 설정: 완벽한 로컬 모드로 시작 (새 파일 만들기 해결)
+    window.DRAWIO_CONFIG = { "service": "none", "defaultLocalStorage": true };
+    window.urlParams = { 'lang': 'ko', 'offline': '1', 'db': '0', 'local': '1' };
 
-    window.DRAWIO_CONFIG = {
-        "service": "none",
-        "defaultLocalStorage": true
-    };
-
+    // 2. 브라우저의 파일 저장 기능을 가로채는 마법의 코드
     (function() {
-        var params = {};
-        params['lang'] = 'ko';
-        params['offline'] = '1'; // ★ 다시 1로 설정 (새 파일 만들기/저장 가능해짐)
-        params['db'] = '0';
-        params['local'] = '1';
-        window.urlParams = params;
-    })();
+        var originalSaveAs = window.saveAs; // draw.io가 사용하는 저장 라이브러리
+        
+        window.saveAs = function(blob, name) {
+            // 파일을 서버로 전송하는 로직
+            var formData = new FormData();
+            formData.append('xml', blob, name);
+            formData.append('filename', name);
 
-    // 2. 핵심 트릭: 사용자가 '내보내기' 메뉴를 누르는 순간만 서버 주소를 주입합니다.
-    // 이 방식은 draw.io의 내부 로직을 방해하지 않으면서 통신망만 잠시 뚫어줍니다.
-    var originalExport = null;
+            fetch('/save', {
+                method: 'POST',
+                body: formData
+            }).then(response => {
+                console.log('서버 전송 완료');
+            }).catch(err => {
+                console.error('서버 전송 실패', err);
+            });
 
-    window.addEventListener('load', function() {
-        // draw.io UI 객체가 로드될 때까지 잠시 기다린 후 실행
-        var checkEditor = setInterval(function() {
-            if (window.EditorUi && EditorUi.prototype.exportFile) {
-                clearInterval(checkEditor);
-                
-                // 내보내기 함수를 가로챕니다.
-                var oldExport = EditorUi.prototype.exportFile;
-                EditorUi.prototype.exportFile = function() {
-                    // 내보내기 창이 뜨기 직전에만 EXPORT_URL을 서버 주소로 할당
-                    window.EXPORT_URL = '/save';
-                    
-                    // 내보내기가 실행되는 동안 일시적으로 오프라인 모드를 해제하는 트릭
-                    var originalOffline = window.urlParams['offline'];
-                    window.urlParams['offline'] = '0';
-                    
-                    oldExport.apply(this, arguments);
-                    
-                    // 실행 후 다시 로컬 모드로 복구
-                    window.urlParams['offline'] = originalOffline;
-                };
+            // 원래의 다운로드 기능도 수행 (사용자 PC 저장)
+            if (originalSaveAs) {
+                originalSaveAs(blob, name);
             }
-        }, 500);
-    });
+        };
+    })();
 </script>
 <script src="js/main.js"></script>
+
+
+@app.route('/save', methods=['POST'])
+def save():
+    # 파일 객체로 넘어오는 경우와 일반 텍스트로 넘어오는 경우 모두 처리
+    file = request.files.get('xml')
+    filename = request.form.get('filename', 'diagram.drawio')
+
+    if not os.path.exists('saves'):
+        os.makedirs('saves')
+
+    save_path = os.path.join('saves', filename)
+
+    if file:
+        file.save(save_path)
+    else:
+        # 텍스트로 넘어올 경우 대비
+        xml_data = request.form.get('xml')
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(xml_data)
+
+    print(f"저장 성공: {save_path}")
+    return "OK", 200
 
 
 
