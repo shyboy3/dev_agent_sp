@@ -1,3 +1,48 @@
+    # --- [도형 모양 판별 로직 확장] ---
+    raw_shape = style_dict.get('shape', '').lower()
+    
+    # 1. 육각형 (Hexagon) - 이미 성공!
+    if 'hexagon' in raw_shape:
+        attrs['shape'] = 'hexagon'
+    
+    # 2. 마름모 (Decision / Rhombus)
+    elif 'rhombus' in raw_shape or 'decision' in raw_shape:
+        attrs['shape'] = 'diamond'
+    
+    # 3. 타원/원 (Start / End / Ellipse)
+    elif 'ellipse' in raw_shape or 'circle' in raw_shape:
+        attrs['shape'] = 'ellipse'
+    
+    # 4. 평행사변형 (Data Input/Output)
+    elif 'parallelogram' in raw_shape:
+        attrs['shape'] = 'parallelogram'
+    
+    # 5. 사다리꼴 (Manual Operation)
+    elif 'trapezoid' in raw_shape:
+        attrs['shape'] = 'trapezoid'
+    
+    # 6. 실린더 (Database / Storage)
+    elif 'cylinder' in raw_shape:
+        attrs['shape'] = 'cylinder'
+    
+    # 7. 문서 형태 (Document)
+    elif 'document' in raw_shape:
+        attrs['shape'] = 'note'  # 또는 'document'
+    
+    # 8. 내부 저장소 (Internal Storage)
+    elif 'internalstorage' in raw_shape:
+        attrs['shape'] = 'rect'
+        attrs['style'] = 'filled,diagonals' # 대각선 줄무늬 스타일
+    
+    # 9. 구름 (Cloud / Network)
+    elif 'cloud' in raw_shape:
+        attrs['shape'] = 'cloud' # Viz.js 버전에 따라 'egg'로 대체될 수 있음
+
+    else:
+        attrs['shape'] = 'box' # 기본값은 사각형
+
+
+
 def parse_drawio_style(style_str):
     # 기본값 설정
     attrs = {'shape': 'box', 'style': 'filled', 'fillcolor': '#ffffff', 'fontcolor': 'black'}
