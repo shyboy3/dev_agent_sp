@@ -1,70 +1,76 @@
 from graphviz import Digraph
 
+from graphviz import Digraph
+
 def generate_wf_viz(steps):
-    """
-    기존의 Streamlit 친화적인 디자인을 유지하면서,
-    draw.io 도형 스타일과 간선 중복 버그를 해결한 통합 렌더링 함수입니다.
-    """
-    # Streamlit의 st.graphviz_chart는 Digraph 객체를 아주 잘 인식합니다.
     dot = Digraph(engine='dot')
     dot.attr(rankdir='TB', splines='polyline', nodesep='0.4', ranksep='0.6')
     dot.attr('node', fontname='Malgun Gothic', fontsize='11')
     dot.attr('edge', fontname='Malgun Gothic', fontsize='9')
     
-    # 기존 코드의 시그니처였던 START 노드 유지
+    # START 노드
     dot.node('start', label='START', shape='ellipse', style='filled', fillcolor='#2ecc71', fontcolor='white')
     
     step_ids = [str(s['id']) for s in steps]
     
-    # 1. 노드 그리기
+    # 1. 노드 그리기 (도형 스타일 반영)
     for s in steps:
         s_id = str(s['id'])
         label_text = f"Step {s_id}: {s['name']}\n(Agent: {s['agent']})"
         
-        # [Q1 반영] 도형 스타일 적용
         style_str = s.get('style', '')
         if style_str:
             node_attrs = parse_drawio_style(style_str)
         else:
-            # draw.io 스타일이 없을 때의 기본값 (기존 코드의 보라색 테마 유지)
             node_attrs = {'shape': 'box', 'style': 'filled', 'fillcolor': '#9b59b6', 'fontcolor': 'white'}
             
         node_attrs['label'] = label_text
         dot.node(s_id, **node_attrs)
         
-        # 최상단 노드를 START와 연결 (기존 로직 유지)
+        # 최상위 노드 연결
         if not s.get('parent_id') or str(s['parent_id']) not in step_ids:
-            # 단, drawio의 그룹핑 자식인 경우는 START와 연결하지 않음
-            if not s.get('drawio_parent') or str(s['drawio_parent']) in ['0', '1']:
-                dot.edge('start', s_id)
+            dot.edge('start', s_id)
 
-    # 2. 간선 그리기 (중복 해결)
-    all_edges = set()
-    
+    # 간선 중복 체크용 집합
+    all_edges = set() 
+
+    # 2. 간선 그리기 (제안하신 로직 완벽 반영)
     for s in steps:
         curr_id = str(s['id'])
         
-        # Next 간선 (기존 ok 초록선) - 여기서 한 번만 그립니다!
+        # [수정] ① 부모(parent_id) -> 나 : 이것도 정식 흐름이므로 초록색 OK로 통일!
+        parent_id = str(s.get('parent_id', ''))
+        if parent_id and parent_id in step_ids:
+            if (parent_id, curr_id) not in all_edges:
+                dot.edge(parent_id, curr_id, color='green', label='ok')
+                all_edges.add((parent_id, curr_id))
+
+        # [수정] ② 나 -> 다음(next_id) : 기존과 동일하게 초록색 OK. (중복 방지)
         next_id = str(s.get('next_id', ''))
         if next_id and next_id in step_ids:
-            dot.edge(curr_id, next_id, color='green', label='ok')
-            all_edges.add((curr_id, next_id))
-            
-        # Fail 간선 (기존 fail 빨간 점선)
+            if (curr_id, next_id) not in all_edges:
+                dot.edge(curr_id, next_id, color='green', label='ok')
+                all_edges.add((curr_id, next_id))
+
+        # ③ 나 -> 실패(fail_id) : 빨간색 점선 유지
         fail_id = str(s.get('fail_id', ''))
         if fail_id and fail_id in step_ids:
-            dot.edge(curr_id, fail_id, color='red', style='dashed', label='fail')
-            all_edges.add((curr_id, fail_id))
-            
-        # [Q2 반영] drawio_parent 구조적 간선 (중복 체크)
+            if (curr_id, fail_id) not in all_edges:
+                dot.edge(curr_id, fail_id, color='red', style='dashed', label='fail')
+                all_edges.add((curr_id, fail_id))
+
+    # 3. draw.io 그룹핑 간선 처리 (회색 점선)
+    for s in steps:
+        curr_id = str(s['id'])
         d_parent = str(s.get('drawio_parent', ''))
+        
         if d_parent and d_parent in step_ids and d_parent != curr_id:
-            # 이미 Next나 Fail로 명시적 선이 그어졌다면 무시 (선 중복 완벽 차단)
+            # 위에서 초록색/빨간색으로 명시적 흐름이 그어지지 않은 순수 '그룹핑'만 희미하게 표시
             if (d_parent, curr_id) not in all_edges and (curr_id, d_parent) not in all_edges:
-                # 눈에 보이지 않던 그룹핑 관계만 회색 점선으로 살짝 표시
                 dot.edge(d_parent, curr_id, style='dashed', color='gray', label='')
 
     return dot
+
 
 
 
