@@ -1,3 +1,116 @@
+def drawio_to_wf_dict(xml_content):
+    """draw.io XML을 프로그램 내부의 워크플로우 dict 형태로 변환합니다."""
+    graph_model = decode_drawio_diagram(xml_content)
+    if not graph_model: return None
+
+    try:
+        cells = graph_model['root']['mxCell']
+        if isinstance(cells, dict): cells = [cells] # 노드가 1개일 경우 리스트로 강제 변환
+    except KeyError:
+        return None
+
+    wf_dict = {}
+    
+    # 1. 노드(Vertex) 먼저 수집
+    for cell in cells:
+        if cell.get('@vertex') == '1':
+            node_id = cell.get('@id')
+            name = clean_html(cell.get('@value', '')) or f"Step_{node_id}"
+            
+            wf_dict[node_id] = {
+                "id": node_id,
+                "name": name,
+                "agent": "Auto",     
+                "task": "draw.io에서 임포트됨",
+                "parent": "",
+                "next": "",
+                "fail": "",
+                # ==========================================
+                # [수정된 부분] Q1, Q2를 위한 정보 추가 추출
+                # ==========================================
+                "style": cell.get('@style', ''),          # [Q1] 도형 및 색상 정보
+                "drawio_parent": cell.get('@parent', '')  # [Q2] draw.io 상의 구조적 부모 (간선 중복 해결용)
+            }
+
+    # 2. 연결선(Edge)을 바탕으로 parent, next, fail 매핑
+    for cell in cells:
+        if cell.get('@edge') == '1':
+            source = cell.get('@source')
+            target = cell.get('@target')
+            label = clean_html(cell.get('@value', '')).lower()
+            
+            if source in wf_dict and target in wf_dict:
+                wf_dict[target]['parent'] = source
+                # 라벨에 fail, 실패, no 등이 들어가면 실패 분기로 처리
+                if any(x in label for x in ['fail', '실패', 'no', '아니오']):
+                    wf_dict[source]['fail'] = target
+                else:
+                    wf_dict[source]['next'] = target
+
+    return wf_dict
+
+
+
+from graphviz import Digraph
+
+def create_integrated_svg_chart_from_dict(wf_dict, output_filename):
+    """wf_dict 데이터를 바탕으로 도형과 연결선이 최적화된 SVG를 생성합니다."""
+    dot = Digraph(format='svg', engine='dot')
+    dot.attr('node', fontname='Malgun Gothic')
+    dot.attr('edge', fontname='Malgun Gothic')
+
+    all_edges = [] # 중복 체크용 간선 리스트 [{'source': x, 'target': y}]
+
+    # 1. 노드 그리기 (Q1 도형 정보 반영)
+    for node_id, node_info in wf_dict.items():
+        node_label = node_info.get('name', '')
+        
+        # 앞서 만든 parse_drawio_style을 이용해 문자열을 Graphviz 속성으로 바꿉니다.
+        node_attrs = parse_drawio_style(node_info.get('style', ''))
+        node_attrs['label'] = node_label
+        
+        dot.node(node_id, **node_attrs)
+
+    # 2. 명시적 연결선 그리기 (next, fail을 바탕으로)
+    for node_id, node_info in wf_dict.items():
+        # 성공/다음(next) 간선
+        next_id = node_info.get('next')
+        if next_id and next_id in wf_dict:
+            all_edges.append({'source': node_id, 'target': next_id})
+            dot.edge(node_id, next_id, label='') 
+            
+        # 실패(fail) 간선 (시각적 구분을 위해 빨간색 지정)
+        fail_id = node_info.get('fail')
+        if fail_id and fail_id in wf_dict:
+            all_edges.append({'source': node_id, 'target': fail_id})
+            dot.edge(node_id, fail_id, label='Fail', color='red', fontcolor='red')
+
+    # 3. 구조적 부모-자식 관계 그리기 (Q2 선 누락/중복 해결)
+    for node_id, node_info in wf_dict.items():
+        d_parent = node_info.get('drawio_parent')
+        
+        # 부모가 유효한 노드(0, 1번 레이어가 아님)이고 자기 자신이 아닐 때
+        if d_parent and d_parent in wf_dict and d_parent != node_id:
+            # 이미 next나 fail로 연결된 선이 있는지 중복 체크
+            edge_exists = any(e['source'] == d_parent and e['target'] == node_id for e in all_edges)
+            
+            # 명시적 선(Edge)이 없을 때만 부모 관계를 선으로 이어줌 (점선으로 차별화)
+            if not edge_exists:
+                dot.edge(d_parent, node_id, label='', style='dashed', color='gray')
+
+    # SVG 파일로 렌더링
+    dot.render(output_filename, cleanup=True, view=False)
+    print(f"--- SVG 차트 생성 완료: {output_filename}.svg ---")
+
+
+
+
+
+
+
+
+
+
 import xmltodict
 import re
 import os
