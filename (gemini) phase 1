@@ -1,3 +1,67 @@
+import streamlit as st
+import json
+import os
+import time
+import urllib.parse
+
+st.set_page_config(page_title="사내망 실시간 뷰어", layout="wide")
+
+# 가급적 app.py 대신 독립된 graph_utils.py에서 가져오는 것을 권장합니다.
+from app import generate_wf_viz 
+
+st.title("📺 워크플로우 실시간 모니터 (오프라인 모드)")
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+vid = st.query_params.get("vid")
+fid = st.query_params.get("fid")
+
+if vid and fid:
+    safe_fid = urllib.parse.unquote(fid)
+    target_file = os.path.join(BASE_DIR, f"view_{vid}_{safe_fid}.json")
+    
+    if os.path.exists(target_file):
+        with open(target_file, "r", encoding="utf-8") as f:
+            wf_list = json.load(f)
+            
+        if wf_list:
+            dot_graph = generate_wf_viz(wf_list)
+            dot_source = dot_graph.source.replace("`", "'").replace("\n", " ")
+
+            # ⭐ 핵심: Viz.js 라이브러리를 사용하여 브라우저 내에서 직접 렌더링
+            # 사내망에서 CDN 접속이 안 될 경우를 대비해 스크립트를 직접 삽입하는 방식입니다.
+            html_template = f"""
+            <div id="graph" style="text-align: center;"></div>
+            <script src="https://github.com/mdaines/viz.js/releases/download/v2.1.2/viz.js"></script>
+            <script src="https://github.com/mdaines/viz.js/releases/download/v2.1.2/full.render.js"></script>
+            <script>
+                try {{
+                    var viz = new Viz();
+                    viz.renderSVGElement(`{dot_source}`)
+                    .then(function(element) {{
+                        document.getElementById('graph').appendChild(element);
+                    }})
+                    .catch(error => {{
+                        document.getElementById('graph').innerHTML = "렌더링 에러: " + error;
+                    }});
+                }} catch (e) {{
+                    document.getElementById('graph').innerHTML = "라이브러리 로드 실패 (사내망 보안 정책 확인)";
+                }}
+            </script>
+            """
+            # 만약 위 GitHub 링크조차 막혀있다면, viz.js 파일 2개를 다운받아 
+            # 로컬 pages 폴더에 넣고 경로를 지정해야 합니다.
+            st.components.v1.html(html_template, height=800, scrolling=True)
+            
+    else:
+        st.info("데이터 대기 중...")
+else:
+    st.error("잘못된 접근입니다.")
+
+time.sleep(2)
+st.rerun()
+
+
+
 import uuid # 맨 위에 추가
 
 def main():
