@@ -1,3 +1,112 @@
+from graphviz import Digraph
+
+def generate_wf_viz(steps):
+    """
+    기존의 Streamlit 친화적인 디자인을 유지하면서,
+    draw.io 도형 스타일과 간선 중복 버그를 해결한 통합 렌더링 함수입니다.
+    """
+    # Streamlit의 st.graphviz_chart는 Digraph 객체를 아주 잘 인식합니다.
+    dot = Digraph(engine='dot')
+    dot.attr(rankdir='TB', splines='polyline', nodesep='0.4', ranksep='0.6')
+    dot.attr('node', fontname='Malgun Gothic', fontsize='11')
+    dot.attr('edge', fontname='Malgun Gothic', fontsize='9')
+    
+    # 기존 코드의 시그니처였던 START 노드 유지
+    dot.node('start', label='START', shape='ellipse', style='filled', fillcolor='#2ecc71', fontcolor='white')
+    
+    step_ids = [str(s['id']) for s in steps]
+    
+    # 1. 노드 그리기
+    for s in steps:
+        s_id = str(s['id'])
+        label_text = f"Step {s_id}: {s['name']}\n(Agent: {s['agent']})"
+        
+        # [Q1 반영] 도형 스타일 적용
+        style_str = s.get('style', '')
+        if style_str:
+            node_attrs = parse_drawio_style(style_str)
+        else:
+            # draw.io 스타일이 없을 때의 기본값 (기존 코드의 보라색 테마 유지)
+            node_attrs = {'shape': 'box', 'style': 'filled', 'fillcolor': '#9b59b6', 'fontcolor': 'white'}
+            
+        node_attrs['label'] = label_text
+        dot.node(s_id, **node_attrs)
+        
+        # 최상단 노드를 START와 연결 (기존 로직 유지)
+        if not s.get('parent_id') or str(s['parent_id']) not in step_ids:
+            # 단, drawio의 그룹핑 자식인 경우는 START와 연결하지 않음
+            if not s.get('drawio_parent') or str(s['drawio_parent']) in ['0', '1']:
+                dot.edge('start', s_id)
+
+    # 2. 간선 그리기 (중복 해결)
+    all_edges = set()
+    
+    for s in steps:
+        curr_id = str(s['id'])
+        
+        # Next 간선 (기존 ok 초록선) - 여기서 한 번만 그립니다!
+        next_id = str(s.get('next_id', ''))
+        if next_id and next_id in step_ids:
+            dot.edge(curr_id, next_id, color='green', label='ok')
+            all_edges.add((curr_id, next_id))
+            
+        # Fail 간선 (기존 fail 빨간 점선)
+        fail_id = str(s.get('fail_id', ''))
+        if fail_id and fail_id in step_ids:
+            dot.edge(curr_id, fail_id, color='red', style='dashed', label='fail')
+            all_edges.add((curr_id, fail_id))
+            
+        # [Q2 반영] drawio_parent 구조적 간선 (중복 체크)
+        d_parent = str(s.get('drawio_parent', ''))
+        if d_parent and d_parent in step_ids and d_parent != curr_id:
+            # 이미 Next나 Fail로 명시적 선이 그어졌다면 무시 (선 중복 완벽 차단)
+            if (d_parent, curr_id) not in all_edges and (curr_id, d_parent) not in all_edges:
+                # 눈에 보이지 않던 그룹핑 관계만 회색 점선으로 살짝 표시
+                dot.edge(d_parent, curr_id, style='dashed', color='gray', label='')
+
+    return dot
+
+
+
+
+
+# --- 이 두 가지가 코드 상단에 꼭 있어야 generate_wf_viz가 작동합니다! ---
+
+DRAWIO_SHAPE_MAP = {
+    'ellipse': 'ellipse', 'rhombus': 'diamond', 'rounded': 'box', 
+    'trapezoid': 'trapezoid', 'parallelogram': 'parallelogram', 
+    'hex': 'hexagon', 'cloud': 'egg'
+}
+
+def parse_drawio_style(style_str):
+    style_data = {}
+    graphviz_attrs = {'style': 'filled', 'fillcolor': '#ffffff'}
+    if not style_str: return graphviz_attrs
+    
+    for pair in style_str.split(';'):
+        if '=' in pair:
+            key, val = pair.split('=')
+            style_data[key.strip()] = val.strip()
+        elif pair.strip():
+            style_data[pair.strip()] = True
+
+    gv_shape = DRAWIO_SHAPE_MAP.get(style_data.get('shape'), 'box')
+    graphviz_attrs['shape'] = gv_shape
+    if style_data.get('rounded') == '1': graphviz_attrs['style'] += ', rounded'
+    fill_color = style_data.get('fillColor')
+    if fill_color and fill_color != 'none': graphviz_attrs['fillcolor'] = fill_color
+    return graphviz_attrs
+
+
+
+
+
+
+
+
+
+
+
                         # ==========================================================
                         # 💡 특징(Feature) 태그 관리 폼
                         # ==========================================================
