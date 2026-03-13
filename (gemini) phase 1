@@ -1,3 +1,118 @@
+import streamlit as st
+import json
+import os
+
+# --- 기존에 정의해둔 헬퍼 함수들 (상단에 위치해야 함) ---
+# def clean_html(...): ...
+# def parse_drawio_style(...): ...
+# def decode_drawio_diagram(...): ...
+# def drawio_to_wf_dict(...): ...
+# def create_integrated_svg_chart_from_dict(...): ...
+
+# --- [3] 메인 앱 ---
+def main():
+    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
+
+    st.sidebar.title("🧬 Orchestration")
+    # ... (중략: 상단 계층도 및 그룹 관리 로직은 기존과 동일) ...
+
+    with col_wf:
+        st.subheader("⚙️ 워크플로우 편집기")
+        
+        # ... (중략: 그룹/아이템/특징 선택 로직은 기존과 동일) ...
+
+        # 3가지 변수가 모두 안전하게 선택되었을 때만 워크플로우 로직 실행
+        if sel_f:
+            # [기존 로직 유지]: draw.io 파일 임포트 폼
+            with st.expander("📥 draw.io 파일 임포트 (기존 데이터를 덮어씁니다)"):
+                uploaded_file = st.file_uploader("draw.io 파일(.drawio, .xml)을 업로드하세요", type=['xml', 'drawio'])
+                
+                if uploaded_file is not None:
+                    if st.button("파일에서 워크플로우 변환 적용", use_container_width=True):
+                        xml_content = uploaded_file.getvalue().decode("utf-8")
+                        # [업데이트된 함수 사용]: style과 drawio_parent 정보가 포함된 dict 반환
+                        imported_wf_dict = drawio_to_wf_dict(xml_content) 
+                        
+                        if imported_wf_dict:
+                            # ==========================================================
+                            # 💡 [수정된 부분]: master_data 저장 구조 변경
+                            # ==========================================================
+                            # 이전에는 'workflows' 아래에 리스트 형태로만 저장했지만, 
+                            # 이제는 Q1, Q2 구현을 위해 'style'과 'drawio_parent' 정보도 필요합니다.
+                            # 따라서 리스트 형태 대신 imported_wf_dict 형태(딕셔너리)를 그대로 저장하거나,
+                            # 리스트 요소 안에 새로 추가된 필드들을 포함시켜야 합니다.
+                            
+                            wf_list_mapped = []
+                            for step_id, step_data in imported_wf_dict.items():
+                                wf_list_mapped.append({
+                                    "id": str(step_data.get("id", "")),
+                                    "name": step_data.get("name", ""),
+                                    "agent": step_data.get("agent", "Auto"),
+                                    "tasks": [step_data.get("task", "draw.io 임포트")],
+                                    "parent_id": step_data.get("parent", ""),
+                                    "next_id": step_data.get("next", ""),
+                                    "fail_id": step_data.get("fail", ""),
+                                    # [Q1, Q2 정보 추가]
+                                    "style": step_data.get("style", ""),
+                                    "drawio_parent": step_data.get("drawio_parent", "")
+                                })
+                            
+                            wf_list_mapped.sort(key=lambda x: str(x['id']))
+                            st.session_state.master_data[selected_cls][sel_n][sel_m].setdefault("workflows", {})[sel_f] = wf_list_mapped
+                            save_data(st.session_state.master_data)
+                            st.success("파일이 성공적으로 변환 및 저장되었습니다!"); st.rerun()
+                        else:
+                            st.error("파일 파싱에 실패했습니다. draw.io 형식이 맞는지 확인해주세요.")
+
+            # ... (중략: 단계 리스트 렌더링 및 폼 수정 로직은 기존과 동일) ...
+
+            wf_list = current_data[sel_n][sel_m]["workflows"].get(sel_f, [])
+
+            # ==========================================================
+            # 💡 [수정된 부분]: 워크플로우 시각화 (SVG 생성 및 렌더링)
+            # ==========================================================
+            if wf_list:
+                # 1. wf_list(리스트 형태)를 create_integrated_svg_chart_from_dict 함수가
+                #    이해할 수 있는 딕셔너리 형태로 다시 변환합니다.
+                render_dict = {}
+                for item in wf_list:
+                    render_dict[item['id']] = item
+
+                # 2. 임시 SVG 파일명 설정
+                svg_filename = "temp_workflow"
+                svg_filepath = f"{svg_filename}.svg"
+
+                # 3. 새로운 통합 시각화 함수 호출 (임시 파일 생성)
+                try:
+                    create_integrated_svg_chart_from_dict(render_dict, svg_filename)
+                    
+                    # 4. Streamlit에 SVG 파일 내용 렌더링
+                    st.write("---")
+                    st.markdown("**🔄 워크플로우 시각화 (통합 구조)**")
+                    
+                    if os.path.exists(svg_filepath):
+                        with open(svg_filepath, "r", encoding="utf-8") as f:
+                            svg_content = f.read()
+                        
+                        # SVG 컨텐츠를 직접 HTML로 삽입
+                        st.components.v1.html(svg_content, width=800, height=600, scrolling=True)
+                        
+                        # (선택) 임시 파일 삭제
+                        # os.remove(svg_filepath) 
+                except Exception as e:
+                    st.error(f"시각화 생성 중 오류가 발생했습니다: {e}")
+                    # 에러 발생 시 기존 방식으로 fallback (선택 사항)
+                    # st.graphviz_chart(generate_wf_viz(wf_list))
+
+
+
+
+
+
+
+
 def drawio_to_wf_dict(xml_content):
     """draw.io XML을 프로그램 내부의 워크플로우 dict 형태로 변환합니다."""
     graph_model = decode_drawio_diagram(xml_content)
