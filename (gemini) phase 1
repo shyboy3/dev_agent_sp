@@ -1,4 +1,75 @@
 def parse_drawio_style(style_str):
+    # 기본값 설정
+    attrs = {'shape': 'box', 'style': 'filled', 'fillcolor': '#ffffff', 'fontcolor': 'black'}
+    
+    if not style_str or not isinstance(style_str, str):
+        return attrs
+
+    # 스타일 파싱 (세미콜론으로 분리)
+    style_dict = {}
+    for part in style_str.split(';'):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            style_dict[k.strip()] = v.strip()
+        elif part.strip():
+            style_dict[part.strip()] = True
+
+    # --- [도형 모양 판별 로직 강화] ---
+    raw_shape = style_dict.get('shape', '').lower()
+    
+    # mxgraph 형태나 복잡한 경로에서 핵심 단어만 추출
+    if 'rhombus' in raw_shape or 'decision' in raw_shape:
+        attrs['shape'] = 'diamond'
+    elif 'ellipse' in raw_shape or 'start' in raw_shape:
+        attrs['shape'] = 'ellipse'
+    elif 'parallelogram' in raw_shape:
+        attrs['shape'] = 'parallelogram'
+    elif 'hexagon' in raw_shape:
+        attrs['shape'] = 'hexagon'
+    else:
+        attrs['shape'] = 'box' # 기본값
+
+    # --- [둥근 모서리 및 색상] ---
+    if style_dict.get('rounded') == '1':
+        attrs['style'] = 'filled, rounded'
+    
+    f_color = style_dict.get('fillColor')
+    if f_color and f_color != 'none':
+        # #이 빠진 경우 보정
+        attrs['fillcolor'] = f_color if f_color.startswith('#') else f_color
+        # 색상이 너무 어두우면 폰트 흰색으로
+        try:
+            hex_color = attrs['fillcolor'].lstrip('#')
+            if len(hex_color) == 6:
+                r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+                if (r + g + b) < 350: attrs['fontcolor'] = 'white'
+        except: pass
+
+    return attrs
+
+def generate_wf_viz(steps):
+    dot = Digraph(engine='dot')
+    # ... 기본 설정 생략 ...
+
+    for s in steps:
+        s_id = str(s['id'])
+        style_str = s.get('style', '') # ❗ 여기서 데이터가 오는지 확인이 필요합니다.
+        
+        # 스타일 파싱 실행
+        node_attrs = parse_drawio_style(style_str)
+        
+        # 라벨 설정
+        node_attrs['label'] = f"Step {s_id}: {s['name']}\n({s['agent']})"
+        
+        # ⭐ 노드 생성 (언패킹 사용)
+        dot.node(s_id, **node_attrs)
+        
+    # ... 간선 로직 생략 ...
+    return dot
+
+
+
+def parse_drawio_style(style_str):
     """
     draw.io의 style 문자열을 Graphviz(Viz.js)가 이해하는 dict로 변환합니다.
     """
