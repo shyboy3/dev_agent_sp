@@ -1,3 +1,47 @@
+                        # ==========================================================
+                        # 💡 특징(Feature) 태그 관리 폼
+                        # ==========================================================
+                        if f_list:
+                            if "feature_meta" not in st.session_state.master_data[selected_cls][sel_n][sel_m]:
+                                st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"] = {}
+                                
+                            with st.expander("🏷️ 특징(Feature) 태그 관리"):
+                                for f_name in f_list:
+                                    if f_name not in st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"]:
+                                        st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name] = {"tags": ""}
+                                    
+                                    # --------------------------------------------------------
+                                    # ⭐ [여기서부터 추가!] 워크플로우 존재 여부에 따른 태그 자동화
+                                    # --------------------------------------------------------
+                                    # 1. 해당 특징에 워크플로우(리스트)가 비어있지 않은지 확인
+                                    has_wf = len(st.session_state.master_data[selected_cls][sel_n][sel_m].get("workflows", {}).get(f_name, [])) > 0
+                                    
+                                    # 2. 현재 태그 문자열을 리스트로 쪼개기 (예: "가격:100, 시간:10m" -> ['가격:100', '시간:10m'])
+                                    current_tags_str = st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"]
+                                    tag_list = [t.strip() for t in current_tags_str.split(',') if t.strip()]
+                                    
+                                    # 3. 워크플로우가 있는데 'workflow' 태그가 없으면 자동 추가
+                                    if has_wf and 'workflow' not in tag_list:
+                                        tag_list.append('workflow')
+                                        st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"] = ", ".join(tag_list)
+                                        
+                                    # 4. (선택) 워크플로우를 싹 지웠을 때 태그도 같이 뺄 거라면:
+                                    elif not has_wf and 'workflow' in tag_list:
+                                        tag_list.remove('workflow')
+                                        st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"] = ", ".join(tag_list)
+                                    # --------------------------------------------------------
+
+                                    # 아래는 원래 있던 텍스트 인풋 박스
+                                    tag_val = st.text_input(f"[{f_name}] 태그 입력 (예: 가격:100, 시간:10m)", 
+                                                            value=st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"], 
+                                                            key=f"tag_{f_name}")
+                                    st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"] = tag_val
+                                
+                                if st.button("💾 태그 일괄 저장", use_container_width=True):
+                                    save_data(st.session_state.master_data); st.success("태그가 저장되었습니다!"); st.rerun()
+
+
+
 import streamlit as st
 import json
 import os
