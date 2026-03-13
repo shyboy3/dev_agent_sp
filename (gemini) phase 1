@@ -1,3 +1,216 @@
+# --- [3] 메인 앱 ---
+def main():
+    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
+    if 'master_data' not in st.session_state:
+        st.session_state.master_data = load_data()
+
+    st.sidebar.title("🧬 Orchestration")
+    selected_cls = st.sidebar.selectbox("분석 클래스", CLASSES)
+    current_data = st.session_state.master_data[selected_cls]
+
+    # 상단 계층도 시각화
+    st.subheader(f"📊 {selected_cls} 계층도")
+    if current_data:
+        st.graphviz_chart(generate_main_tree(selected_cls, current_data))
+    else:
+        st.info("데이터가 없습니다. 아래에서 그룹을 추가하세요.")
+    st.divider()
+
+    col_manage, col_wf = st.columns([1, 1.4])
+
+    with col_manage:
+        st.subheader("📁 조직 계층 관리")
+        with st.expander("➕ 새 그룹 추가"):
+            new_n = st.text_input("그룹명")
+            if st.button("생성"):
+                if new_n and new_n not in current_data:
+                    st.session_state.master_data[selected_cls][new_n] = {}
+                    save_data(st.session_state.master_data); st.rerun()
+
+        for n_name in list(current_data.keys()):
+            gc1, gc2 = st.columns([4, 1])
+            gc1.markdown(f"**📁 {n_name}**")
+            if gc2.button("🗑️", key=f"del_n_{n_name}"):
+                del st.session_state.master_data[selected_cls][n_name]
+                save_data(st.session_state.master_data); st.rerun()
+            
+            for m_name in list(current_data[n_name].keys()):
+                m_cols = st.columns([0.5, 3.5, 1])
+                m_cols[1].info(f"📄 {m_name}")
+                if m_cols[2].button("🗑️", key=f"del_m_{n_name}_{m_name}"):
+                    del st.session_state.master_data[selected_cls][n_name][m_name]
+                    save_data(st.session_state.master_data); st.rerun()
+            
+            with st.expander(f"➕ [{n_name}] 아이템 추가"):
+                new_m = st.text_input("아이템 명칭", key=f"in_m_{n_name}")
+                if st.button("추가", key=f"btn_m_{n_name}"):
+                    if new_m and new_m not in current_data[n_name]:
+                        st.session_state.master_data[selected_cls][n_name][new_m] = {"features": "", "workflows": {}}
+                        save_data(st.session_state.master_data); st.rerun()
+            st.divider()
+
+    with col_wf:
+        st.subheader("⚙️ 워크플로우 편집기")
+        
+        # 안전한 변수 초기화
+        sel_n, sel_m, sel_f = None, None, None
+        
+        n_list = list(current_data.keys())
+        if n_list:
+            sel_n = st.selectbox("그룹 선택", n_list)
+            if sel_n:
+                m_list = list(current_data[sel_n].keys())
+                if m_list:
+                    sel_m = st.selectbox("아이템 선택", m_list)
+                    if sel_m:
+                        # 특징 입력 및 업데이트
+                        feat_str = current_data[sel_n][sel_m].get("features", "")
+                        new_feat_str = st.text_area("특징 리스트 (';' 구분)", value=feat_str, height=70)
+                        if st.button("특징 저장 및 반영"):
+                            st.session_state.master_data[selected_cls][sel_n][sel_m]["features"] = new_feat_str
+                            save_data(st.session_state.master_data); st.rerun()
+                        
+                        f_list = [f.strip() for f in new_feat_str.replace('\n',';').split(';') if f.strip()]
+                        
+                        # ==========================================================
+                        # 💡 [새로 추가된 부분 1]: 특징별 태그(Tag) 관리 폼
+                        # ==========================================================
+                        if f_list:
+                            if "feature_meta" not in st.session_state.master_data[selected_cls][sel_n][sel_m]:
+                                st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"] = {}
+                                
+                            with st.expander("🏷️ 특징(Feature) 태그 관리"):
+                                for f_name in f_list:
+                                    if f_name not in st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"]:
+                                        st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name] = {"tags": ""}
+                                        
+                                    tag_val = st.text_input(f"[{f_name}] 태그 입력 (예: 가격:100, 시간:10m)", 
+                                                            value=st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"], 
+                                                            key=f"tag_{f_name}")
+                                    st.session_state.master_data[selected_cls][sel_n][sel_m]["feature_meta"][f_name]["tags"] = tag_val
+                                
+                                if st.button("💾 태그 일괄 저장", use_container_width=True):
+                                    save_data(st.session_state.master_data); st.success("태그가 저장되었습니다!"); st.rerun()
+                        # ==========================================================
+
+                        if f_list:
+                            sel_f = st.selectbox("설계할 특징 선택", f_list)
+
+        # 3가지 변수가 모두 안전하게 선택되었을 때만 워크플로우 로직 실행
+        if sel_f:
+            # ==========================================================
+            # 💡 [새로 추가된 부분 2]: draw.io 파일 업로드 폼
+            # ==========================================================
+            with st.expander("📥 draw.io 파일 임포트 (기존 데이터를 덮어씁니다)"):
+                uploaded_file = st.file_uploader("draw.io 파일(.drawio, .xml)을 업로드하세요", type=['xml', 'drawio'])
+                
+                if uploaded_file is not None:
+                    if st.button("파일에서 워크플로우 변환 적용", use_container_width=True):
+                        xml_content = uploaded_file.getvalue().decode("utf-8")
+                        # 이전에 작성한 파싱 함수(drawio_to_wf_dict)를 호출합니다.
+                        imported_wf_dict = drawio_to_wf_dict(xml_content) 
+                        
+                        if imported_wf_dict:
+                            # 기존 회원님의 데이터 구조(리스트 안의 딕셔너리, tasks 리스트)에 완벽 호환되도록 데이터 매핑!
+                            wf_list_mapped = []
+                            for step_id, step_data in imported_wf_dict.items():
+                                wf_list_mapped.append({
+                                    "id": str(step_data.get("id", "")),
+                                    "name": step_data.get("name", ""),
+                                    "agent": step_data.get("agent", "Auto"),
+                                    "tasks": [step_data.get("task", "draw.io 임포트")],
+                                    "parent_id": step_data.get("parent", ""),
+                                    "next_id": step_data.get("next", ""),
+                                    "fail_id": step_data.get("fail", "")
+                                })
+                            
+                            # ID 기준으로 오름차순 정렬
+                            wf_list_mapped.sort(key=lambda x: str(x['id']))
+                            
+                            st.session_state.master_data[selected_cls][sel_n][sel_m].setdefault("workflows", {})[sel_f] = wf_list_mapped
+                            save_data(st.session_state.master_data)
+                            st.success("파일이 성공적으로 변환 및 저장되었습니다!"); st.rerun()
+                        else:
+                            st.error("파일 파싱에 실패했습니다. draw.io 형식이 맞는지 확인해주세요.")
+            # ==========================================================
+
+            wf_list = current_data[sel_n][sel_m]["workflows"].get(sel_f, [])
+            
+            c_header, c_reset = st.columns([3, 1])
+            c_header.write("📋 **단계 리스트 (클릭 시 수정)**")
+            
+            # 수정 모드 해제 버튼 (신규 추가)
+            if st.session_state.get('editing_step') and c_reset.button("🆕 신규 추가"):
+                if 'editing_step' in st.session_state:
+                    del st.session_state.editing_step
+                    st.rerun()
+
+            for i, s in enumerate(wf_list):
+                sc1, sc2 = st.columns([4, 1])
+                # 스텝 클릭 시 편집 모드로 진입
+                if sc1.button(f"Step {s['id']}: {s['name']} (Agent: {s['agent']})", key=f"edit_s_{i}", use_container_width=True):
+                    st.session_state.editing_step = s
+                    st.rerun()
+                # 스텝 삭제
+                if sc2.button("❌", key=f"del_s_{i}"):
+                    if st.session_state.get('editing_step', {}).get('id') == s['id']:
+                        if 'editing_step' in st.session_state: del st.session_state.editing_step
+                    wf_list.pop(i)
+                    st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                    save_data(st.session_state.master_data); st.rerun()
+
+            # 현재 편집 중인 데이터 세팅
+            edit_data = st.session_state.get('editing_step', {})
+            
+            with st.form("wf_form", clear_on_submit=False):
+                form_title = f"🛠️ 단계 수정 중: {edit_data['id']}" if edit_data else "🛠️ 새 단계 추가"
+                st.write(f"**{form_title}**")
+                
+                c1, c2, c3 = st.columns([1, 2, 1])
+                default_id = edit_data.get('id', f"1-{len(wf_list)+1}")
+                sid = c1.text_input("ID", value=default_id)
+                sname = c2.text_input("명칭", value=edit_data.get('name', ""))
+                sagent = c3.text_input("에이전트", value=edit_data.get('agent', ""))
+                stasks = st.text_area("Task (엔터 구분)", value="\n".join(edit_data.get('tasks', [])))
+                
+                lc1, lc2, lc3 = st.columns(3)
+                pid = lc1.text_input("부모 ID (분기 지점)", value=edit_data.get('parent_id', ""))
+                nid = lc2.text_input("Next ID (성공)", value=edit_data.get('next_id', ""))
+                fid = lc3.text_input("Fail ID (실패)", value=edit_data.get('fail_id', ""))
+                
+                if st.form_submit_button("💾 저장 및 적용"):
+                    if not sid or not sname:
+                        st.error("ID와 명칭은 필수입니다.")
+                    else:
+                        new_step = {
+                            "id": sid, "name": sname, "agent": sagent,
+                            "tasks": [t.strip() for t in stasks.split('\n') if t.strip()],
+                            "parent_id": pid, "next_id": nid, "fail_id": fid
+                        }
+                        # 기존 ID가 있으면 교체, 없으면 추가
+                        wf_list = [s for s in wf_list if s['id'] != sid]
+                        wf_list.append(new_step)
+                        wf_list.sort(key=lambda x: str(x['id']))
+                        st.session_state.master_data[selected_cls][sel_n][sel_m]["workflows"][sel_f] = wf_list
+                        save_data(st.session_state.master_data)
+                        if 'editing_step' in st.session_state: del st.session_state.editing_step
+                        st.rerun()
+
+            if wf_list: 
+                st.graphviz_chart(generate_wf_viz(wf_list))
+
+    # 하단 추출 기능
+    st.sidebar.divider()
+    if st.sidebar.button("📥 전체 데이터 추출 (JSON)"):
+        json_str = json.dumps(st.session_state.master_data, indent=4, ensure_ascii=False)
+        st.sidebar.download_button("다운로드", json_str, "agent_master_data.json")
+
+
+
+
+
+
+
 def generate_main_tree(selected_cls, data):
     dot = [
         # (기존에 좁혀둔 글로벌 간격 유지)
