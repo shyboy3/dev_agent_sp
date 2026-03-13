@@ -1,3 +1,73 @@
+import uuid # 맨 위에 추가
+
+def main():
+    st.set_page_config(page_title="Agent Architecture Pro", layout="wide")
+    
+    # ⭐ 1. 접속한 사용자(브라우저 탭)만의 고유 ID 생성
+    if 'view_id' not in st.session_state:
+        st.session_state.view_id = str(uuid.uuid4())
+        
+    # ... (기존 코드) ...
+
+            if wf_list: 
+                # ⭐ 2. 고유 ID가 붙은 파일명으로 저장 (예: view_a1b2c3.json)
+                temp_filename = f"view_{st.session_state.view_id}.json"
+                with open(temp_filename, "w", encoding="utf-8") as f:
+                    json.dump(wf_list, f, ensure_ascii=False)
+
+                # ⭐ 3. 새 창을 여는 전용 링크 제공 (주소 끝에 ?vid=고유ID 를 붙임)
+                viewer_url = f"/Viewer?vid={st.session_state.view_id}"
+                st.markdown(f'👉 **<a href="{viewer_url}" target="_blank">📺 나만의 워크플로우 뷰어 새 창으로 열기</a>**', unsafe_allow_html=True)
+                
+                # 메인 창 그래프 (필요 시 유지)
+                st.graphviz_chart(generate_wf_viz(wf_list))
+
+
+
+import streamlit as st
+import json
+import os
+from app import generate_wf_viz, parse_drawio_style
+
+st.set_page_config(page_title="실시간 뷰어", layout="wide")
+
+# 2초마다 새로고침하는 자바스크립트
+st.components.v1.html(
+    """<script>setTimeout(function() { window.location.reload(); }, 2000);</script>""",
+    height=0, width=0
+)
+
+st.title("📺 워크플로우 실시간 모니터")
+
+# ⭐ 1. 주소창에서 고유 ID(vid)를 가져옵니다.
+# (최신 Streamlit 버전에서는 st.query_params를 사용합니다)
+vid = st.query_params.get("vid")
+
+if vid:
+    # ⭐ 2. 내 고유 ID가 붙은 파일만 찾아서 엽니다.
+    target_file = f"view_{vid}.json"
+    
+    if os.path.exists(target_file):
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                wf_list = json.load(f)
+                
+            if wf_list:
+                dot_graph = generate_wf_viz(wf_list)
+                st.graphviz_chart(dot_graph, use_container_width=True)
+            else:
+                st.info("현재 편집 중인 단계가 없습니다.")
+        except Exception as e:
+            st.warning("데이터를 읽는 중입니다... (새로고침 대기)")
+    else:
+        st.info("메인 창에서 워크플로우를 선택하면 여기에 표시됩니다.")
+else:
+    # ID 없이 그냥 들어온 경우 차단
+    st.error("잘못된 접근입니다. 메인 화면에서 '뷰어 열기' 링크를 클릭해서 접속해주세요.")
+
+
+
+
 <!DOCTYPE html>
 <html lang="ko">
 <head>
