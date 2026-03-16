@@ -1,3 +1,948 @@
+import os
+import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from itertools import combinations_with_replacement
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib import cm
+from matplotlib.colors import BoundaryNorm
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+
+
+# ------------------------------------------------------------
+# Data loading
+# ------------------------------------------------------------
+
+def load_nanoscope_txt(filepath: str) -> Tuple[np.ndarray, Dict[str, str]]:
+    """
+    Load NanoScope numerical data exported as txt.
+
+    Expected format:
+    - metadata lines begin with '#'
+    - numerical data are whitespace-separated rows
+    """
+    metadata: Dict[str, str] = {}
+    numeric_rows: List[List[float]] = []
+
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                line2 = s.lstrip("#").strip()
+                if ":" in line2:
+                    k, v = line2.split(":", 1)
+                    metadata[k.strip()] = v.strip()
+                else:
+                    metadata[f"meta_{len(metadata)+1}"] = line2
+                continue
+
+            parts = re.split(r"\s+", s)
+            try:
+                row = [float(x) for x in parts if x != ""]
+            except ValueError:
+                # Skip malformed lines that are neither valid metadata nor numeric rows
+                continue
+
+            if row:
+                numeric_rows.append(row)
+
+    if not numeric_rows:
+        raise ValueError("No numerical data found in the TXT file.")
+
+    widths = {len(r) for r in numeric_rows}
+    if len(widths) != 1:
+        raise ValueError("Inconsistent row lengths found in numerical data.")
+
+    arr = np.array(numeric_rows, dtype=float)
+    return arr, metadata
+
+
+# ------------------------------------------------------------
+# Threshold analysis
+# ------------------------------------------------------------
+
+def multi_threshold_masks(data: np.ndarray, thresholds: List[float]) -> Tuple[List[np.ndarray], List[Tuple[float, float]]]:
+    """
+    Convert K thresholds into K+1 regions.
+    Region ranges:
+      (-inf, t1), [t1, t2), ..., [tK, +inf)
+    """
+    ts = sorted(thresholds)
+    masks: List[np.ndarray] = []
+    ranges: List[Tuple[float, float]] = []
+
+    prev = -np.inf
+    for t in ts:
+        mask = (data >= prev) & (data < t)
+        masks.append(mask)
+        ranges.append((prev, t))
+        prev = t
+
+    mask = data >= prev
+    masks.append(mask)
+    ranges.append((prev, np.inf))
+    return masks, ranges
+
+
+def auto_thresholds_equal_interval(data: np.ndarray, n_thresh: int) -> List[float]:
+    dmin = float(np.nanmin(data))
+    dmax = float(np.nanmax(data))
+    if n_thresh <= 0:
+        return []
+    return np.linspace(dmin, dmax, n_thresh + 2)[1:-1].tolist()
+
+
+def _otsu_from_hist(hist: np.ndarray, bin_centers: np.ndarray) -> float:
+    hist = hist.astype(float)
+    prob = hist / np.sum(hist)
+    omega = np.cumsum(prob)
+    mu = np.cumsum(prob * bin_centers)
+    mu_t = mu[-1]
+
+    denom = omega * (1.0 - omega)
+    sigma_b2 = np.full_like(denom, -1.0)
+    valid = denom > 0
+    sigma_b2[valid] = ((mu_t * omega[valid] - mu[valid]) ** 2) / denom[valid]
+
+    idx = int(np.argmax(sigma_b2[:-1])) if len(sigma_b2) > 1 else 0
+    return float(bin_centers[idx])
+
+
+def auto_thresholds_otsu(data: np.ndarray, n_bins: int = 256) -> List[float]:
+    vals = data[np.isfinite(data)].ravel()
+    if vals.size == 0:
+        return []
+    if np.min(vals) == np.max(vals):
+        return [float(vals[0])]
+    hist, bin_edges = np.histogram(vals, bins=n_bins)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    return [_otsu_from_hist(hist, bin_centers)]
+
+
+def auto_thresholds_multi_otsu(data: np.ndarray, n_thresh: int, n_bins: int = 128) -> List[float]:
+    vals = data[np.isfinite(data)].ravel()
+    if vals.size == 0 or n_thresh <= 0:
+        return []
+    vmin, vmax = float(np.min(vals)), float(np.max(vals))
+    if vmin == vmax:
+        return [vmin] * n_thresh
+
+    hist, bin_edges = np.histogram(vals, bins=n_bins, range=(vmin, vmax))
+    hist = hist.astype(float)
+    p = hist / np.sum(hist)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    omega = np.cumsum(p)
+    mu = np.cumsum(p * centers)
+    mu_t = mu[-1]
+
+    def class_stats(a: int, b: int) -> Tuple[float, float]:
+        if a == 0:
+            w = omega[b]
+            m = mu[b]
+        else:
+            w = omega[b] - omega[a - 1]
+            m = mu[b] - mu[a - 1]
+        if w <= 0:
+            return 0.0, 0.0
+        return w, m / w
+
+    num_classes = n_thresh + 1
+    n = len(hist)
+    if num_classes <= 1 or n < num_classes:
+        return auto_thresholds_equal_interval(vals, n_thresh)
+
+    best_sigma = -np.inf
+    best_breaks = None
+    for breaks in combinations_with_replacement(range(n - 1), n_thresh):
+        valid = True
+        prev = 0
+        sigma = 0.0
+        for br in list(breaks) + [n - 1]:
+            if br < prev:
+                valid = False
+                break
+            w, mean_c = class_stats(prev, br)
+            sigma += w * (mean_c - mu_t) ** 2
+            prev = br + 1
+        if valid and sigma > best_sigma:
+            best_sigma = sigma
+            best_breaks = breaks
+
+    if best_breaks is None:
+        return auto_thresholds_equal_interval(vals, n_thresh)
+
+    thresholds = [float(bin_edges[b + 1]) for b in best_breaks]
+    return sorted(thresholds)
+
+
+def auto_thresholds_kmeans(data: np.ndarray, n_thresh: int, random_state: int = 0) -> List[float]:
+    vals = data[np.isfinite(data)].ravel().reshape(-1, 1)
+    if vals.size == 0 or n_thresh <= 0:
+        return []
+    n_clusters = n_thresh + 1
+    if vals.shape[0] < n_clusters:
+        return auto_thresholds_equal_interval(data, n_thresh)
+    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=random_state)
+    km.fit(vals)
+    centers = np.sort(km.cluster_centers_.ravel())
+    thresholds = [(centers[i] + centers[i + 1]) / 2.0 for i in range(len(centers) - 1)]
+    return [float(t) for t in thresholds]
+
+
+def auto_thresholds_gmm(data: np.ndarray, n_thresh: int, random_state: int = 0) -> List[float]:
+    vals = data[np.isfinite(data)].ravel().reshape(-1, 1)
+    if vals.size == 0 or n_thresh <= 0:
+        return []
+    n_components = n_thresh + 1
+    if vals.shape[0] < n_components:
+        return auto_thresholds_equal_interval(data, n_thresh)
+
+    gmm = GaussianMixture(n_components=n_components, covariance_type="full", random_state=random_state)
+    gmm.fit(vals)
+
+    means = gmm.means_.ravel()
+    variances = np.array([c[0, 0] for c in gmm.covariances_], dtype=float)
+    weights = gmm.weights_.ravel()
+
+    order = np.argsort(means)
+    means = means[order]
+    variances = variances[order]
+    weights = weights[order]
+
+    thresholds: List[float] = []
+    for i in range(len(means) - 1):
+        m1, m2 = means[i], means[i + 1]
+        s1, s2 = np.sqrt(max(variances[i], 1e-12)), np.sqrt(max(variances[i + 1], 1e-12))
+        w1, w2 = max(weights[i], 1e-12), max(weights[i + 1], 1e-12)
+
+        a = 1.0 / (2.0 * s2 ** 2) - 1.0 / (2.0 * s1 ** 2)
+        b = m1 / (s1 ** 2) - m2 / (s2 ** 2)
+        c = (m2 ** 2) / (2.0 * s2 ** 2) - (m1 ** 2) / (2.0 * s1 ** 2) + np.log((w2 * s1) / (w1 * s2))
+
+        if abs(a) < 1e-12:
+            if abs(b) < 1e-12:
+                x = (m1 + m2) / 2.0
+            else:
+                x = -c / b
+        else:
+            disc = b ** 2 - 4.0 * a * c
+            if disc < 0:
+                x = (m1 + m2) / 2.0
+            else:
+                roots = [(-b + np.sqrt(disc)) / (2.0 * a), (-b - np.sqrt(disc)) / (2.0 * a)]
+                between = [r for r in roots if min(m1, m2) <= r <= max(m1, m2)]
+                x = between[0] if between else (m1 + m2) / 2.0
+        thresholds.append(float(x))
+
+    return sorted(thresholds)[:n_thresh]
+
+
+def auto_threshold_count_by_unique(data: np.ndarray, max_thresholds: int = 10) -> int:
+    """
+    Heuristic:
+    - if unique count is small, use unique_count-1
+    - otherwise use sqrt-based capped count
+    """
+    flat = data.ravel()
+    unique_count = len(np.unique(np.round(flat, decimals=8)))
+    if unique_count <= 1:
+        return 1
+    if unique_count <= max_thresholds + 1:
+        return max(1, unique_count - 1)
+    n = int(np.clip(np.sqrt(unique_count) / 2, 2, max_thresholds))
+    return n
+
+
+def build_region_map(data: np.ndarray, thresholds: List[float]) -> np.ndarray:
+    ts = np.array(sorted(thresholds), dtype=float)
+    return np.digitize(data, bins=ts, right=False)
+
+
+# ------------------------------------------------------------
+# GUI
+# ------------------------------------------------------------
+
+@dataclass
+class CropBox:
+    top: int = 0
+    bottom: int = 0
+    left: int = 0
+    right: int = 0
+
+
+class ThresholdApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("NanoScope Threshold Analysis App")
+        self.root.geometry("1500x920")
+
+        self.raw_data: Optional[np.ndarray] = None
+        self.current_data: Optional[np.ndarray] = None
+        self.metadata: Dict[str, str] = {}
+        self.filepath: Optional[str] = None
+
+        self.figure = Figure(figsize=(10, 7.8), dpi=100, facecolor="white")
+        gs = self.figure.add_gridspec(2, 2, height_ratios=[4, 1.35], hspace=0.28, wspace=0.28)
+        self.ax_raw = self.figure.add_subplot(gs[0, 0])
+        self.ax_thr = self.figure.add_subplot(gs[0, 1])
+        self.ax_raw_hist = self.figure.add_subplot(gs[1, 0])
+        self.ax_thr_hist = self.figure.add_subplot(gs[1, 1])
+        self.ax_raw.set_facecolor("white")
+        self.ax_thr.set_facecolor("white")
+        self.ax_raw_hist.set_facecolor("white")
+        self.ax_thr_hist.set_facecolor("white")
+        self.canvas = None
+
+        self.cmap_names = sorted(m for m in plt.colormaps() if not m.endswith("_r"))
+        self.current_im_raw = None
+        self.current_im_thr = None
+        self.region_map: Optional[np.ndarray] = None
+        self.region_summary: List[str] = []
+        self.cbar_raw = None
+        self.cbar_thr = None
+
+        self._build_ui()
+        self._draw_empty()
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=8)
+        main.pack(fill="both", expand=True)
+
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="y")
+
+        right = ttk.Frame(main)
+        right.pack(side="right", fill="both", expand=True)
+
+        # File section
+        file_frame = ttk.LabelFrame(left, text="File", padding=8)
+        file_frame.pack(fill="x", pady=4)
+        ttk.Button(file_frame, text="Open TXT", command=self.open_file).pack(fill="x", pady=2)
+        ttk.Button(file_frame, text="Reset to Raw", command=self.reset_to_raw).pack(fill="x", pady=2)
+        ttk.Button(file_frame, text="Save Raw Image", command=lambda: self.save_current_plot("raw")).pack(fill="x", pady=2)
+        ttk.Button(file_frame, text="Save Threshold Image", command=lambda: self.save_current_plot("threshold")).pack(fill="x", pady=2)
+        ttk.Button(file_frame, text="Save Raw Histogram", command=lambda: self.save_current_plot("raw_hist")).pack(fill="x", pady=2)
+        ttk.Button(file_frame, text="Save Threshold Histogram", command=lambda: self.save_current_plot("threshold_hist")).pack(fill="x", pady=2)
+        ttk.Button(file_frame, text="Save Region Summary", command=self.save_summary).pack(fill="x", pady=2)
+
+        # Crop section
+        crop_frame = ttk.LabelFrame(left, text="Crop", padding=8)
+        crop_frame.pack(fill="x", pady=4)
+
+        self.top_var = tk.StringVar(value="0")
+        self.bottom_var = tk.StringVar(value="0")
+        self.left_var = tk.StringVar(value="0")
+        self.right_var = tk.StringVar(value="0")
+
+        for label, var in [
+            ("Top", self.top_var),
+            ("Bottom", self.bottom_var),
+            ("Left", self.left_var),
+            ("Right", self.right_var),
+        ]:
+            row = ttk.Frame(crop_frame)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=label, width=8).pack(side="left")
+            ttk.Entry(row, textvariable=var, width=12).pack(side="left", fill="x", expand=True)
+
+        ttk.Button(crop_frame, text="Apply Crop", command=self.apply_crop).pack(fill="x", pady=3)
+
+        # Display section
+        display_frame = ttk.LabelFrame(left, text="Display", padding=8)
+        display_frame.pack(fill="x", pady=4)
+
+        self.cmap_var = tk.StringVar(value="viridis")
+        self.threshold_cmap_var = tk.StringVar(value="tab20")
+        self.vmin_var = tk.StringVar(value="")
+        self.vmax_var = tk.StringVar(value="")
+
+        row = ttk.Frame(display_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Colormap", width=12).pack(side="left")
+        cmap_box = ttk.Combobox(row, textvariable=self.cmap_var, values=self.cmap_names, state="readonly", width=22)
+        cmap_box.pack(side="left", fill="x", expand=True)
+        cmap_box.bind("<<ComboboxSelected>>", lambda e: self.refresh_display())
+
+        row = ttk.Frame(display_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="vmin", width=12).pack(side="left")
+        ttk.Entry(row, textvariable=self.vmin_var, width=12).pack(side="left", fill="x", expand=True)
+
+        row = ttk.Frame(display_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="vmax", width=12).pack(side="left")
+        ttk.Entry(row, textvariable=self.vmax_var, width=12).pack(side="left", fill="x", expand=True)
+
+        row = ttk.Frame(display_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Threshold cmap", width=12).pack(side="left")
+        thr_cmap_box = ttk.Combobox(row, textvariable=self.threshold_cmap_var, values=sorted(plt.colormaps()), state="readonly", width=22)
+        thr_cmap_box.pack(side="left", fill="x", expand=True)
+        thr_cmap_box.bind("<<ComboboxSelected>>", lambda e: self.refresh_display())
+
+        ttk.Button(display_frame, text="Apply Display", command=self.refresh_display).pack(fill="x", pady=3)
+
+        # Threshold section
+        thr_frame = ttk.LabelFrame(left, text="Threshold", padding=8)
+        thr_frame.pack(fill="x", pady=4)
+
+        self.n_thresh_var = tk.StringVar(value="2")
+        self.threshold_values_var = tk.StringVar(value="")
+        self.auto_count_var = tk.BooleanVar(value=False)
+        self.auto_values_var = tk.BooleanVar(value=False)
+        self.auto_method_var = tk.StringVar(value="quantile")
+
+        row = ttk.Frame(thr_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Threshold count", width=14).pack(side="left")
+        ttk.Entry(row, textvariable=self.n_thresh_var, width=10).pack(side="left")
+
+        ttk.Checkbutton(thr_frame, text="Auto threshold count", variable=self.auto_count_var).pack(anchor="w")
+        ttk.Checkbutton(thr_frame, text="Auto threshold values", variable=self.auto_values_var).pack(anchor="w")
+
+        row = ttk.Frame(thr_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Auto method", width=14).pack(side="left")
+        method_box = ttk.Combobox(row, textvariable=self.auto_method_var, values=["equal_interval", "quantile", "otsu", "multi_otsu", "kmeans", "gmm"], state="readonly", width=16)
+        method_box.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(thr_frame, text="Manual threshold values (comma-separated)").pack(anchor="w", pady=(6, 0))
+        ttk.Entry(thr_frame, textvariable=self.threshold_values_var).pack(fill="x", pady=2)
+
+        btns = ttk.Frame(thr_frame)
+        btns.pack(fill="x", pady=4)
+        ttk.Button(btns, text="Suggest Thresholds", command=self.suggest_thresholds).pack(side="left", fill="x", expand=True, padx=1)
+        ttk.Button(btns, text="Apply Threshold", command=self.apply_threshold).pack(side="left", fill="x", expand=True, padx=1)
+
+        # Metadata / summary section
+        info_frame = ttk.LabelFrame(left, text="Metadata / Region Summary", padding=8)
+        info_frame.pack(fill="both", expand=True, pady=4)
+
+        self.info_text = tk.Text(info_frame, height=20, wrap="word")
+        self.info_text.pack(fill="both", expand=True)
+
+        # Plot area
+        plot_frame = ttk.Frame(right)
+        plot_frame.pack(fill="both", expand=True)
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(fill="both", expand=True)
+        canvas_widget.configure(bg="white")
+        self.canvas.draw()
+
+    def _draw_empty(self):
+        if self.cbar_raw is not None:
+            try:
+                self.cbar_raw.remove()
+            except Exception:
+                pass
+            self.cbar_raw = None
+        if self.cbar_thr is not None:
+            try:
+                self.cbar_thr.remove()
+            except Exception:
+                pass
+            self.cbar_thr = None
+        self.ax_raw.clear()
+        self.ax_thr.clear()
+        self.ax_raw_hist.clear()
+        self.ax_thr_hist.clear()
+        self.ax_raw.set_title("Raw / Cropped Image")
+        self.ax_thr.set_title("Threshold Regions")
+        self.ax_raw_hist.set_title("Raw Histogram")
+        self.ax_thr_hist.set_title("Threshold Histogram")
+        self.ax_raw.text(0.5, 0.5, "No data loaded", ha="center", va="center")
+        self.ax_thr.text(0.5, 0.5, "No threshold result", ha="center", va="center")
+        self.ax_raw_hist.text(0.5, 0.5, "No histogram", ha="center", va="center")
+        self.ax_thr_hist.text(0.5, 0.5, "No histogram", ha="center", va="center")
+        self.canvas.draw()
+
+    def open_file(self):
+        path = filedialog.askopenfilename(
+            title="Open NanoScope TXT",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            data, metadata = load_nanoscope_txt(path)
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+            return
+
+        self.filepath = path
+        self.raw_data = data
+        self.current_data = data.copy()
+        self.metadata = metadata
+        self.region_map = None
+        self.region_summary = []
+
+        self.top_var.set("0")
+        self.bottom_var.set("0")
+        self.left_var.set("0")
+        self.right_var.set("0")
+        self.vmin_var.set("")
+        self.vmax_var.set("")
+
+        self.update_info_panel()
+        self.refresh_display()
+
+    def reset_to_raw(self):
+        if self.raw_data is None:
+            return
+        self.current_data = self.raw_data.copy()
+        self.region_map = None
+        self.region_summary = []
+        self.top_var.set("0")
+        self.bottom_var.set("0")
+        self.left_var.set("0")
+        self.right_var.set("0")
+        self.update_info_panel()
+        self.refresh_display()
+
+    def _parse_int(self, text: str, default: int = 0) -> int:
+        text = text.strip()
+        if text == "":
+            return default
+        return int(text)
+
+    def _parse_float_optional(self, text: str) -> Optional[float]:
+        text = text.strip()
+        if text == "":
+            return None
+        return float(text)
+
+    def apply_crop(self):
+        if self.raw_data is None:
+            messagebox.showwarning("No data", "Please load a TXT file first.")
+            return
+        try:
+            top = self._parse_int(self.top_var.get(), 0)
+            bottom = self._parse_int(self.bottom_var.get(), 0)
+            left = self._parse_int(self.left_var.get(), 0)
+            right = self._parse_int(self.right_var.get(), 0)
+        except ValueError:
+            messagebox.showerror("Crop Error", "Crop values must be integers.")
+            return
+
+        h, w = self.raw_data.shape
+        if top < 0 or bottom < 0 or left < 0 or right < 0:
+            messagebox.showerror("Crop Error", "Crop values must be >= 0.")
+            return
+        if top + bottom >= h or left + right >= w:
+            messagebox.showerror("Crop Error", "Crop size is too large for current image.")
+            return
+
+        self.current_data = self.raw_data[top:h-bottom if bottom > 0 else h,
+                                         left:w-right if right > 0 else w].copy()
+        self.region_map = None
+        self.region_summary = []
+        self.update_info_panel()
+        self.refresh_display()
+
+    def get_display_limits(self) -> Tuple[Optional[float], Optional[float]]:
+        try:
+            vmin = self._parse_float_optional(self.vmin_var.get())
+            vmax = self._parse_float_optional(self.vmax_var.get())
+        except ValueError:
+            messagebox.showerror("Display Error", "vmin/vmax must be numeric.")
+            return None, None
+        return vmin, vmax
+
+    def refresh_display(self):
+        if self.current_data is None:
+            self._draw_empty()
+            return
+
+        cmap_name = self.cmap_var.get()
+        thr_cmap_name = self.threshold_cmap_var.get()
+        vmin, vmax = self.get_display_limits()
+        if vmin is None and self.vmin_var.get().strip() != "":
+            return
+        if vmax is None and self.vmax_var.get().strip() != "":
+            return
+
+        disp = np.array(self.current_data, dtype=float)
+        finite_mask = np.isfinite(disp)
+        if not np.any(finite_mask):
+            self._draw_empty()
+            return
+
+        finite_vals = disp[finite_mask]
+        disp[~finite_mask] = float(np.median(finite_vals))
+
+        if vmin is None:
+            vmin = float(np.min(finite_vals))
+        if vmax is None:
+            vmax = float(np.max(finite_vals))
+        if vmin == vmax:
+            vmax = vmin + 1e-12
+
+        if self.cbar_raw is not None:
+            try:
+                self.cbar_raw.remove()
+            except Exception:
+                pass
+            self.cbar_raw = None
+        if self.cbar_thr is not None:
+            try:
+                self.cbar_thr.remove()
+            except Exception:
+                pass
+            self.cbar_thr = None
+
+        self.ax_raw.clear()
+        self.ax_thr.clear()
+        self.ax_raw_hist.clear()
+        self.ax_thr_hist.clear()
+
+        self.ax_raw.set_title("Raw / Cropped Image")
+        self.current_im_raw = self.ax_raw.imshow(
+            disp,
+            cmap=cmap_name,
+            origin="upper",
+            aspect="equal",
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        self.ax_raw.set_xlabel("X")
+        self.ax_raw.set_ylabel("Y")
+        self.cbar_raw = self.figure.colorbar(self.current_im_raw, ax=self.ax_raw, fraction=0.046, pad=0.04)
+
+        thresholds = []
+        if self.region_map is not None:
+            try:
+                thresholds = self._parse_thresholds()
+            except Exception:
+                thresholds = []
+
+        line_colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0', 'C1', 'C2', 'C3', 'C4', 'C5'])
+
+        self.ax_thr.set_title("Threshold Regions")
+        if self.region_map is None:
+            self.ax_thr.text(0.5, 0.5, "Apply threshold to view result", ha="center", va="center")
+            thr_hist_vals = finite_vals
+        else:
+            self.current_im_thr = self.ax_thr.imshow(
+                self.region_map,
+                cmap=thr_cmap_name,
+                origin="upper",
+                aspect="equal",
+                interpolation="nearest",
+            )
+            self.ax_thr.set_xlabel("X")
+            self.ax_thr.set_ylabel("Y")
+            self.cbar_thr = self.figure.colorbar(self.current_im_thr, ax=self.ax_thr, fraction=0.046, pad=0.04)
+            thr_hist_vals = self.region_map[np.isfinite(self.region_map)].ravel()
+
+        self.ax_raw_hist.set_title("Raw Histogram")
+        self.ax_raw_hist.hist(finite_vals, bins=128)
+        self.ax_raw_hist.set_xlim(vmin, vmax)
+        self.ax_raw_hist.set_xlabel("Value")
+        self.ax_raw_hist.set_ylabel("Count")
+        for i, t in enumerate(thresholds):
+            self.ax_raw_hist.axvline(t, linestyle="--", linewidth=1.5, color=line_colors[i % len(line_colors)], label=f"T{i+1}")
+        if thresholds:
+            self.ax_raw_hist.legend(fontsize=8, loc="best")
+
+        self.ax_thr_hist.set_title("Threshold Histogram")
+        if self.region_map is None:
+            self.ax_thr_hist.hist(finite_vals, bins=128)
+            self.ax_thr_hist.set_xlim(vmin, vmax)
+            self.ax_thr_hist.set_xlabel("Value")
+        else:
+            bins = np.arange(-0.5, int(np.max(thr_hist_vals)) + 1.5, 1)
+            self.ax_thr_hist.hist(thr_hist_vals, bins=bins)
+            self.ax_thr_hist.set_xlim(-0.5, int(np.max(thr_hist_vals)) + 0.5)
+            self.ax_thr_hist.set_xlabel("Threshold Region Index")
+            ymax = self.ax_thr_hist.get_ylim()[1]
+            for i, t in enumerate(thresholds):
+                self.ax_thr_hist.text(i + 0.5, ymax * 0.95, f"T{i+1}={t:.4g}",
+                                      color=line_colors[i % len(line_colors)], ha="center", va="top", fontsize=8)
+        self.ax_thr_hist.set_ylabel("Count")
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def suggest_thresholds(self):
+        if self.current_data is None:
+            messagebox.showwarning("No data", "Please load a TXT file first.")
+            return
+
+        try:
+            n_thresh = self._parse_int(self.n_thresh_var.get(), 2)
+        except ValueError:
+            messagebox.showerror("Threshold Error", "Threshold count must be an integer.")
+            return
+
+        method = self.auto_method_var.get()
+        if method == "otsu":
+            n_thresh = 1
+            self.n_thresh_var.set("1")
+        elif self.auto_count_var.get() and method != "multi_otsu":
+            n_thresh = auto_threshold_count_by_unique(self.current_data)
+            self.n_thresh_var.set(str(n_thresh))
+
+        ts = self._compute_auto_thresholds(method, n_thresh)
+        self.threshold_values_var.set(", ".join(f"{t:.6g}" for t in ts))
+
+    def _compute_auto_thresholds(self, method: str, n_thresh: int) -> List[float]:
+        if method == "equal_interval":
+            return auto_thresholds_equal_interval(self.current_data, n_thresh)
+        if method == "quantile":
+            return auto_thresholds_quantile(self.current_data, n_thresh)
+        if method == "otsu":
+            return auto_thresholds_otsu(self.current_data)
+        if method == "multi_otsu":
+            return auto_thresholds_multi_otsu(self.current_data, n_thresh)
+        if method == "kmeans":
+            return auto_thresholds_kmeans(self.current_data, n_thresh)
+        if method == "gmm":
+            return auto_thresholds_gmm(self.current_data, n_thresh)
+        return auto_thresholds_quantile(self.current_data, n_thresh)
+
+    def _parse_thresholds(self) -> List[float]:
+        if self.current_data is None:
+            raise ValueError("No data loaded.")
+
+        try:
+            n_thresh = self._parse_int(self.n_thresh_var.get(), 2)
+        except ValueError:
+            raise ValueError("Threshold count must be an integer.")
+
+        if n_thresh < 1:
+            raise ValueError("Threshold count must be >= 1.")
+
+        method = self.auto_method_var.get()
+        if method == "otsu":
+            n_thresh = 1
+            self.n_thresh_var.set("1")
+        elif self.auto_count_var.get() and method != "multi_otsu":
+            n_thresh = auto_threshold_count_by_unique(self.current_data)
+            self.n_thresh_var.set(str(n_thresh))
+
+        if self.auto_values_var.get():
+            ts = self._compute_auto_thresholds(method, n_thresh)
+            self.threshold_values_var.set(", ".join(f"{t:.6g}" for t in ts))
+            return sorted(ts)
+
+        raw = self.threshold_values_var.get().strip()
+        if not raw:
+            raise ValueError("Please enter threshold values or enable auto threshold values.")
+
+        try:
+            ts = [float(x.strip()) for x in raw.split(",") if x.strip() != ""]
+        except ValueError:
+            raise ValueError("Threshold values must be numeric and comma-separated.")
+
+        if len(ts) != n_thresh:
+            raise ValueError(f"Threshold count is {n_thresh}, but {len(ts)} values were provided.")
+
+        return sorted(ts)
+
+    def apply_threshold(self):
+        if self.current_data is None:
+            messagebox.showwarning("No data", "Please load a TXT file first.")
+            return
+
+        try:
+            thresholds = self._parse_thresholds()
+        except Exception as e:
+            messagebox.showerror("Threshold Error", str(e))
+            return
+
+        self.region_map = build_region_map(self.current_data, thresholds)
+        masks, ranges = multi_threshold_masks(self.current_data, thresholds)
+        total = self.current_data.size
+
+        lines: List[str] = []
+        lines.append("[Threshold Summary]")
+        lines.append(f"Thresholds: {', '.join(f'{t:.6g}' for t in thresholds)}")
+        lines.append("")
+
+        for idx, (mask, rg) in enumerate(zip(masks, ranges)):
+            count = int(mask.sum())
+            pct = 100.0 * count / total if total > 0 else 0.0
+
+            lo, hi = rg
+            lo_s = "-inf" if np.isneginf(lo) else f"{lo:.6g}"
+            hi_s = "+inf" if np.isposinf(hi) else f"{hi:.6g}"
+            label = f"Region {idx}: [{lo_s}, {hi_s})" if not np.isposinf(hi) else f"Region {idx}: [{lo_s}, {hi_s}]"
+            lines.append(f"{label}")
+            lines.append(f"  Pixels: {count}")
+            lines.append(f"  Percent: {pct:.3f}%")
+
+        self.region_summary = lines
+        self.update_info_panel()
+        self.refresh_display()
+
+    def update_info_panel(self):
+        self.info_text.delete("1.0", tk.END)
+
+        if self.filepath:
+            self.info_text.insert(tk.END, f"File: {self.filepath}\n\n")
+
+        if self.raw_data is not None:
+            self.info_text.insert(tk.END, "[Image Info]\n")
+            self.info_text.insert(tk.END, f"Raw shape: {self.raw_data.shape}\n")
+        if self.current_data is not None:
+            self.info_text.insert(tk.END, f"Current shape: {self.current_data.shape}\n")
+            self.info_text.insert(tk.END, f"Min: {np.nanmin(self.current_data):.6g}\n")
+            self.info_text.insert(tk.END, f"Max: {np.nanmax(self.current_data):.6g}\n")
+            self.info_text.insert(tk.END, f"Mean: {np.nanmean(self.current_data):.6g}\n")
+            self.info_text.insert(tk.END, f"Std: {np.nanstd(self.current_data):.6g}\n\n")
+
+        if self.metadata:
+            self.info_text.insert(tk.END, "[Metadata]\n")
+            for k, v in self.metadata.items():
+                self.info_text.insert(tk.END, f"{k}: {v}\n")
+            self.info_text.insert(tk.END, "\n")
+
+        if self.region_summary:
+            self.info_text.insert(tk.END, "\n".join(self.region_summary))
+
+    def save_current_plot(self, kind: str):
+        if self.current_data is None:
+            messagebox.showwarning("No data", "Please load a TXT file first.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save image",
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png"), ("TIFF files", "*.tif"), ("JPEG files", "*.jpg")],
+        )
+        if not filepath:
+            return
+
+        try:
+            fig = Figure(figsize=(6, 5), dpi=150)
+            ax = fig.add_subplot(111)
+            line_colors = plt.rcParams['axes.prop_cycle'].by_key().get('color', ['C0', 'C1', 'C2', 'C3', 'C4', 'C5'])
+
+            if kind == "raw":
+                cmap_name = self.cmap_var.get()
+                vmin, vmax = self.get_display_limits()
+                im = ax.imshow(self.current_data, cmap=cmap_name, origin="upper", aspect="equal", vmin=vmin, vmax=vmax, interpolation="nearest")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                ax.set_title("Raw / Cropped Image")
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+            elif kind == "threshold":
+                if self.region_map is None:
+                    messagebox.showwarning("No threshold result", "Apply threshold first.")
+                    return
+                im = ax.imshow(self.region_map, cmap=self.threshold_cmap_var.get(), origin="upper", aspect="equal", interpolation="nearest")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                ax.set_title("Threshold Regions")
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+            elif kind == "raw_hist":
+                vals = self.current_data[np.isfinite(self.current_data)]
+                ax.hist(vals, bins=128)
+                ax.set_title("Raw Histogram")
+                ax.set_xlabel("Value")
+                ax.set_ylabel("Count")
+                try:
+                    thresholds = self._parse_thresholds() if self.region_map is not None else []
+                except Exception:
+                    thresholds = []
+                for i, t in enumerate(thresholds):
+                    ax.axvline(t, linestyle="--", linewidth=1.5, color=line_colors[i % len(line_colors)], label=f"T{i+1}")
+                if thresholds:
+                    ax.legend(fontsize=8, loc="best")
+            elif kind == "threshold_hist":
+                if self.region_map is None:
+                    messagebox.showwarning("No threshold result", "Apply threshold first.")
+                    return
+                vals = self.region_map[np.isfinite(self.region_map)].ravel()
+                bins = np.arange(-0.5, int(np.max(vals)) + 1.5, 1)
+                ax.hist(vals, bins=bins)
+                ax.set_xlim(-0.5, int(np.max(vals)) + 0.5)
+                ax.set_title("Threshold Histogram")
+                ax.set_xlabel("Threshold Region Index")
+                ax.set_ylabel("Count")
+                try:
+                    thresholds = self._parse_thresholds()
+                except Exception:
+                    thresholds = []
+                ymax = ax.get_ylim()[1]
+                for i, t in enumerate(thresholds):
+                    ax.text(i + 0.5, ymax * 0.95, f"T{i+1}={t:.4g}", color=line_colors[i % len(line_colors)], ha="center", va="top", fontsize=8)
+            else:
+                messagebox.showerror("Save Error", f"Unknown save type: {kind}")
+                return
+
+            fig.tight_layout()
+            fig.savefig(filepath, bbox_inches="tight")
+            messagebox.showinfo("Saved", f"Saved image to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def save_summary(self):
+        if not self.region_summary:
+            messagebox.showwarning("No summary", "Apply threshold first.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save summary",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext == ".csv":
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write("line\n")
+                    for line in self.region_summary:
+                        f.write('"' + line.replace('"', '""') + '"\n')
+            else:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write("\n".join(self.region_summary))
+            messagebox.showinfo("Saved", f"Saved summary to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+
+def main():
+    root = tk.Tk()
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    app = ThresholdApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
 self.figure = Figure(figsize=(10, 7.8), dpi=100, facecolor="white")
 gs = self.figure.add_gridspec(2, 2, height_ratios=[4, 1.35], hspace=0.28, wspace=0.28)
 
