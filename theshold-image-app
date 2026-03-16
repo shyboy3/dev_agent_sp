@@ -1,3 +1,274 @@
+self.figure = Figure(figsize=(10, 7.8), dpi=100, facecolor="white")
+gs = self.figure.add_gridspec(2, 2, height_ratios=[4, 1.35], hspace=0.28, wspace=0.28)
+
+self.ax_raw = self.figure.add_subplot(gs[0, 0])
+self.ax_thr = self.figure.add_subplot(gs[0, 1])
+self.ax_raw_hist = self.figure.add_subplot(gs[1, 0])
+self.ax_thr_hist = self.figure.add_subplot(gs[1, 1])
+
+self.ax_raw.set_facecolor("white")
+self.ax_thr.set_facecolor("white")
+self.ax_raw_hist.set_facecolor("white")
+self.ax_thr_hist.set_facecolor("white")
+
+----
+
+ttk.Button(file_frame, text="Save Raw Image", command=lambda: self.save_current_plot("raw")).pack(fill="x", pady=2)
+ttk.Button(file_frame, text="Save Threshold Image", command=lambda: self.save_current_plot("threshold")).pack(fill="x", pady=2)
+ttk.Button(file_frame, text="Save Raw Histogram", command=lambda: self.save_current_plot("raw_hist")).pack(fill="x", pady=2)
+ttk.Button(file_frame, text="Save Threshold Histogram", command=lambda: self.save_current_plot("threshold_hist")).pack(fill="x", pady=2)
+ttk.Button(file_frame, text="Save Region Summary", command=self.save_summary).pack(fill="x", pady=2)
+
+
+---
+def _draw_empty(self):
+    self.ax_raw.clear()
+    self.ax_thr.clear()
+    self.ax_raw_hist.clear()
+    self.ax_thr_hist.clear()
+
+    self.ax_raw.set_title("Raw / Cropped Image")
+    self.ax_thr.set_title("Threshold Regions")
+    self.ax_raw_hist.set_title("Raw Histogram")
+    self.ax_thr_hist.set_title("Threshold Histogram")
+
+    self.ax_raw.text(0.5, 0.5, "No data loaded", ha="center", va="center")
+    self.ax_thr.text(0.5, 0.5, "No threshold result", ha="center", va="center")
+    self.ax_raw_hist.text(0.5, 0.5, "No histogram", ha="center", va="center")
+    self.ax_thr_hist.text(0.5, 0.5, "No histogram", ha="center", va="center")
+
+    self.canvas.draw()
+
+----
+
+def refresh_display(self):
+    if self.current_data is None:
+        self._draw_empty()
+        return
+
+    cmap_name = self.cmap_var.get()
+    thr_cmap_name = self.threshold_cmap_var.get()
+
+    vmin, vmax = self.get_display_limits()
+    if vmin is None and self.vmin_var.get().strip() != "":
+        return
+    if vmax is None and self.vmax_var.get().strip() != "":
+        return
+
+    disp = np.array(self.current_data, dtype=float)
+    finite_mask = np.isfinite(disp)
+
+    if self.cbar_raw is not None:
+        try:
+            self.cbar_raw.remove()
+        except Exception:
+            pass
+        self.cbar_raw = None
+
+    if self.cbar_thr is not None:
+        try:
+            self.cbar_thr.remove()
+        except Exception:
+            pass
+        self.cbar_thr = None
+
+    if not np.any(finite_mask):
+        self.ax_raw.clear()
+        self.ax_thr.clear()
+        self.ax_raw_hist.clear()
+        self.ax_thr_hist.clear()
+
+        self.ax_raw.set_title("Raw / Cropped Image")
+        self.ax_thr.set_title("Threshold Regions")
+        self.ax_raw_hist.set_title("Raw Histogram")
+        self.ax_thr_hist.set_title("Threshold Histogram")
+
+        self.ax_raw.text(0.5, 0.5, "Data contains no finite values", ha="center", va="center")
+        self.ax_thr.text(0.5, 0.5, "No threshold result", ha="center", va="center")
+        self.ax_raw_hist.text(0.5, 0.5, "No histogram", ha="center", va="center")
+        self.ax_thr_hist.text(0.5, 0.5, "No histogram", ha="center", va="center")
+
+        self.canvas.draw()
+        return
+
+    finite_vals = disp[finite_mask]
+    fill_value = float(np.median(finite_vals))
+    disp[~finite_mask] = fill_value
+
+    if vmin is None:
+        vmin = float(np.min(finite_vals))
+    if vmax is None:
+        vmax = float(np.max(finite_vals))
+    if vmin == vmax:
+        vmax = vmin + 1e-12
+
+    self.ax_raw.clear()
+    self.ax_thr.clear()
+    self.ax_raw_hist.clear()
+    self.ax_thr_hist.clear()
+
+    # Raw image
+    self.ax_raw.set_title("Raw / Cropped Image")
+    self.current_im_raw = self.ax_raw.imshow(
+        disp,
+        cmap=cmap_name,
+        origin="upper",
+        aspect="equal",
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+    self.ax_raw.set_xlabel("X")
+    self.ax_raw.set_ylabel("Y")
+    self.cbar_raw = self.figure.colorbar(
+        self.current_im_raw, ax=self.ax_raw, fraction=0.046, pad=0.04
+    )
+
+    # Threshold image
+    self.ax_thr.set_title("Threshold Regions")
+    if self.region_map is None:
+        self.ax_thr.text(0.5, 0.5, "Apply threshold to view result", ha="center", va="center")
+    else:
+        self.current_im_thr = self.ax_thr.imshow(
+            self.region_map,
+            cmap=thr_cmap_name,
+            origin="upper",
+            aspect="equal",
+            interpolation="nearest",
+        )
+        self.ax_thr.set_xlabel("X")
+        self.ax_thr.set_ylabel("Y")
+        self.cbar_thr = self.figure.colorbar(
+            self.current_im_thr, ax=self.ax_thr, fraction=0.046, pad=0.04
+        )
+
+    thresholds = []
+    if self.region_map is not None:
+        try:
+            thresholds = self._parse_thresholds()
+        except Exception:
+            thresholds = []
+
+    # Raw histogram
+    self.ax_raw_hist.set_title("Raw Histogram")
+    self.ax_raw_hist.hist(finite_vals, bins=128)
+    self.ax_raw_hist.set_xlim(vmin, vmax)
+    self.ax_raw_hist.set_xlabel("Value")
+    self.ax_raw_hist.set_ylabel("Count")
+    for t in thresholds:
+        self.ax_raw_hist.axvline(t)
+
+    # Threshold histogram
+    self.ax_thr_hist.set_title("Threshold Histogram")
+    self.ax_thr_hist.hist(finite_vals, bins=128)
+    self.ax_thr_hist.set_xlim(vmin, vmax)
+    self.ax_thr_hist.set_xlabel("Value")
+    self.ax_thr_hist.set_ylabel("Count")
+    for t in thresholds:
+        self.ax_thr_hist.axvline(t)
+
+    self.figure.tight_layout()
+    self.canvas.draw()
+
+
+-----
+
+def save_current_plot(self, kind: str):
+    if self.current_data is None:
+        messagebox.showwarning("No data", "Please load a TXT file first.")
+        return
+
+    filepath = filedialog.asksaveasfilename(
+        title="Save image",
+        defaultextension=".png",
+        filetypes=[("PNG files", "*.png"), ("TIFF files", "*.tif"), ("JPEG files", "*.jpg")],
+    )
+    if not filepath:
+        return
+
+    try:
+        fig = Figure(figsize=(6, 5), dpi=150)
+        ax = fig.add_subplot(111)
+
+        if kind == "raw":
+            cmap_name = self.cmap_var.get()
+            vmin, vmax = self.get_display_limits()
+            im = ax.imshow(
+                self.current_data,
+                cmap=cmap_name,
+                origin="upper",
+                aspect="equal",
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title("Raw / Cropped Image")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+
+        elif kind == "threshold":
+            if self.region_map is None:
+                messagebox.showwarning("No threshold result", "Apply threshold first.")
+                return
+            im = ax.imshow(
+                self.region_map,
+                cmap=self.threshold_cmap_var.get(),
+                origin="upper",
+                aspect="equal",
+                interpolation="nearest",
+            )
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.set_title("Threshold Regions")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+
+        elif kind == "raw_hist":
+            vals = self.current_data[np.isfinite(self.current_data)]
+            ax.hist(vals, bins=128)
+            ax.set_title("Raw Histogram")
+            ax.set_xlabel("Value")
+            ax.set_ylabel("Count")
+            try:
+                thresholds = self._parse_thresholds() if self.region_map is not None else []
+            except Exception:
+                thresholds = []
+            for t in thresholds:
+                ax.axvline(t)
+
+        elif kind == "threshold_hist":
+            vals = self.current_data[np.isfinite(self.current_data)]
+            ax.hist(vals, bins=128)
+            ax.set_title("Threshold Histogram")
+            ax.set_xlabel("Value")
+            ax.set_ylabel("Count")
+            try:
+                thresholds = self._parse_thresholds() if self.region_map is not None else []
+            except Exception:
+                thresholds = []
+            for t in thresholds:
+                ax.axvline(t)
+
+        else:
+            messagebox.showerror("Save Error", f"Unknown save type: {kind}")
+            return
+
+        fig.tight_layout()
+        fig.savefig(filepath, bbox_inches="tight")
+        messagebox.showinfo("Saved", f"Saved image to:\n{filepath}")
+    except Exception as e:
+        messagebox.showerror("Save Error", str(e))
+
+
+-----
+
+self.ax_raw_hist.axvline(t, linestyle="--", linewidth=1.2)
+self.ax_thr_hist.axvline(t, linestyle="--", linewidth=1.2)
+
+-----
+
+
+
 import os
 import re
 import tkinter as tk
@@ -7,6 +278,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from itertools import combinations_with_replacement
+from itertools import combinations_with_replacement
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -14,6 +286,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import cm
 from matplotlib.colors import BoundaryNorm
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 
@@ -641,6 +915,21 @@ class ThresholdApp:
             return auto_thresholds_gmm(self.current_data, n_thresh)
         return auto_thresholds_quantile(self.current_data, n_thresh)
 
+    def _compute_auto_thresholds(self, method: str, n_thresh: int) -> List[float]:
+        if method == "equal_interval":
+            return auto_thresholds_equal_interval(self.current_data, n_thresh)
+        if method == "quantile":
+            return auto_thresholds_quantile(self.current_data, n_thresh)
+        if method == "otsu":
+            return auto_thresholds_otsu(self.current_data)
+        if method == "multi_otsu":
+            return auto_thresholds_multi_otsu(self.current_data, n_thresh)
+        if method == "kmeans":
+            return auto_thresholds_kmeans(self.current_data, n_thresh)
+        if method == "gmm":
+            return auto_thresholds_gmm(self.current_data, n_thresh)
+        return auto_thresholds_quantile(self.current_data, n_thresh)
+
     def _parse_thresholds(self) -> List[float]:
         if self.current_data is None:
             raise ValueError("No data loaded.")
@@ -665,6 +954,20 @@ class ThresholdApp:
             ts = self._compute_auto_thresholds(method, n_thresh)
             self.threshold_values_var.set(", ".join(f"{t:.6g}" for t in ts))
             return sorted(ts)
+
+        raw = self.threshold_values_var.get().strip()
+        if not raw:
+            raise ValueError("Please enter threshold values or enable auto threshold values.")
+
+        try:
+            ts = [float(x.strip()) for x in raw.split(",") if x.strip() != ""]
+        except ValueError:
+            raise ValueError("Threshold values must be numeric and comma-separated.")
+
+        if len(ts) != n_thresh:
+            raise ValueError(f"Threshold count is {n_thresh}, but {len(ts)} values were provided.")
+
+        return sorted(ts)
 
         raw = self.threshold_values_var.get().strip()
         if not raw:
@@ -826,6 +1129,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
