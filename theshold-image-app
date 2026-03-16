@@ -1,3 +1,119 @@
+def refresh_display(self):
+    if self.current_data is None:
+        self._draw_empty()
+        return
+
+    cmap_name = self.cmap_var.get()
+    thr_cmap_name = self.threshold_cmap_var.get()
+
+    vmin, vmax = self.get_display_limits()
+    if vmin is None and self.vmin_var.get().strip() != "":
+        return
+    if vmax is None and self.vmax_var.get().strip() != "":
+        return
+
+    # display용 안전 배열
+    disp = np.array(self.current_data, dtype=float)
+    finite_mask = np.isfinite(disp)
+
+    if not np.any(finite_mask):
+        if self.cbar_raw is not None:
+            try:
+                self.cbar_raw.remove()
+            except Exception:
+                pass
+            self.cbar_raw = None
+
+        if self.cbar_thr is not None:
+            try:
+                self.cbar_thr.remove()
+            except Exception:
+                pass
+            self.cbar_thr = None
+
+        self.ax_raw.clear()
+        self.ax_thr.clear()
+        self.ax_raw.set_title("Raw / Cropped Image")
+        self.ax_thr.set_title("Threshold Regions")
+        self.ax_raw.text(0.5, 0.5, "Data contains no finite values", ha="center", va="center")
+        self.ax_thr.text(0.5, 0.5, "No threshold result", ha="center", va="center")
+        self.canvas.draw()
+        return
+
+    finite_vals = disp[finite_mask]
+    fill_value = float(np.median(finite_vals))
+    disp[~finite_mask] = fill_value
+
+    if vmin is None:
+        vmin = float(np.min(finite_vals))
+    if vmax is None:
+        vmax = float(np.max(finite_vals))
+    if vmin == vmax:
+        vmax = vmin + 1e-12
+
+    if self.cbar_raw is not None:
+        try:
+            self.cbar_raw.remove()
+        except Exception:
+            pass
+        self.cbar_raw = None
+
+    if self.cbar_thr is not None:
+        try:
+            self.cbar_thr.remove()
+        except Exception:
+            pass
+        self.cbar_thr = None
+
+    self.ax_raw.clear()
+    self.ax_thr.clear()
+
+    self.ax_raw.set_title("Raw / Cropped Image")
+    self.current_im_raw = self.ax_raw.imshow(
+        disp,
+        cmap=cmap_name,
+        origin="upper",
+        aspect="equal",
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+    self.ax_raw.set_xlabel("X")
+    self.ax_raw.set_ylabel("Y")
+    self.cbar_raw = self.figure.colorbar(
+        self.current_im_raw, ax=self.ax_raw, fraction=0.046, pad=0.04
+    )
+
+    self.ax_thr.set_title("Threshold Regions")
+    if self.region_map is None:
+        self.ax_thr.text(0.5, 0.5, "Apply threshold to view result", ha="center", va="center")
+    else:
+        self.current_im_thr = self.ax_thr.imshow(
+            self.region_map,
+            cmap=thr_cmap_name,
+            origin="upper",
+            aspect="equal",
+            interpolation="nearest",
+        )
+        self.ax_thr.set_xlabel("X")
+        self.ax_thr.set_ylabel("Y")
+        self.cbar_thr = self.figure.colorbar(
+            self.current_im_thr, ax=self.ax_thr, fraction=0.046, pad=0.04
+        )
+
+    self.figure.tight_layout()
+    self.canvas.draw()
+
+
+self.cbar_raw = None
+self.cbar_thr = None
+
+
+
+self.threshold_cmap_var = tk.StringVar(value="tab20")
+
+
+
 import os
 import re
 import tkinter as tk
