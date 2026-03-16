@@ -163,6 +163,8 @@ class ThresholdApp:
         self.current_im_thr = None
         self.region_map: Optional[np.ndarray] = None
         self.region_summary: List[str] = []
+        self.cbar_raw = None
+        self.cbar_thr = None
 
         self._build_ui()
         self._draw_empty()
@@ -213,6 +215,7 @@ class ThresholdApp:
         display_frame.pack(fill="x", pady=4)
 
         self.cmap_var = tk.StringVar(value="viridis")
+        self.threshold_cmap_var = tk.StringVar(value="tab20")
         self.vmin_var = tk.StringVar(value="")
         self.vmax_var = tk.StringVar(value="")
 
@@ -232,6 +235,13 @@ class ThresholdApp:
         row.pack(fill="x", pady=2)
         ttk.Label(row, text="vmax", width=12).pack(side="left")
         ttk.Entry(row, textvariable=self.vmax_var, width=12).pack(side="left", fill="x", expand=True)
+
+        row = ttk.Frame(display_frame)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Threshold cmap", width=12).pack(side="left")
+        thr_cmap_box = ttk.Combobox(row, textvariable=self.threshold_cmap_var, values=sorted(plt.colormaps()), state="readonly", width=22)
+        thr_cmap_box.pack(side="left", fill="x", expand=True)
+        thr_cmap_box.bind("<<ComboboxSelected>>", lambda e: self.refresh_display())
 
         ttk.Button(display_frame, text="Apply Display", command=self.refresh_display).pack(fill="x", pady=3)
 
@@ -285,6 +295,18 @@ class ThresholdApp:
         self.canvas.draw()
 
     def _draw_empty(self):
+        if self.cbar_raw is not None:
+            try:
+                self.cbar_raw.remove()
+            except Exception:
+                pass
+            self.cbar_raw = None
+        if self.cbar_thr is not None:
+            try:
+                self.cbar_thr.remove()
+            except Exception:
+                pass
+            self.cbar_thr = None
         self.ax_raw.clear()
         self.ax_thr.clear()
         self.ax_raw.set_title("Raw / Cropped Image")
@@ -401,15 +423,19 @@ class ThresholdApp:
         self.ax_raw.clear()
         self.ax_raw.set_title("Raw / Cropped Image")
         self.current_im_raw = self.ax_raw.imshow(
-            self.current_data,
+            disp,
             cmap=cmap_name,
             origin="upper",
-            aspect="auto",
+            aspect="equal",
             vmin=vmin,
             vmax=vmax,
+            interpolation="nearest",
         )
         self.ax_raw.set_xlabel("X")
         self.ax_raw.set_ylabel("Y")
+        if hasattr(self, "cbar_raw") and self.cbar_raw is not None:
+            self.cbar_raw.remove()
+        self.cbar_raw = self.figure.colorbar(self.current_im_raw, ax=self.ax_raw, fraction=0.046, pad=0.04)
 
         self.ax_thr.clear()
         self.ax_thr.set_title("Threshold Regions")
@@ -422,13 +448,16 @@ class ThresholdApp:
             norm = BoundaryNorm(bounds, cmap_thr.N)
             self.current_im_thr = self.ax_thr.imshow(
                 self.region_map,
-                cmap=cmap_thr,
-                norm=norm,
+                cmap=self.threshold_cmap_var.get(),
                 origin="upper",
-                aspect="auto",
+                aspect="equal",
+                interpolation="nearest",
             )
             self.ax_thr.set_xlabel("X")
             self.ax_thr.set_ylabel("Y")
+            if hasattr(self, "cbar_thr") and self.cbar_thr is not None:
+                self.cbar_thr.remove()
+            self.cbar_thr = self.figure.colorbar(self.current_im_thr, ax=self.ax_thr, fraction=0.046, pad=0.04)
 
         self.figure.tight_layout()
         self.canvas.draw()
@@ -576,7 +605,8 @@ class ThresholdApp:
             if kind == "raw":
                 cmap_name = self.cmap_var.get()
                 vmin, vmax = self.get_display_limits()
-                ax.imshow(self.current_data, cmap=cmap_name, origin="upper", aspect="auto", vmin=vmin, vmax=vmax)
+                im = ax.imshow(self.current_data, cmap=cmap_name, origin="upper", aspect="equal", vmin=vmin, vmax=vmax, interpolation="nearest")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 ax.set_title("Raw / Cropped Image")
             else:
                 if self.region_map is None:
@@ -586,7 +616,8 @@ class ThresholdApp:
                 cmap_thr = cm.get_cmap("tab20", n_regions)
                 bounds = np.arange(-0.5, n_regions + 0.5, 1)
                 norm = BoundaryNorm(bounds, cmap_thr.N)
-                ax.imshow(self.region_map, cmap=cmap_thr, norm=norm, origin="upper", aspect="auto")
+                im = ax.imshow(self.region_map, cmap=self.threshold_cmap_var.get(), origin="upper", aspect="equal", interpolation="nearest")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 ax.set_title("Threshold Regions")
 
             ax.set_xlabel("X")
