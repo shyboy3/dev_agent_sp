@@ -1,161 +1,3 @@
-def refresh_display(self):
-    if self.current_data is None:
-        self._draw_empty()
-        return
-
-    cmap_name = self.cmap_var.get()
-    vmin, vmax = self.get_display_limits()
-    if vmin is None and self.vmin_var.get().strip() != "":
-        return
-    if vmax is None and self.vmax_var.get().strip() != "":
-        return
-
-    disp = np.array(self.current_data, dtype=float)
-    finite_mask = np.isfinite(disp)
-
-    if not np.any(finite_mask):
-        self.ax_raw.clear()
-        self.ax_thr.clear()
-        self.ax_raw.set_title("Raw / Cropped Image")
-        self.ax_thr.set_title("Threshold Regions")
-        self.ax_raw.text(0.5, 0.5, "Data contains no finite values", ha="center", va="center")
-        self.ax_thr.text(0.5, 0.5, "No threshold result", ha="center", va="center")
-        self.canvas.draw()
-        return
-
-    finite_vals = disp[finite_mask]
-    disp[~finite_mask] = float(np.median(finite_vals))
-
-    if vmin is None:
-        vmin = float(np.min(finite_vals))
-    if vmax is None:
-        vmax = float(np.max(finite_vals))
-    if vmin == vmax:
-        vmax = vmin + 1e-12
-
-    self.ax_raw.clear()
-    self.ax_raw.set_title("Raw / Cropped Image")
-    self.current_im_raw = self.ax_raw.imshow(
-        disp,
-        cmap=cmap_name,
-        origin="upper",
-        aspect="auto",
-        vmin=vmin,
-        vmax=vmax,
-        interpolation="nearest",
-    )
-    self.ax_raw.set_xlabel("X")
-    self.ax_raw.set_ylabel("Y")
-
-    self.ax_thr.clear()
-    self.ax_thr.set_title("Threshold Regions")
-    if self.region_map is None:
-        self.ax_thr.text(0.5, 0.5, "Apply threshold to view result", ha="center", va="center")
-    else:
-        n_regions = int(np.nanmax(self.region_map)) + 1
-        cmap_thr = cm.get_cmap("tab20", n_regions)
-        bounds = np.arange(-0.5, n_regions + 0.5, 1)
-        norm = BoundaryNorm(bounds, cmap_thr.N)
-        self.current_im_thr = self.ax_thr.imshow(
-            self.region_map,
-            cmap=cmap_thr,
-            norm=norm,
-            origin="upper",
-            aspect="auto",
-            interpolation="nearest",
-        )
-        self.ax_thr.set_xlabel("X")
-        self.ax_thr.set_ylabel("Y")
-
-    self.figure.tight_layout()
-    self.canvas.draw()
-
-
-self.info_text.insert(tk.END, f"Current shape: {self.current_data.shape}\n")
-finite_mask = np.isfinite(self.current_data)
-self.info_text.insert(tk.END, f"Finite pixels: {int(np.sum(finite_mask))} / {self.current_data.size}\n")
-self.info_text.insert(tk.END, f"Min: {np.nanmin(self.current_data):.6g}\n")
-self.info_text.insert(tk.END, f"Max: {np.nanmax(self.current_data):.6g}\n")
-self.info_text.insert(tk.END, f"Mean: {np.nanmean(self.current_data):.6g}\n")
-self.info_text.insert(tk.END, f"Std: {np.nanstd(self.current_data):.6g}\n\n")
-
-
-def load_nanoscope_txt(filepath: str) -> Tuple[np.ndarray, Dict[str, str]]:
-    metadata: Dict[str, str] = {}
-    numeric_rows: List[List[float]] = []
-    flat_values: List[float] = []
-
-    def _extract_int_from_text(text: str) -> Optional[int]:
-        m = re.search(r"(-?\d+)", text)
-        return int(m.group(1)) if m else None
-
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-
-            if s.startswith("#"):
-                line2 = s.lstrip("#").strip()
-                if ":" in line2:
-                    k, v = line2.split(":", 1)
-                    metadata[k.strip()] = v.strip()
-                else:
-                    metadata[f"meta_{len(metadata)+1}"] = line2
-                continue
-
-            parts = [p for p in re.split(r"[,\s]+", s) if p != ""]
-            row = []
-            ok = True
-            for p in parts:
-                try:
-                    val = float(p)
-                    row.append(val)
-                    flat_values.append(val)
-                except ValueError:
-                    ok = False
-                    break
-
-            if ok and row:
-                numeric_rows.append(row)
-
-    if not flat_values:
-        raise ValueError("No numerical data found in the TXT file.")
-
-    if numeric_rows:
-        widths = {len(r) for r in numeric_rows}
-        if len(widths) == 1 and len(numeric_rows) > 1:
-            return np.array(numeric_rows, dtype=float), metadata
-
-    xpix = None
-    ypix = None
-    for k, v in metadata.items():
-        kl = k.lower()
-        if xpix is None and ("x pixel" in kl or "samps/line" in kl or "samples/line" in kl or "resolution x" in kl):
-            xpix = _extract_int_from_text(v)
-        if ypix is None and ("y pixel" in kl or "number of lines" in kl or kl == "lines" or "resolution y" in kl):
-            ypix = _extract_int_from_text(v)
-
-    flat = np.array(flat_values, dtype=float)
-
-    if xpix is not None and ypix is not None and xpix > 0 and ypix > 0:
-        expected = xpix * ypix
-        if flat.size >= expected:
-            return flat[:expected].reshape(ypix, xpix), metadata
-
-    side = int(np.sqrt(flat.size))
-    if side * side == flat.size:
-        return flat.reshape(side, side), metadata
-
-    return flat.reshape(1, -1), metadata
-
-
-
-
-
-
-
-
 import os
 import re
 import tkinter as tk
@@ -309,10 +151,12 @@ class ThresholdApp:
         self.metadata: Dict[str, str] = {}
         self.filepath: Optional[str] = None
 
-        self.figure = Figure(figsize=(10, 5.5), dpi=100)
+        self.figure = Figure(figsize=(10, 5.5), dpi=100, facecolor="white")
         self.ax_raw = self.figure.add_subplot(1, 2, 1)
         self.ax_thr = self.figure.add_subplot(1, 2, 2)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
+        self.ax_raw.set_facecolor("white")
+        self.ax_thr.set_facecolor("white")
+        self.canvas = None
 
         self.cmap_names = sorted(m for m in plt.colormaps() if not m.endswith("_r"))
         self.current_im_raw = None
@@ -431,7 +275,14 @@ class ThresholdApp:
         self.info_text.pack(fill="both", expand=True)
 
         # Plot area
-        self.canvas.get_tk_widget().pack(in_=right, fill="both", expand=True)
+        plot_frame = ttk.Frame(right)
+        plot_frame.pack(fill="both", expand=True)
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(fill="both", expand=True)
+        canvas_widget.configure(bg="white")
+        self.canvas.draw()
 
     def _draw_empty(self):
         self.ax_raw.clear()
@@ -440,7 +291,7 @@ class ThresholdApp:
         self.ax_thr.set_title("Threshold Regions")
         self.ax_raw.text(0.5, 0.5, "No data loaded", ha="center", va="center")
         self.ax_thr.text(0.5, 0.5, "No threshold result", ha="center", va="center")
-        self.canvas.draw_idle()
+        self.canvas.draw()
 
     def open_file(self):
         path = filedialog.askopenfilename(
@@ -580,7 +431,7 @@ class ThresholdApp:
             self.ax_thr.set_ylabel("Y")
 
         self.figure.tight_layout()
-        self.canvas.draw_idle()
+        self.canvas.draw()
 
     def suggest_thresholds(self):
         if self.current_data is None:
@@ -765,7 +616,8 @@ class ThresholdApp:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write("line\n")
                     for line in self.region_summary:
-                        f.write(f'"{line.replace("\"", "\"\"")}"\n')
+                        f.write('"' + line.replace('"', '""') + '"
+')
             else:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write("\n".join(self.region_summary))
