@@ -1,3 +1,1368 @@
+---------------------------------------------------------------------------------------------
+-   nanoscope 패키지로 spm, .000 파일 로딩, 실패하면 pySPM 시도
+---------------------------------------------------------------------------------------------
+import os
+import json
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.stats import mode
+
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib import colormaps
+from matplotlib import colors as mcolors
+
+from skimage import io as skio
+from skimage.filters import threshold_otsu, threshold_multiotsu, gaussian
+from skimage.restoration import denoise_tv_chambolle, denoise_wavelet
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+
+try:
+    import pySPM
+    HAS_PYSPM = True
+    PYSPM_IMPORT_ERROR = None
+except Exception as _pysmp_err:
+    pySPM = None
+    HAS_PYSPM = False
+    PYSPM_IMPORT_ERROR = _pysmp_err
+
+try:
+    import nanoscope
+    HAS_NANOSCOPE = True
+    NANOSCOPE_IMPORT_ERROR = None
+except Exception as _nanoscope_err:
+    nanoscope = None
+    HAS_NANOSCOPE = False
+    NANOSCOPE_IMPORT_ERROR = _nanoscope_err
+
+
+class NanoScopeThresholdApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("NanoScope Threshold App")
+        self.root.geometry("1710x1040")
+
+        self.filepaths = []
+        self.filepath = None
+        self.raw_image = None
+        self.cropped_image = None
+        self.preprocessed_image = None
+        self.label_image = None
+        self.threshold_values = []
+        self.group_percentages = []
+
+        self.last_hist_raw = None
+        self.last_hist_threshold = None
+        self.last_raw_figure = None
+        self.last_threshold_figure = None
+
+        self.raw_canvas = None
+        self.threshold_canvas = None
+        self.raw_hist_canvas = None
+        self.threshold_hist_canvas = None
+
+        self._init_variables()
+        self._build_ui()
+
+    def _init_variables(self):
+        self.crop_enable_var = tk.BooleanVar(value=False)
+        self.crop_x_var = tk.IntVar(value=0)
+        self.crop_y_var = tk.IntVar(value=0)
+        self.crop_w_var = tk.IntVar(value=256)
+        self.crop_h_var = tk.IntVar(value=256)
+
+        self.pp_order_var = tk.StringVar(value="Median > Gaussian > TV > Wavelet")
+        self.pp_median_var = tk.BooleanVar(value=False)
+        self.pp_median_size_var = tk.IntVar(value=3)
+        self.pp_gaussian_var = tk.BooleanVar(value=False)
+        self.pp_gaussian_sigma_var = tk.DoubleVar(value=1.0)
+        self.pp_gaussian_preserve_range_var = tk.BooleanVar(value=True)
+        self.pp_tv_var = tk.BooleanVar(value=False)
+        self.pp_tv_weight_var = tk.DoubleVar(value=0.10)
+        self.pp_tv_eps_var = tk.DoubleVar(value=2e-4)
+        self.pp_tv_max_num_iter_var = tk.IntVar(value=200)
+        self.pp_wavelet_var = tk.BooleanVar(value=False)
+        self.pp_wavelet_sigma_var = tk.DoubleVar(value=0.08)
+        self.pp_wavelet_wavelet_var = tk.StringVar(value="db2")
+        self.pp_wavelet_mode_var = tk.StringVar(value="soft")
+        self.pp_wavelet_rescale_sigma_var = tk.BooleanVar(value=True)
+
+        self.threshold_method_var = tk.StringVar(value="Multi-Otsu")
+        self.threshold_count_var = tk.IntVar(value=2)
+        self.kmeans_random_state_var = tk.IntVar(value=0)
+        self.kmeans_n_init_var = tk.IntVar(value=10)
+        self.gmm_random_state_var = tk.IntVar(value=0)
+        self.gmm_covariance_type_var = tk.StringVar(value="full")
+        self.equal_interval_percentile_low_var = tk.DoubleVar(value=0.0)
+        self.equal_interval_percentile_high_var = tk.DoubleVar(value=100.0)
+        self.use_manual_thresholds_var = tk.BooleanVar(value=False)
+        self.manual_thresholds_var = tk.StringVar(value="")
+
+        self.bp_enable_var = tk.BooleanVar(value=False)
+        self.bp_min_region_size_var = tk.IntVar(value=10)
+
+        self.display_size_var = tk.IntVar(value=420)
+        self.raw_colormap_var = tk.StringVar(value="viridis")
+        self.threshold_colormap_var = tk.StringVar(value="viridis")
+        self.raw_min_enable_var = tk.BooleanVar(value=False)
+        self.raw_max_enable_var = tk.BooleanVar(value=False)
+        self.raw_vmin_var = tk.DoubleVar(value=0.0)
+        self.raw_vmax_var = tk.DoubleVar(value=1.0)
+        self.show_boundaries_var = tk.BooleanVar(value=False)
+        self.boundary_color_var = tk.StringVar(value="red")
+        self.boundary_thickness_var = tk.DoubleVar(value=0.8)
+
+        self.raw_shape_var = tk.StringVar(value="Raw Shape: N/A")
+        self.status_var = tk.StringVar(value="Ready")
+        self.selected_spm_channel_var = tk.StringVar(value="")
+        self.current_source_info = None
+        self.current_afm_backend = None
+        self.current_afm_metrics = {}
+        self.spm_channels_by_path = {}
+        self.spm_channel_combo = None
+
+    def _build_ui(self):
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+
+        control_outer = ttk.Frame(outer, width=520)
+        control_outer.pack(side="left", fill="y", padx=8, pady=8)
+        control_outer.pack_propagate(False)
+
+        self.control_canvas = tk.Canvas(control_outer, highlightthickness=0, width=500)
+        self.control_canvas.pack(side="left", fill="both", expand=True)
+
+        self.control_scrollbar = ttk.Scrollbar(control_outer, orient="vertical", command=self.control_canvas.yview)
+        self.control_scrollbar.pack(side="right", fill="y")
+        self.control_canvas.configure(yscrollcommand=self.control_scrollbar.set)
+
+        control = ttk.Frame(self.control_canvas)
+        self.control_frame = control
+        self._control_window_id = self.control_canvas.create_window((0, 0), window=control, anchor="nw")
+
+        control.bind("<Configure>", self._on_control_frame_configure)
+        self.control_canvas.bind("<Configure>", self._on_control_canvas_configure)
+        self.control_canvas.bind("<Enter>", self._bind_mousewheel)
+        self.control_canvas.bind("<Leave>", self._unbind_mousewheel)
+
+        view = ttk.Frame(outer)
+        view.pack(side="right", fill="both", expand=True, padx=8, pady=8)
+
+        self._build_file_group(control)
+        self._build_action_group(control)
+        self._build_crop_group(control)
+        self._build_preprocessing_group(control)
+        self._build_threshold_group(control)
+        self._build_binary_processing_group(control)
+        self._build_display_group(control)
+
+        ttk.Label(control, textvariable=self.status_var, foreground="blue", wraplength=470).pack(fill="x", padx=4, pady=6)
+        self._build_view_group(view)
+
+
+    def _on_control_frame_configure(self, event=None):
+        self.control_canvas.configure(scrollregion=self.control_canvas.bbox("all"))
+
+    def _on_control_canvas_configure(self, event):
+        self.control_canvas.itemconfigure(self._control_window_id, width=event.width)
+
+    def _bind_mousewheel(self, event=None):
+        self.control_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.control_canvas.bind_all("<Button-4>", self._on_mousewheel_linux)
+        self.control_canvas.bind_all("<Button-5>", self._on_mousewheel_linux)
+
+    def _unbind_mousewheel(self, event=None):
+        self.control_canvas.unbind_all("<MouseWheel>")
+        self.control_canvas.unbind_all("<Button-4>")
+        self.control_canvas.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, event):
+        self.control_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_mousewheel_linux(self, event):
+        if event.num == 4:
+            self.control_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.control_canvas.yview_scroll(1, "units")
+
+    def _build_file_group(self, parent):
+        g = ttk.LabelFrame(parent, text="File")
+        g.pack(fill="x", pady=4)
+
+        row = ttk.Frame(g)
+        row.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row, text="Load Image", command=self.load_images).pack(side="left", padx=2)
+        ttk.Button(row, text="Reload", command=self.reload_image).pack(side="left", padx=2)
+        ttk.Button(row, text="Remove Selected", command=self.remove_selected_file).pack(side="left", padx=2)
+        ttk.Button(row, text="Clear List", command=self.clear_file_list).pack(side="left", padx=2)
+
+        ttk.Label(g, text="Loaded Files").pack(anchor="w", padx=4)
+        list_frame = ttk.Frame(g)
+        list_frame.pack(fill="x", padx=4, pady=(0, 4))
+        self.file_listbox = tk.Listbox(list_frame, height=6, exportselection=False)
+        self.file_listbox.pack(side="left", fill="x", expand=True)
+        self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.file_listbox.config(yscrollcommand=scrollbar.set)
+
+        row2 = ttk.Frame(g)
+        row2.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(row2, text="Save Params", command=self.save_parameters_to_file).pack(side="left", padx=2)
+        ttk.Button(row2, text="Load Params", command=self.load_parameters_from_file).pack(side="left", padx=2)
+
+        ch_row = ttk.Frame(g)
+        ch_row.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(ch_row, text="AFM Channel").pack(side="left")
+        self.spm_channel_combo = ttk.Combobox(ch_row, textvariable=self.selected_spm_channel_var, state="disabled", width=36)
+        self.spm_channel_combo.pack(side="left", fill="x", expand=True, padx=6)
+        self.spm_channel_combo.bind("<<ComboboxSelected>>", self.on_spm_channel_select)
+
+        self.file_label = ttk.Label(g, text="No file selected", wraplength=460)
+        self.file_label.pack(fill="x", padx=4, pady=(0, 4))
+
+    def _build_action_group(self, parent):
+        g = ttk.LabelFrame(parent, text="Actions")
+        g.pack(fill="x", pady=4)
+
+        row1 = ttk.Frame(g)
+        row1.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row1, text="Process", command=self.process_all).pack(side="left", padx=2)
+        ttk.Button(row1, text="Reset", command=self.reset_processing).pack(side="left", padx=2)
+        ttk.Button(row1, text="Export TXT", command=self.export_processing_summary).pack(side="left", padx=2)
+
+        row2 = ttk.Frame(g)
+        row2.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row2, text="Save Raw Image", command=self.save_raw_image).pack(side="left", padx=2)
+        ttk.Button(row2, text="Save Threshold Image", command=self.save_threshold_image).pack(side="left", padx=2)
+
+        row3 = ttk.Frame(g)
+        row3.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row3, text="Save Raw Histogram", command=self.save_raw_histogram).pack(side="left", padx=2)
+        ttk.Button(row3, text="Save Threshold Histogram", command=self.save_threshold_histogram).pack(side="left", padx=2)
+
+    def _build_crop_group(self, parent):
+        g = ttk.LabelFrame(parent, text="Crop")
+        g.pack(fill="x", pady=4)
+
+        ttk.Checkbutton(g, text="Enable Crop", variable=self.crop_enable_var).pack(anchor="w", padx=4, pady=2)
+        grid = ttk.Frame(g)
+        grid.pack(fill="x", padx=4, pady=2)
+        for i, (label, var) in enumerate([
+            ("X", self.crop_x_var), ("Y", self.crop_y_var),
+            ("W", self.crop_w_var), ("H", self.crop_h_var),
+        ]):
+            ttk.Label(grid, text=label).grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=2, pady=2)
+            ttk.Entry(grid, textvariable=var, width=8).grid(row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=2, pady=2)
+
+        ttk.Label(g, textvariable=self.raw_shape_var).pack(anchor="w", padx=4, pady=(2, 4))
+
+    def _build_preprocessing_group(self, parent):
+        g = ttk.LabelFrame(parent, text="Pre-Processing")
+        g.pack(fill="x", pady=4)
+
+        r0 = ttk.Frame(g)
+        r0.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r0, text="Order").pack(side="left")
+        ttk.Entry(r0, textvariable=self.pp_order_var, width=40).pack(side="left", padx=4)
+        ttk.Label(g, text="Use method names separated by '>'", wraplength=460).pack(anchor="w", padx=4, pady=(0, 4))
+
+        med = ttk.LabelFrame(g, text="Median")
+        med.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(med, text="Enable", variable=self.pp_median_var).pack(side="left", padx=4)
+        ttk.Label(med, text="Kernel").pack(side="left")
+        ttk.Entry(med, textvariable=self.pp_median_size_var, width=6).pack(side="left", padx=4)
+
+        ga = ttk.LabelFrame(g, text="Gaussian")
+        ga.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(ga, text="Enable", variable=self.pp_gaussian_var).pack(side="left", padx=4)
+        ttk.Label(ga, text="Sigma").pack(side="left")
+        ttk.Entry(ga, textvariable=self.pp_gaussian_sigma_var, width=6).pack(side="left", padx=4)
+        ttk.Checkbutton(ga, text="Preserve Range", variable=self.pp_gaussian_preserve_range_var).pack(side="left", padx=4)
+
+        tv = ttk.LabelFrame(g, text="Total Variation")
+        tv.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(tv, text="Enable", variable=self.pp_tv_var).pack(side="left", padx=4)
+        ttk.Label(tv, text="Weight").pack(side="left")
+        ttk.Entry(tv, textvariable=self.pp_tv_weight_var, width=6).pack(side="left", padx=2)
+        ttk.Label(tv, text="Eps").pack(side="left")
+        ttk.Entry(tv, textvariable=self.pp_tv_eps_var, width=8).pack(side="left", padx=2)
+        ttk.Label(tv, text="Iter").pack(side="left")
+        ttk.Entry(tv, textvariable=self.pp_tv_max_num_iter_var, width=6).pack(side="left", padx=2)
+
+        wav = ttk.LabelFrame(g, text="Wavelet Denoising")
+        wav.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(wav, text="Enable", variable=self.pp_wavelet_var).pack(side="left", padx=4)
+        ttk.Label(wav, text="Sigma").pack(side="left")
+        ttk.Entry(wav, textvariable=self.pp_wavelet_sigma_var, width=6).pack(side="left", padx=2)
+        ttk.Label(wav, text="Wavelet").pack(side="left")
+        ttk.Entry(wav, textvariable=self.pp_wavelet_wavelet_var, width=7).pack(side="left", padx=2)
+        ttk.Label(wav, text="Mode").pack(side="left")
+        ttk.Combobox(wav, textvariable=self.pp_wavelet_mode_var, values=["soft", "hard"], width=6, state="readonly").pack(side="left", padx=2)
+        ttk.Checkbutton(wav, text="Rescale Sigma", variable=self.pp_wavelet_rescale_sigma_var).pack(side="left", padx=4)
+
+    def _build_threshold_group(self, parent):
+        g = ttk.LabelFrame(parent, text="Threshold")
+        g.pack(fill="x", pady=4)
+
+        r1 = ttk.Frame(g)
+        r1.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r1, text="Method").pack(side="left")
+        ttk.Combobox(
+            r1,
+            textvariable=self.threshold_method_var,
+            values=["Otsu", "Multi-Otsu", "K-means", "GMM", "Equal Interval"],
+            state="readonly", width=16
+        ).pack(side="left", padx=4)
+
+        r2 = ttk.Frame(g)
+        r2.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r2, text="Threshold Count").pack(side="left")
+        ttk.Entry(r2, textvariable=self.threshold_count_var, width=6).pack(side="left", padx=4)
+        ttk.Label(r2, text="(groups = count + 1)").pack(side="left", padx=4)
+
+        r3 = ttk.Frame(g)
+        r3.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(r3, text="Use Manual Thresholds", variable=self.use_manual_thresholds_var).pack(side="left", padx=2)
+        ttk.Button(r3, text="Suggest", command=self.suggest_thresholds).pack(side="left", padx=4)
+
+        r4 = ttk.Frame(g)
+        r4.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r4, text="Manual Values").pack(side="left")
+        ttk.Entry(r4, textvariable=self.manual_thresholds_var, width=38).pack(side="left", padx=4)
+        ttk.Label(g, text="Comma-separated values. Example: 0.12, 0.35, 0.51", wraplength=460).pack(anchor="w", padx=4, pady=(0, 4))
+
+        km = ttk.LabelFrame(g, text="K-means Params")
+        km.pack(fill="x", padx=4, pady=2)
+        ttk.Label(km, text="Random State").pack(side="left", padx=2)
+        ttk.Entry(km, textvariable=self.kmeans_random_state_var, width=6).pack(side="left", padx=2)
+        ttk.Label(km, text="n_init").pack(side="left", padx=2)
+        ttk.Entry(km, textvariable=self.kmeans_n_init_var, width=6).pack(side="left", padx=2)
+
+        gm = ttk.LabelFrame(g, text="GMM Params")
+        gm.pack(fill="x", padx=4, pady=2)
+        ttk.Label(gm, text="Random State").pack(side="left", padx=2)
+        ttk.Entry(gm, textvariable=self.gmm_random_state_var, width=6).pack(side="left", padx=2)
+        ttk.Label(gm, text="Covariance").pack(side="left", padx=2)
+        ttk.Combobox(gm, textvariable=self.gmm_covariance_type_var, values=["full", "tied", "diag", "spherical"], state="readonly", width=9).pack(side="left", padx=2)
+
+        eq = ttk.LabelFrame(g, text="Equal Interval Params")
+        eq.pack(fill="x", padx=4, pady=2)
+        ttk.Label(eq, text="Low %").pack(side="left", padx=2)
+        ttk.Entry(eq, textvariable=self.equal_interval_percentile_low_var, width=6).pack(side="left", padx=2)
+        ttk.Label(eq, text="High %").pack(side="left", padx=2)
+        ttk.Entry(eq, textvariable=self.equal_interval_percentile_high_var, width=6).pack(side="left", padx=2)
+
+    def _build_binary_processing_group(self, parent):
+        g = ttk.LabelFrame(parent, text="Binary Processing")
+        g.pack(fill="x", pady=4)
+        ttk.Checkbutton(g, text="Enable small-region replacement", variable=self.bp_enable_var).pack(anchor="w", padx=4, pady=2)
+        row = ttk.Frame(g)
+        row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="P (replace regions <= P pixels)").pack(side="left")
+        ttk.Entry(row, textvariable=self.bp_min_region_size_var, width=8).pack(side="left", padx=4)
+        ttk.Label(g, text="Connected components smaller than or equal to P are replaced with the dominant surrounding label.", wraplength=460).pack(anchor="w", padx=4, pady=(0, 4))
+
+    def _build_display_group(self, parent):
+        g = ttk.LabelFrame(parent, text="Display")
+        g.pack(fill="x", pady=4)
+
+        r1 = ttk.Frame(g)
+        r1.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r1, text="Image Size").pack(side="left")
+        ttk.Entry(r1, textvariable=self.display_size_var, width=8).pack(side="left", padx=4)
+
+        cmaps = ["viridis", "gray", "plasma", "inferno", "magma", "turbo", "jet"]
+        r2 = ttk.Frame(g)
+        r2.pack(fill="x", padx=4, pady=2)
+        ttk.Label(r2, text="Raw Colormap").pack(side="left")
+        ttk.Combobox(r2, textvariable=self.raw_colormap_var, values=cmaps, state="readonly", width=10).pack(side="left", padx=4)
+        ttk.Label(r2, text="Threshold Colormap").pack(side="left", padx=(8, 0))
+        ttk.Combobox(r2, textvariable=self.threshold_colormap_var, values=cmaps, state="readonly", width=10).pack(side="left", padx=4)
+
+        r3 = ttk.Frame(g)
+        r3.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(r3, text="Use Raw Min", variable=self.raw_min_enable_var).pack(side="left", padx=2)
+        ttk.Entry(r3, textvariable=self.raw_vmin_var, width=8).pack(side="left", padx=2)
+        ttk.Checkbutton(r3, text="Use Raw Max", variable=self.raw_max_enable_var).pack(side="left", padx=(8, 2))
+        ttk.Entry(r3, textvariable=self.raw_vmax_var, width=8).pack(side="left", padx=2)
+
+        r4 = ttk.Frame(g)
+        r4.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(r4, text="Show Boundaries", variable=self.show_boundaries_var).pack(side="left", padx=2)
+        ttk.Label(r4, text="Boundary Color").pack(side="left", padx=2)
+        ttk.Combobox(r4, textvariable=self.boundary_color_var, values=["red", "yellow", "cyan", "white", "black"], state="readonly", width=8).pack(side="left", padx=2)
+        ttk.Label(r4, text="Contour Thickness").pack(side="left", padx=(8, 2))
+        ttk.Entry(r4, textvariable=self.boundary_thickness_var, width=6).pack(side="left", padx=2)
+
+    def _build_view_group(self, parent):
+        img_frame = ttk.Frame(parent)
+        img_frame.pack(fill="x", pady=(0, 6))
+
+        self.raw_panel = ttk.LabelFrame(img_frame, text="Raw / Preprocessed")
+        self.raw_panel.pack(side="left", fill="both", expand=True, padx=4)
+        self.raw_canvas_container = ttk.Frame(self.raw_panel)
+        self.raw_canvas_container.pack(fill="both", expand=True)
+
+        self.threshold_panel = ttk.LabelFrame(img_frame, text="Threshold Result")
+        self.threshold_panel.pack(side="left", fill="both", expand=True, padx=4)
+        self.threshold_canvas_container = ttk.Frame(self.threshold_panel)
+        self.threshold_canvas_container.pack(fill="both", expand=True)
+
+        hist_frame = ttk.Frame(parent)
+        hist_frame.pack(fill="both", expand=True)
+
+        self.raw_hist_group = ttk.LabelFrame(hist_frame, text="Raw Histogram")
+        self.raw_hist_group.pack(side="left", fill="both", expand=True, padx=4)
+        self.raw_hist_canvas_container = ttk.Frame(self.raw_hist_group)
+        self.raw_hist_canvas_container.pack(fill="both", expand=True)
+
+        self.threshold_hist_group = ttk.LabelFrame(hist_frame, text="Threshold Histogram")
+        self.threshold_hist_group.pack(side="left", fill="both", expand=True, padx=4)
+        self.threshold_hist_canvas_container = ttk.Frame(self.threshold_hist_group)
+        self.threshold_hist_canvas_container.pack(fill="both", expand=True)
+
+    # I/O
+    def load_images(self):
+        paths = filedialog.askopenfilenames(
+            title="Select image(s)",
+            filetypes=[
+                ("Supported", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.npy *.csv *.txt *.spm *.000 *.001 *.002 *.003 *.004 *.005 *.006 *.007 *.008 *.009"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not paths:
+            return
+        added = 0
+        for path in paths:
+            if path not in self.filepaths:
+                self.filepaths.append(path)
+                self.file_listbox.insert(tk.END, os.path.basename(path))
+                added += 1
+        if self.filepaths:
+            select_idx = len(self.filepaths) - 1
+            self.file_listbox.selection_clear(0, tk.END)
+            self.file_listbox.selection_set(select_idx)
+            self.file_listbox.activate(select_idx)
+            self.file_listbox.see(select_idx)
+            self._set_current_file(select_idx)
+        self.status_var.set(f"Loaded {added} new file(s). Total files: {len(self.filepaths)}")
+
+    def on_file_select(self, event=None):
+        selection = self.file_listbox.curselection()
+        if not selection:
+            return
+        self._set_current_file(selection[0])
+
+    def _set_current_file(self, idx):
+        if idx < 0 or idx >= len(self.filepaths):
+            return
+        self.filepath = self.filepaths[idx]
+        self._refresh_spm_channel_ui_for_current_file()
+        self._read_current_file()
+
+    def on_spm_channel_select(self, event=None):
+        if not self.filepath or not self._is_bruker_candidate(self.filepath):
+            return
+        self._read_current_file()
+
+    def _refresh_spm_channel_ui_for_current_file(self):
+        path = self.filepath
+        if not path or not self._is_bruker_candidate(path):
+            self.selected_spm_channel_var.set("")
+            if self.spm_channel_combo is not None:
+                self.spm_channel_combo.configure(values=[], state="disabled")
+            return
+
+        channel_names = self._get_spm_channel_names(path)
+        display_names = [str(name) for name in channel_names]
+        if self.spm_channel_combo is not None:
+            state = "readonly" if display_names else "disabled"
+            self.spm_channel_combo.configure(values=display_names, state=state)
+
+        current = self.selected_spm_channel_var.get().strip()
+        if current in display_names:
+            return
+
+        preferred = self._choose_default_spm_channel(channel_names)
+        self.selected_spm_channel_var.set(str(preferred) if preferred is not None else "")
+
+    def _is_bruker_candidate(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        return ext == ".spm" or (len(ext) == 4 and ext[1:].isdigit())
+
+    def _get_nanoscope_channel_names(self, path):
+        if not HAS_NANOSCOPE:
+            return []
+        names = []
+        try:
+            parsed = nanoscope.read(path)
+            for img in parsed:
+                img_type = getattr(img, "type", None)
+                if img_type is not None:
+                    names.append(str(img_type))
+        except Exception:
+            return []
+        # deduplicate while preserving order
+        seen = set()
+        ordered = []
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        return ordered
+
+    def _get_spm_channel_names(self, path):
+        if path in self.spm_channels_by_path:
+            return self.spm_channels_by_path[path]
+
+        names = []
+        if self._is_bruker_candidate(path) and HAS_NANOSCOPE:
+            names = self._get_nanoscope_channel_names(path)
+
+        if not names and HAS_PYSPM:
+            try:
+                bruker = pySPM.Bruker(path)
+                names = [str(name) for name in bruker.list_channels()]
+            except Exception:
+                names = []
+
+        self.spm_channels_by_path[path] = names
+        return names
+
+    def _choose_default_spm_channel(self, channel_names):
+        preferred_order = [
+            "Height Sensor", "Height", "ZSensor", "Z Sensor", "Topography",
+            "Height Trace", "Topography Trace", "Height Retrace", "Topography Retrace"
+        ]
+        lowered = {str(name).strip().lower(): name for name in channel_names}
+        for pref in preferred_order:
+            match = lowered.get(pref.lower())
+            if match is not None:
+                return match
+        for name in channel_names:
+            lname = str(name).lower()
+            if "height" in lname or "topography" in lname or "z" in lname:
+                return name
+        return channel_names[0] if channel_names else None
+
+    def remove_selected_file(self):
+        selection = self.file_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Info", "Select a file to remove.")
+            return
+        idx = selection[0]
+        removed = self.filepaths.pop(idx)
+        self.file_listbox.delete(idx)
+        if self.filepath == removed:
+            self.reset_processing(keep_image=False)
+            if self.filepaths:
+                new_idx = min(idx, len(self.filepaths) - 1)
+                self.file_listbox.selection_set(new_idx)
+                self.file_listbox.activate(new_idx)
+                self._set_current_file(new_idx)
+            else:
+                self.file_label.config(text="No file selected")
+                self._refresh_spm_channel_ui_for_current_file()
+        self.status_var.set(f"Removed: {os.path.basename(removed)}")
+
+    def clear_file_list(self):
+        self.filepaths = []
+        self.filepath = None
+        self.file_listbox.delete(0, tk.END)
+        self.reset_processing(keep_image=False)
+        self.file_label.config(text="No file selected")
+        self.raw_shape_var.set("Raw Shape: N/A")
+        self.current_source_info = None
+        self.current_afm_backend = None
+        self.current_afm_metrics = {}
+        self.selected_spm_channel_var.set("")
+        self._refresh_spm_channel_ui_for_current_file()
+        self.status_var.set("File list cleared")
+
+    def reload_image(self):
+        if not self.filepath:
+            messagebox.showinfo("Info", "No file selected yet.")
+            return
+        self._read_current_file()
+
+    def _read_current_file(self):
+        try:
+            path = self.filepath
+            arr, source_info = self._load_array_from_path(path)
+
+            arr = self._to_2d_float(arr)
+            self.raw_image = arr
+            self.current_source_info = source_info
+            h, w = arr.shape
+            self.raw_shape_var.set(f"Raw Shape: {h} x {w} (H x W)")
+            if self.file_label is not None:
+                self.file_label.config(text=path)
+            # Preserve all user parameters across file changes.
+            # Only initialize display min/max once when they still have their startup defaults.
+            if (not self.raw_min_enable_var.get()) and (not self.raw_max_enable_var.get()) and float(self.raw_vmin_var.get()) == 0.0 and float(self.raw_vmax_var.get()) == 1.0:
+                self.raw_vmin_var.set(float(np.min(arr)))
+                self.raw_vmax_var.set(float(np.max(arr)))
+            info_suffix = f" | {source_info}" if source_info else ""
+            self.status_var.set(f"Loaded image: {os.path.basename(path)} | size={arr.shape[1]} x {arr.shape[0]}{info_suffix}")
+            self.reset_processing(keep_image=True)
+            self.process_all()
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+            self.status_var.set("Failed to load image")
+
+    def _load_array_from_path(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".npy":
+            return np.load(path), None
+        if ext in [".csv", ".txt"]:
+            return np.loadtxt(path, delimiter=',' if ext == '.csv' else None), None
+        if self._is_bruker_candidate(path):
+            return self._load_spm_file(path)
+        return skio.imread(path), None
+
+    def _load_spm_file(self, path):
+        errors = []
+        if HAS_NANOSCOPE:
+            try:
+                return self._load_bruker_with_nanoscope(path)
+            except Exception as exc:
+                errors.append(f"nanoscope: {exc}")
+
+        if HAS_PYSPM:
+            try:
+                return self._load_bruker_with_pyspm(path)
+            except Exception as exc:
+                errors.append(f"pySPM: {exc}")
+
+        if not HAS_NANOSCOPE and not HAS_PYSPM:
+            raise ImportError(
+                "Loading Bruker AFM files (.spm, .000, .001, ...) requires nanoscope or pySPM.\n"
+                f"nanoscope import error: {NANOSCOPE_IMPORT_ERROR}\n"
+                f"pySPM import error: {PYSPM_IMPORT_ERROR}"
+            )
+
+        raise RuntimeError("Failed to load Bruker AFM file. " + " | ".join(errors))
+
+    def _get_selected_or_default_channel_name(self, channel_names):
+        display_names = [str(name) for name in channel_names]
+        chosen_name = self.selected_spm_channel_var.get().strip()
+        if not chosen_name or chosen_name not in display_names:
+            default_name = self._choose_default_spm_channel(channel_names)
+            chosen_name = str(default_name) if default_name is not None else chosen_name
+            self.selected_spm_channel_var.set(chosen_name)
+        return chosen_name
+
+    def _load_bruker_with_nanoscope(self, path):
+        parsed = nanoscope.read(path)
+        channel_objs = []
+        for img in parsed:
+            img_type = getattr(img, "type", None)
+            if img_type is None:
+                continue
+            channel_objs.append((str(img_type), img))
+        if not channel_objs:
+            raise ValueError("nanoscope did not expose any readable channels.")
+
+        channel_names = [name for name, _ in channel_objs]
+        self.spm_channels_by_path[path] = channel_names
+        chosen_name = self._get_selected_or_default_channel_name(channel_names)
+        chosen_img = None
+        for name, img in channel_objs:
+            if name == chosen_name:
+                chosen_img = img
+                break
+        if chosen_img is None:
+            raise ValueError(f"Selected AFM channel '{chosen_name}' was not found.")
+
+        process_kwargs = {}
+        try:
+            chosen_img.process(**process_kwargs)
+        except TypeError:
+            chosen_img.process()
+
+        data = getattr(chosen_img, "data", None)
+        if data is None:
+            pixels = getattr(chosen_img, "pixels", None)
+            if pixels is None:
+                raise ValueError(f"nanoscope channel '{chosen_name}' does not expose data or pixels.")
+            data = pixels
+
+        metrics = {}
+        for key in ["rms", "zrange", "mean", "min", "max"]:
+            val = getattr(chosen_img, key, None)
+            if val is not None:
+                try:
+                    metrics[key] = float(val)
+                except Exception:
+                    metrics[key] = val
+        self.current_afm_backend = "nanoscope"
+        self.current_afm_metrics = metrics
+
+        source_parts = [f"Backend: nanoscope", f"AFM channel: {chosen_name}"]
+        if "zrange" in metrics:
+            source_parts.append(f"z-range: {metrics['zrange']:.6g}")
+        if "rms" in metrics:
+            source_parts.append(f"rms: {metrics['rms']:.6g}")
+        return np.asarray(data), " | ".join(source_parts)
+
+    def _load_bruker_with_pyspm(self, path):
+        bruker = pySPM.Bruker(path)
+        channel_names = self._get_spm_channel_names(path)
+        if not channel_names:
+            try:
+                channel_names = [str(name) for name in bruker.list_channels()]
+                self.spm_channels_by_path[path] = channel_names
+            except Exception:
+                channel_names = []
+
+        chosen_name = self._get_selected_or_default_channel_name(channel_names)
+        if not chosen_name:
+            raise ValueError("No readable image channel was found in this Bruker AFM file.")
+
+        last_error = None
+        image_obj = None
+        for getter_args in [
+            (chosen_name,),
+            tuple(name for name in channel_names if str(name) == chosen_name)[:1],
+            tuple(),
+        ]:
+            try:
+                if len(getter_args) == 0:
+                    continue
+                image_obj = bruker.get_channel(*getter_args)
+                if image_obj is not None:
+                    break
+            except Exception as exc:
+                last_error = exc
+
+        if image_obj is None:
+            raise RuntimeError(f"Failed to read AFM channel '{chosen_name}': {last_error}")
+
+        pixels = getattr(image_obj, "pixels", None)
+        if pixels is None:
+            raise ValueError(f"AFM channel '{chosen_name}' does not contain pixel data.")
+
+        self.current_afm_backend = "pySPM"
+        self.current_afm_metrics = {}
+        source_info = f"Backend: pySPM | AFM channel: {chosen_name}"
+        zscale = getattr(image_obj, "zscale", None)
+        if zscale:
+            source_info += f" | z-scale: {zscale}"
+        return np.asarray(pixels), source_info
+
+    def _to_2d_float(self, arr):
+        arr = np.asarray(arr)
+        if arr.ndim == 2:
+            out = arr.astype(np.float32)
+        elif arr.ndim == 3:
+            if arr.shape[2] in [3, 4]:
+                out = np.mean(arr[..., :3].astype(np.float32), axis=2)
+            else:
+                out = np.mean(arr.astype(np.float32), axis=0)
+        else:
+            raise ValueError(f"Unsupported array shape: {arr.shape}")
+
+        if not np.isfinite(out).all():
+            valid = out[np.isfinite(out)]
+            fill = float(valid.mean()) if valid.size else 0.0
+            out = np.nan_to_num(out, nan=fill, posinf=fill, neginf=fill)
+        return out.astype(np.float32)
+
+    # Processing pipeline
+    def process_all(self):
+        if self.raw_image is None:
+            messagebox.showwarning("Warning", "Load an image first.")
+            return
+        try:
+            self.cropped_image = self.get_cropped_image()
+            self.preprocessed_image = self.apply_preprocessing(self.cropped_image)
+            self.label_image, self.threshold_values = self.compute_threshold_labels(self.preprocessed_image)
+            if self.bp_enable_var.get():
+                p = max(0, int(self.bp_min_region_size_var.get()))
+                self.label_image = self.replace_small_regions_with_neighbors(self.label_image, p)
+            self.group_percentages = self.compute_group_percentages(self.label_image)
+            self.update_image_panels()
+            self.update_histograms()
+            groups = int(np.max(self.label_image)) + 1 if self.label_image is not None else 0
+            self.status_var.set(f"Processed successfully | groups={groups} | thresholds={np.round(self.threshold_values, 5).tolist()}")
+        except Exception as e:
+            messagebox.showerror("Process Error", str(e))
+            self.status_var.set("Processing failed")
+
+    def reset_processing(self, keep_image=False):
+        self.cropped_image = None
+        self.preprocessed_image = None
+        self.label_image = None
+        self.threshold_values = []
+        self.group_percentages = []
+        self.last_hist_raw = None
+        self.last_hist_threshold = None
+        self.last_raw_figure = None
+        self.last_threshold_figure = None
+
+        if not keep_image:
+            self.raw_image = None
+            self.filepath = None
+            self.current_source_info = None
+            self.current_afm_backend = None
+            self.current_afm_metrics = {}
+            self.raw_shape_var.set("Raw Shape: N/A")
+
+        self.clear_canvas("raw")
+        self.clear_canvas("threshold")
+        self.clear_canvas("raw_hist")
+        self.clear_canvas("threshold_hist")
+        self.status_var.set("Ready")
+
+    def clear_canvas(self, which):
+        mapping = {
+            "raw": "raw_canvas",
+            "threshold": "threshold_canvas",
+            "raw_hist": "raw_hist_canvas",
+            "threshold_hist": "threshold_hist_canvas",
+        }
+        attr = mapping[which]
+        obj = getattr(self, attr)
+        if obj is not None:
+            obj.get_tk_widget().destroy()
+            setattr(self, attr, None)
+
+    def get_cropped_image(self):
+        img = self.raw_image
+        if img is None:
+            return None
+        if not self.crop_enable_var.get():
+            return img.copy()
+        h, w = img.shape
+        x = max(0, int(self.crop_x_var.get()))
+        y = max(0, int(self.crop_y_var.get()))
+        cw = max(1, int(self.crop_w_var.get()))
+        ch = max(1, int(self.crop_h_var.get()))
+        x = min(x, max(0, w - 1))
+        y = min(y, max(0, h - 1))
+        x2 = min(w, x + cw)
+        y2 = min(h, y + ch)
+        if x >= x2 or y >= y2:
+            raise ValueError("Invalid crop range")
+        return img[y:y2, x:x2].copy()
+
+    def apply_preprocessing(self, image):
+        out = image.astype(np.float32).copy()
+        raw_order = self.pp_order_var.get().strip()
+        order = [x.strip().lower() for x in raw_order.split('>')] if raw_order else ["median", "gaussian", "tv", "wavelet"]
+        aliases = {
+            "median": "median",
+            "gaussian": "gaussian",
+            "total variation": "tv",
+            "tv": "tv",
+            "wavelet": "wavelet",
+            "wavelet denoising": "wavelet",
+        }
+        for name in order:
+            method = aliases.get(name.lower())
+            if method == "median" and self.pp_median_var.get():
+                ksize = max(1, int(self.pp_median_size_var.get()))
+                if ksize % 2 == 0:
+                    ksize += 1
+                out = ndi.median_filter(out, size=ksize)
+            elif method == "gaussian" and self.pp_gaussian_var.get():
+                sigma = max(0.0, float(self.pp_gaussian_sigma_var.get()))
+                out = gaussian(out, sigma=sigma, preserve_range=self.pp_gaussian_preserve_range_var.get()).astype(np.float32)
+            elif method == "tv" and self.pp_tv_var.get():
+                weight = max(1e-8, float(self.pp_tv_weight_var.get()))
+                eps = max(1e-12, float(self.pp_tv_eps_var.get()))
+                n_iter = max(1, int(self.pp_tv_max_num_iter_var.get()))
+                out = denoise_tv_chambolle(out, weight=weight, eps=eps, max_num_iter=n_iter).astype(np.float32)
+            elif method == "wavelet" and self.pp_wavelet_var.get():
+                sigma = max(0.0, float(self.pp_wavelet_sigma_var.get()))
+                wavelet_name = self.pp_wavelet_wavelet_var.get().strip() or "db2"
+                mode_name = self.pp_wavelet_mode_var.get().strip() or "soft"
+                out = denoise_wavelet(out, sigma=sigma, wavelet=wavelet_name, mode=mode_name, rescale_sigma=self.pp_wavelet_rescale_sigma_var.get(), channel_axis=None).astype(np.float32)
+        return out
+
+    def _parse_manual_thresholds(self):
+        text = self.manual_thresholds_var.get().strip()
+        if not text:
+            return []
+        parts = [p.strip() for p in text.replace(';', ',').split(',') if p.strip()]
+        return sorted(float(p) for p in parts)
+
+    def suggest_thresholds(self):
+        if self.raw_image is None:
+            messagebox.showinfo("Info", "Load an image first.")
+            return
+        try:
+            img = self.get_cropped_image()
+            img = self.apply_preprocessing(img)
+            thr = self.compute_auto_threshold_values(img)
+            self.manual_thresholds_var.set(", ".join(f"{x:.6g}" for x in thr))
+            self.status_var.set("Suggested thresholds updated in manual input field")
+        except Exception as e:
+            messagebox.showerror("Suggestion Error", str(e))
+
+    def compute_auto_threshold_values(self, image):
+        data = image.astype(np.float32)
+        flat = data.reshape(-1, 1)
+        count = max(1, int(self.threshold_count_var.get()))
+        groups = count + 1
+        method = self.threshold_method_var.get().strip().lower()
+
+        if method == "otsu":
+            return [float(threshold_otsu(data))]
+        if method == "multi-otsu":
+            return [float(x) for x in threshold_multiotsu(data, classes=groups)]
+        if method == "k-means":
+            km = KMeans(n_clusters=groups, random_state=int(self.kmeans_random_state_var.get()), n_init=max(1, int(self.kmeans_n_init_var.get())))
+            km.fit(flat)
+            centers = np.sort(km.cluster_centers_.flatten())
+            return self._centers_to_thresholds(centers)
+        if method == "gmm":
+            gm = GaussianMixture(n_components=groups, covariance_type=self.gmm_covariance_type_var.get(), random_state=int(self.gmm_random_state_var.get()))
+            gm.fit(flat)
+            means = np.sort(gm.means_.flatten())
+            return self._centers_to_thresholds(means)
+        if method == "equal interval":
+            p_low = float(self.equal_interval_percentile_low_var.get())
+            p_high = float(self.equal_interval_percentile_high_var.get())
+            if p_high <= p_low:
+                raise ValueError("Equal Interval: High percentile must be greater than low percentile.")
+            low = float(np.percentile(data, p_low))
+            high = float(np.percentile(data, p_high))
+            return [float(x) for x in np.linspace(low, high, groups + 1)[1:-1]]
+        raise ValueError(f"Unknown threshold method: {self.threshold_method_var.get()}")
+
+    def compute_threshold_labels(self, image):
+        data = image.astype(np.float32)
+        count = max(1, int(self.threshold_count_var.get()))
+        if self.use_manual_thresholds_var.get():
+            thr = self._parse_manual_thresholds()
+            if not thr:
+                raise ValueError("Manual thresholds are enabled, but no values were entered.")
+            labels = np.digitize(data, bins=thr).astype(np.int32)
+            return labels, thr
+
+        thr = self.compute_auto_threshold_values(data)
+        if self.threshold_method_var.get().strip().lower() == "otsu":
+            labels = np.digitize(data, bins=thr).astype(np.int32)
+            return labels, thr
+
+        if len(thr) != count:
+            raise ValueError(f"Threshold count mismatch: expected {count}, got {len(thr)}")
+        labels = np.digitize(data, bins=thr).astype(np.int32)
+        if self.threshold_method_var.get().strip().lower() == "equal interval":
+            groups = len(thr) + 1
+            p_low = float(self.equal_interval_percentile_low_var.get())
+            p_high = float(self.equal_interval_percentile_high_var.get())
+            low = float(np.percentile(data, p_low))
+            high = float(np.percentile(data, p_high))
+            labels[data < low] = 0
+            labels[data >= high] = groups - 1
+        return labels, thr
+
+    def _centers_to_thresholds(self, centers_sorted):
+        centers_sorted = np.asarray(centers_sorted, dtype=np.float32)
+        if centers_sorted.size <= 1:
+            return []
+        mids = 0.5 * (centers_sorted[:-1] + centers_sorted[1:])
+        return [float(x) for x in mids]
+
+    def replace_small_regions_with_neighbors(self, label_img, max_region_size):
+        out = label_img.copy()
+        structure = np.ones((3, 3), dtype=np.uint8)
+        unique_vals = np.unique(out)
+        for val in unique_vals:
+            mask = out == val
+            cc, n_cc = ndi.label(mask, structure=structure)
+            for idx in range(1, n_cc + 1):
+                region_mask = cc == idx
+                area = int(region_mask.sum())
+                if area <= max_region_size:
+                    dilated = ndi.binary_dilation(region_mask, structure=structure)
+                    border = dilated & (~region_mask)
+                    neighbor_vals = out[border]
+                    neighbor_vals = neighbor_vals[neighbor_vals != val]
+                    if neighbor_vals.size == 0:
+                        continue
+                    replacement = mode(neighbor_vals, keepdims=False).mode
+                    out[region_mask] = int(replacement)
+        return out.astype(np.int32)
+
+    def compute_group_percentages(self, label_img):
+        if label_img is None:
+            return []
+        labels = label_img.ravel().astype(np.int32)
+        groups = int(labels.max()) + 1 if labels.size else 0
+        counts = np.array([(labels == i).sum() for i in range(groups)], dtype=np.int64)
+        total = max(1, int(counts.sum()))
+        return [100.0 * c / total for c in counts]
+
+    # Rendering
+    def update_image_panels(self):
+        self.draw_raw_image_panel()
+        self.draw_threshold_image_panel()
+
+    def _get_raw_vmin_vmax(self, image):
+        vmin = float(np.min(image))
+        vmax = float(np.max(image))
+        if self.raw_min_enable_var.get():
+            vmin = float(self.raw_vmin_var.get())
+        if self.raw_max_enable_var.get():
+            vmax = float(self.raw_vmax_var.get())
+        if vmax <= vmin:
+            raise ValueError("Raw display max must be greater than min.")
+        return vmin, vmax
+
+    def draw_raw_image_panel(self):
+        self.clear_canvas("raw")
+        if self.preprocessed_image is None:
+            return
+        size = max(200, int(self.display_size_var.get()))
+        fig = Figure(figsize=(size / 100.0, size / 100.0), dpi=100)
+        ax = fig.add_subplot(111)
+        vmin, vmax = self._get_raw_vmin_vmax(self.preprocessed_image)
+        im = ax.imshow(self.preprocessed_image, cmap=self.raw_colormap_var.get(), vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title("Raw / Preprocessed")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        self.last_raw_figure = fig
+        canvas = FigureCanvasTkAgg(fig, master=self.raw_canvas_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.raw_canvas = canvas
+
+    def draw_threshold_image_panel(self):
+        self.clear_canvas("threshold")
+        if self.label_image is None:
+            return
+        size = max(200, int(self.display_size_var.get()))
+        fig = Figure(figsize=(size / 100.0, size / 100.0), dpi=100)
+        ax = fig.add_subplot(111)
+        groups = int(np.max(self.label_image)) + 1
+        vmax = max(1, groups - 1)
+        cmap_name = self.threshold_colormap_var.get()
+        im = ax.imshow(self.label_image, cmap=cmap_name, vmin=0, vmax=vmax, interpolation="nearest")
+
+        if self.show_boundaries_var.get() and groups > 1:
+            linewidth = max(0.1, float(self.boundary_thickness_var.get()))
+            levels = np.arange(0.5, groups - 0.5 + 1e-9, 1.0)
+            ax.contour(self.label_image, levels=levels, colors=self.boundary_color_var.get(), linewidths=linewidth)
+
+        ax.set_title("Threshold Result")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_ticks(np.arange(groups))
+        fig.tight_layout()
+        self.last_threshold_figure = fig
+        canvas = FigureCanvasTkAgg(fig, master=self.threshold_canvas_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.threshold_canvas = canvas
+
+    # Histograms
+    def update_histograms(self):
+        self.draw_raw_histogram()
+        self.draw_threshold_histogram()
+
+    def draw_raw_histogram(self):
+        self.clear_canvas("raw_hist")
+        if self.preprocessed_image is None:
+            return
+        fig = Figure(figsize=(5.8, 2.9), dpi=100)
+        ax = fig.add_subplot(111)
+        values = self.preprocessed_image.ravel().astype(np.float32)
+        ax.hist(values, bins=256)
+        for i, t in enumerate(self.threshold_values):
+            ax.axvline(t, linestyle='--', linewidth=1.2, label=f'T{i + 1}')
+        ax.set_title("Raw / Preprocessed Histogram")
+        ax.set_xlabel("Intensity")
+        ax.set_ylabel("Count")
+        if len(self.threshold_values) > 0:
+            ax.legend(loc='upper right', fontsize=8)
+        fig.tight_layout()
+        self.last_hist_raw = fig
+        canvas = FigureCanvasTkAgg(fig, master=self.raw_hist_canvas_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.raw_hist_canvas = canvas
+
+    def _get_threshold_hist_colors(self, groups):
+        cmap = colormaps[self.threshold_colormap_var.get()]
+        if groups <= 1:
+            return [cmap(0.5)]
+        norm = mcolors.Normalize(vmin=0, vmax=max(1, groups - 1))
+        return [cmap(norm(i)) for i in range(groups)]
+
+    def draw_threshold_histogram(self):
+        self.clear_canvas("threshold_hist")
+        if self.label_image is None:
+            return
+        fig = Figure(figsize=(5.8, 2.9), dpi=100)
+        ax = fig.add_subplot(111)
+        labels = self.label_image.ravel().astype(np.int32)
+        groups = int(labels.max()) + 1 if labels.size else 0
+        counts = np.array([(labels == i).sum() for i in range(groups)], dtype=np.int64)
+        xs = np.arange(groups)
+        colors = self._get_threshold_hist_colors(groups)
+        bars = ax.bar(xs, counts, width=0.85, color=colors)
+        total = max(1, int(counts.sum()))
+        ymax = counts.max() if counts.size else 1
+        ax.set_ylim(0, ymax * 1.18 + 1)
+        ax.set_xticks(xs)
+        ax.set_title("Threshold Histogram")
+        ax.set_xlabel("Threshold Group Label")
+        ax.set_ylabel("Count")
+
+        self.group_percentages = [100.0 * c / total for c in counts]
+        for bar, pct, c in zip(bars, self.group_percentages, counts):
+            ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height() + max(1, ymax * 0.02), f"{pct:.1f}%", ha='center', va='bottom', fontsize=9)
+        fig.tight_layout()
+        self.last_hist_threshold = fig
+        canvas = FigureCanvasTkAgg(fig, master=self.threshold_hist_canvas_container)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.threshold_hist_canvas = canvas
+
+    def _parameter_specs(self):
+        return [
+            ("crop_enable", self.crop_enable_var),
+            ("crop_x", self.crop_x_var),
+            ("crop_y", self.crop_y_var),
+            ("crop_w", self.crop_w_var),
+            ("crop_h", self.crop_h_var),
+            ("pp_order", self.pp_order_var),
+            ("pp_median_enable", self.pp_median_var),
+            ("pp_median_size", self.pp_median_size_var),
+            ("pp_gaussian_enable", self.pp_gaussian_var),
+            ("pp_gaussian_sigma", self.pp_gaussian_sigma_var),
+            ("pp_gaussian_preserve_range", self.pp_gaussian_preserve_range_var),
+            ("pp_tv_enable", self.pp_tv_var),
+            ("pp_tv_weight", self.pp_tv_weight_var),
+            ("pp_tv_eps", self.pp_tv_eps_var),
+            ("pp_tv_max_num_iter", self.pp_tv_max_num_iter_var),
+            ("pp_wavelet_enable", self.pp_wavelet_var),
+            ("pp_wavelet_sigma", self.pp_wavelet_sigma_var),
+            ("pp_wavelet_wavelet", self.pp_wavelet_wavelet_var),
+            ("pp_wavelet_mode", self.pp_wavelet_mode_var),
+            ("pp_wavelet_rescale_sigma", self.pp_wavelet_rescale_sigma_var),
+            ("threshold_method", self.threshold_method_var),
+            ("threshold_count", self.threshold_count_var),
+            ("kmeans_random_state", self.kmeans_random_state_var),
+            ("kmeans_n_init", self.kmeans_n_init_var),
+            ("gmm_random_state", self.gmm_random_state_var),
+            ("gmm_covariance_type", self.gmm_covariance_type_var),
+            ("equal_interval_percentile_low", self.equal_interval_percentile_low_var),
+            ("equal_interval_percentile_high", self.equal_interval_percentile_high_var),
+            ("use_manual_thresholds", self.use_manual_thresholds_var),
+            ("manual_thresholds", self.manual_thresholds_var),
+            ("bp_enable", self.bp_enable_var),
+            ("bp_min_region_size", self.bp_min_region_size_var),
+            ("display_size", self.display_size_var),
+            ("raw_colormap", self.raw_colormap_var),
+            ("threshold_colormap", self.threshold_colormap_var),
+            ("raw_min_enable", self.raw_min_enable_var),
+            ("raw_max_enable", self.raw_max_enable_var),
+            ("raw_vmin", self.raw_vmin_var),
+            ("raw_vmax", self.raw_vmax_var),
+            ("show_boundaries", self.show_boundaries_var),
+            ("boundary_color", self.boundary_color_var),
+            ("boundary_thickness", self.boundary_thickness_var),
+            ("selected_spm_channel", self.selected_spm_channel_var),
+        ]
+
+    def get_parameter_state(self):
+        return {name: var.get() for name, var in self._parameter_specs()}
+
+    def apply_parameter_state(self, state):
+        applied = 0
+        for name, var in self._parameter_specs():
+            if name in state:
+                try:
+                    var.set(state[name])
+                    applied += 1
+                except Exception:
+                    pass
+        return applied
+
+    def save_parameters_to_file(self):
+        state = self.get_parameter_state()
+        default_name = "nanoscope_threshold_params.json"
+        if self.filepath:
+            stem = os.path.splitext(os.path.basename(self.filepath))[0]
+            default_name = f"{stem}_params.json"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        payload = {
+            "app": "NanoScope Threshold App",
+            "version": 2,
+            "parameters": state,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        self.status_var.set(f"Saved parameter file: {os.path.basename(path)}")
+
+    def load_parameters_from_file(self):
+        path = filedialog.askopenfilename(
+            title="Load parameter file",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            state = payload.get("parameters", payload)
+            applied = self.apply_parameter_state(state)
+            self._refresh_spm_channel_ui_for_current_file()
+            self.status_var.set(f"Loaded parameter file: {os.path.basename(path)} | applied={applied}")
+            if self.raw_image is not None:
+                self.process_all()
+        except Exception as e:
+            messagebox.showerror("Load Params Error", str(e))
+
+    # Export / Save
+    def export_processing_summary(self):
+        if self.preprocessed_image is None or self.label_image is None:
+            messagebox.showinfo("Info", "No processed result to export.")
+            return
+        default_name = "processing_summary.txt"
+        if self.filepath:
+            stem = os.path.splitext(os.path.basename(self.filepath))[0]
+            default_name = f"{stem}_processing_summary.txt"
+        path = filedialog.asksaveasfilename(defaultextension=".txt", initialfile=default_name, filetypes=[("Text", "*.txt")])
+        if not path:
+            return
+
+        lines = []
+        lines.append("NanoScope Threshold App - Processing Summary")
+        lines.append("=" * 48)
+        lines.append(f"File: {self.filepath if self.filepath else 'N/A'}")
+        lines.append(f"Source info: {self.current_source_info if self.current_source_info else 'N/A'}")
+        lines.append(f"AFM backend: {self.current_afm_backend if self.current_afm_backend else 'N/A'}")
+        lines.append(f"Selected AFM channel: {self.selected_spm_channel_var.get() if self.selected_spm_channel_var.get() else 'N/A'}")
+        lines.append(f"Raw image shape: {None if self.raw_image is None else self.raw_image.shape}")
+        lines.append(f"Crop enabled: {self.crop_enable_var.get()}")
+        lines.append(f"Crop x, y, w, h: {self.crop_x_var.get()}, {self.crop_y_var.get()}, {self.crop_w_var.get()}, {self.crop_h_var.get()}")
+        if self.current_afm_metrics:
+            lines.append("AFM metrics:")
+            for key, value in self.current_afm_metrics.items():
+                lines.append(f"  {key}: {value}")
+        lines.append("")
+
+        lines.append("[Pre-Processing]")
+        lines.append(f"Order: {self.pp_order_var.get()}")
+        lines.append(f"Median enabled: {self.pp_median_var.get()} | kernel={self.pp_median_size_var.get()}")
+        lines.append(f"Gaussian enabled: {self.pp_gaussian_var.get()} | sigma={self.pp_gaussian_sigma_var.get()} | preserve_range={self.pp_gaussian_preserve_range_var.get()}")
+        lines.append(f"TV enabled: {self.pp_tv_var.get()} | weight={self.pp_tv_weight_var.get()} | eps={self.pp_tv_eps_var.get()} | iter={self.pp_tv_max_num_iter_var.get()}")
+        lines.append(f"Wavelet enabled: {self.pp_wavelet_var.get()} | sigma={self.pp_wavelet_sigma_var.get()} | wavelet={self.pp_wavelet_wavelet_var.get()} | mode={self.pp_wavelet_mode_var.get()} | rescale_sigma={self.pp_wavelet_rescale_sigma_var.get()}")
+        lines.append("")
+
+        lines.append("[Threshold]")
+        lines.append(f"Method: {self.threshold_method_var.get()}")
+        lines.append(f"Threshold Count: {self.threshold_count_var.get()}")
+        lines.append(f"Use Manual Thresholds: {self.use_manual_thresholds_var.get()}")
+        lines.append(f"Manual Values: {self.manual_thresholds_var.get()}")
+        lines.append(f"Resolved Threshold Values: {', '.join(f'{x:.8g}' for x in self.threshold_values)}")
+        lines.append(f"K-means random_state={self.kmeans_random_state_var.get()}, n_init={self.kmeans_n_init_var.get()}")
+        lines.append(f"GMM random_state={self.gmm_random_state_var.get()}, covariance_type={self.gmm_covariance_type_var.get()}")
+        lines.append(f"Equal interval low%={self.equal_interval_percentile_low_var.get()}, high%={self.equal_interval_percentile_high_var.get()}")
+        lines.append("")
+
+        lines.append("[Binary Processing]")
+        lines.append(f"Enabled: {self.bp_enable_var.get()}")
+        lines.append(f"P: {self.bp_min_region_size_var.get()}")
+        lines.append("")
+
+        lines.append("[Display]")
+        lines.append(f"Raw colormap: {self.raw_colormap_var.get()}")
+        lines.append(f"Threshold colormap: {self.threshold_colormap_var.get()}")
+        lines.append(f"Raw min enabled: {self.raw_min_enable_var.get()} | value={self.raw_vmin_var.get()}")
+        lines.append(f"Raw max enabled: {self.raw_max_enable_var.get()} | value={self.raw_vmax_var.get()}")
+        lines.append(f"Show boundaries: {self.show_boundaries_var.get()} | color={self.boundary_color_var.get()} | contour thickness={self.boundary_thickness_var.get()}")
+        lines.append("")
+
+        lines.append("[Threshold Group Percentages]")
+        for i, pct in enumerate(self.group_percentages):
+            lines.append(f"Group {i}: {pct:.4f}%")
+
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+        self.status_var.set(f"Exported summary: {os.path.basename(path)}")
+
+    def save_raw_image(self):
+        if self.last_raw_figure is None:
+            messagebox.showinfo("Info", "No processed image to save.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png"), ("PDF", "*.pdf")])
+        if not path:
+            return
+        self.last_raw_figure.savefig(path, bbox_inches='tight')
+        self.status_var.set(f"Saved raw image: {os.path.basename(path)}")
+
+    def save_threshold_image(self):
+        if self.last_threshold_figure is None:
+            messagebox.showinfo("Info", "No threshold image to save.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png"), ("PDF", "*.pdf")])
+        if not path:
+            return
+        self.last_threshold_figure.savefig(path, bbox_inches='tight')
+        self.status_var.set(f"Saved threshold image: {os.path.basename(path)}")
+
+    def save_raw_histogram(self):
+        if self.last_hist_raw is None:
+            messagebox.showinfo("Info", "No raw histogram to save.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png"), ("PDF", "*.pdf")])
+        if not path:
+            return
+        self.last_hist_raw.savefig(path, bbox_inches='tight')
+        self.status_var.set(f"Saved raw histogram: {os.path.basename(path)}")
+
+    def save_threshold_histogram(self):
+        if self.last_hist_threshold is None:
+            messagebox.showinfo("Info", "No threshold histogram to save.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png"), ("PDF", "*.pdf")])
+        if not path:
+            return
+        self.last_hist_threshold.savefig(path, bbox_inches='tight')
+        self.status_var.set(f"Saved threshold histogram: {os.path.basename(path)}")
+
+
+def main():
+    root = tk.Tk()
+    try:
+        style = ttk.Style()
+        if 'clam' in style.theme_names():
+            style.theme_use('clam')
+    except Exception:
+        pass
+    app = NanoScopeThresholdApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
 
 --------------------------------------------------------------------------------------------------------
 - SPM Read and Channel Selection Version
