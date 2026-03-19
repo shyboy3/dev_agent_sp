@@ -1,3 +1,66 @@
+# build_v11_nanoscope.spec
+from PyInstaller.utils.hooks import collect_all
+
+nanoscope_datas, nanoscope_binaries, nanoscope_hiddenimports = collect_all("nanoscope")
+pyspm_datas, pyspm_binaries, pyspm_hiddenimports = collect_all("pySPM")
+
+datas = []
+datas += nanoscope_datas
+datas += pyspm_datas
+
+binaries = []
+binaries += nanoscope_binaries
+binaries += pyspm_binaries
+
+hiddenimports = []
+hiddenimports += nanoscope_hiddenimports
+hiddenimports += pyspm_hiddenimports
+
+a = Analysis(
+    ["nanoscope_threshold_app_full_v11_hist_unit.py"],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "PyQt5", "PyQt6", "PySide2", "PySide6", "PyQtWebEngine"
+    ],
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="nanoscope_threshold_app_full_v11_hist_unit",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="nanoscope_threshold_app_full_v11_hist_unit",
+)
+
+
+
+---------------------------------------------------------------------------------
+- 히스토그램 통계값과 유닛 반영
+---------------------------------------------------------------------------------
 import os
 import json
 import tkinter as tk
