@@ -1,3 +1,18 @@
+from nanoscope.files import ImageFile
+
+with ImageFile(r"./file.000") as f:
+    ch = f[0]
+
+    for name in ["data", "image", "pixels", "map", "values", "raw", "processed", "trace"]:
+        if hasattr(ch, name):
+            try:
+                obj = getattr(ch, name)
+                print(name, type(obj))
+                if hasattr(obj, "shape"):
+                    print("   shape =", obj.shape)
+            except Exception as e:
+                print(name, "ERR", e)
+
 ---------------------------------------------------------------------------------------------
 -   nanoscope 패키지로 spm, .000 파일 로딩, 실패하면 pySPM 시도
 ---------------------------------------------------------------------------------------------
