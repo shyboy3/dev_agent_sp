@@ -1,6 +1,8 @@
+#V17.1
 import os
 import json
 import re
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -882,7 +884,7 @@ class NanoScopeThresholdApp:
         def norm_unit(u):
             if u is None:
                 return None
-            s = str(u).strip().lower().replace("μ", "µ").replace(" ", "")
+            s = str(u).strip().lower().replace("μ", "µ").replace("\x00", "")
             aliases = {
                 "micron": "um", "microns": "um", "micrometer": "um", "micrometers": "um",
                 "micrometre": "um", "micrometres": "um", "µm": "um", "u m": "um", "um": "um",
@@ -906,32 +908,34 @@ class NanoScopeThresholdApp:
 
         try:
             raw = Path(filepath).read_bytes()
-        except Exception:
-            return None, None, None, None
+        except Exception as e:
+            return None, None, None, f"Header read failed: {e}"
 
-        text = raw.decode("latin1", errors="ignore").replace(" ", "")
+        text = raw.decode("latin1", errors="ignore").replace("\x00", "")
+
         candidates = []
-        # line-oriented pass first
-        for raw_line in re.split(r"[
-]+", text):
+        debug_hits = []
+        for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line or "scan size" not in line.lower():
                 continue
-            tail = line
+            debug_hits.append(line)
             if ":" in line:
                 tail = line.split(":", 1)[1].strip()
             else:
                 m = re.search(r"scan\s*size\s*(.*)$", line, flags=re.IGNORECASE)
-                if m:
-                    tail = m.group(1).strip()
+                tail = m.group(1).strip() if m else ""
             if tail:
                 candidates.append(tail)
-        # whole-text fallback in case the header is packed oddly
+
         if not candidates:
-            for m in re.finditer(r"scan\s*size\s*:?\s*([-+0-9.eE]+(?:\s+[-+0-9.eE]+)?\s*[A-Za-z~µμ]+)", text, flags=re.IGNORECASE):
-                candidates.append(m.group(1).strip())
+            for m in re.finditer(r"scan\s*size\s*:?[ \t]*([-+0-9.eE]+(?:[ \t]+[-+0-9.eE]+)?[ \t]*[A-Za-z~µμ]+)", text, flags=re.IGNORECASE):
+                val = m.group(1).strip()
+                candidates.append(val)
+                debug_hits.append(f"whole-text:{val}")
+
         if not candidates:
-            return None, None, None, None
+            return None, None, None, "No validated Scan Size found in header"
 
         single_pat = re.compile(r"^\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z~µμ]+)\s*$")
         pair_pat = re.compile(r"^\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z~µμ]+)\s*$")
@@ -957,7 +961,7 @@ class NanoScopeThresholdApp:
                         trusted_other.append((x * unit_dict[unit_norm], y * unit_dict[unit_norm], "nm", f"Bruker header Scan Size: {clean}"))
                         continue
                     if unit_clean == "~m":
-                        tilde_um_candidates.append((x * 1e3, y * 1e3, "nm", f"Bruker header Scan Size (~m validated): {clean}"))
+                        tilde_um_candidates.append((x * 1e3, y * 1e3, "nm", f"Bruker header Scan Size (~m candidate): {clean}"))
                         continue
 
             m1 = single_pat.match(clean)
@@ -967,106 +971,35 @@ class NanoScopeThresholdApp:
                 unit_norm = norm_unit(unit_raw)
                 unit_clean = str(unit_raw).strip().lower().replace("μ", "µ")
                 if val > 0:
-                    x_total_nm, y_total_nm = make_xy_from_x_total(val if unit_norm == "nm" else val * unit_dict.get(unit_norm, 1.0))
+                    x_total_nm, y_total_nm = make_xy_from_x_total(val)
                     if unit_norm == "nm":
                         trusted_nm.append((x_total_nm, y_total_nm, "nm", f"Bruker header Scan Size: {clean}"))
                         continue
                     if unit_norm in unit_dict:
-                        trusted_other.append((x_total_nm, y_total_nm, "nm", f"Bruker header Scan Size: {clean}"))
+                        trusted_other.append((x_total_nm * unit_dict[unit_norm], y_total_nm * unit_dict[unit_norm], "nm", f"Bruker header Scan Size: {clean}"))
                         continue
                     if unit_clean == "~m":
-                        x_total_nm, y_total_nm = make_xy_from_x_total(val * 1e3)
-                        tilde_um_candidates.append((x_total_nm, y_total_nm, "nm", f"Bruker header Scan Size (~m validated): {clean}"))
+                        tilde_um_candidates.append((x_total_nm * 1e3, y_total_nm * 1e3, "nm", f"Bruker header Scan Size (~m candidate): {clean}"))
                         continue
 
         if trusted_nm:
-            xnm, ynm, unit, src = trusted_nm[0]
-            for cand in tilde_um_candidates + trusted_other:
-                if compatible_nm(cand[0], xnm) and compatible_nm(cand[1], ynm):
-                    src = cand[3]
-                    break
-            return xnm, ynm, unit, src
+            x, y, unit, source = trusted_nm[0]
+            return x, y, unit, source
 
         if trusted_other:
-            return trusted_other[0]
+            x, y, unit, source = trusted_other[0]
+            return x, y, unit, source
+
         if tilde_um_candidates:
-            return tilde_um_candidates[0]
-        return None, None, None, None
+            for cand in tilde_um_candidates:
+                cand_x, cand_y, unit, source = cand
+                for nm_x, nm_y, _u, _src in trusted_nm:
+                    if compatible_nm(cand_x, nm_x) and compatible_nm(cand_y, nm_y):
+                        return cand_x, cand_y, unit, source.replace("(~m candidate)", "(~m validated)")
+            # do not trust ~m by itself
+            return None, None, None, "Only ~m Scan Size candidate found; ignored without nm cross-check"
 
-def _infer_xy_calibration_from_pyspm(self, image_obj, image_shape=None):
-        if image_obj is None:
-            return None, None, None, None
-
-        unit_dict = {
-            "pm": 1e-3,
-            "nm": 1.0,
-            "um": 1e3,
-            "µm": 1e3,
-            "μm": 1e3,
-            "mm": 1e6,
-            "a": 1e-1,
-            "å": 1e-1,
-            "ang": 1e-1,
-            "angstrom": 1e-1,
-        }
-
-        def norm_unit(u):
-            if u is None:
-                return None
-            s = str(u).strip().lower()
-            if s in unit_dict:
-                return s
-            # normalize micro symbols and plurals/spacing
-            s = s.replace("μ", "µ")
-            aliases = {
-                "micron": "um", "microns": "um", "micrometer": "um", "micrometers": "um",
-                "micrometre": "um", "micrometres": "um", "µm": "um",
-                "nanometer": "nm", "nanometers": "nm", "nanometre": "nm", "nanometres": "nm",
-                "picometer": "pm", "picometers": "pm", "millimeter": "mm", "millimeters": "mm",
-                "angstroms": "angstrom",
-            }
-            return aliases.get(s, s)
-
-        # 1) Preferred: pxs() metadata if available and non-zero
-        try:
-            if hasattr(image_obj, 'pxs') and callable(image_obj.pxs):
-                px_to_real = image_obj.pxs()
-                if isinstance(px_to_real, (list, tuple)) and len(px_to_real) >= 2:
-                    xpair, ypair = px_to_real[0], px_to_real[1]
-                    if isinstance(xpair, (list, tuple)) and len(xpair) >= 2 and isinstance(ypair, (list, tuple)) and len(ypair) >= 2:
-                        xval, xunit = xpair[0], norm_unit(xpair[1])
-                        yval, yunit = ypair[0], norm_unit(ypair[1])
-                        if xunit in unit_dict and yunit in unit_dict:
-                            xnm = float(xval) * unit_dict[xunit]
-                            ynm = float(yval) * unit_dict[yunit]
-                            if xnm > 0 and ynm > 0:
-                                return xnm, ynm, 'nm', 'pySPM.pxs()'
-        except Exception:
-            pass
-
-        # 2) Fallback: size['real'] / size['pixels'] pattern seen in pySPM SPM_image
-        try:
-            size = getattr(image_obj, 'size', None)
-            if isinstance(size, dict):
-                real = size.get('real', {})
-                pixels = size.get('pixels', {})
-                if isinstance(real, dict) and isinstance(pixels, dict):
-                    runit = norm_unit(real.get('unit'))
-                    if runit in unit_dict:
-                        rx = real.get('x')
-                        ry = real.get('y')
-                        px = pixels.get('x')
-                        py = pixels.get('y')
-                        if rx is not None and ry is not None and px and py:
-                            # convert total real scan size to nm
-                            x_total_nm = float(rx) * unit_dict[runit]
-                            y_total_nm = float(ry) * unit_dict[runit]
-                            if x_total_nm > 0 and y_total_nm > 0:
-                                return x_total_nm, y_total_nm, 'nm', "pySPM.size['real']"
-        except Exception:
-            pass
-
-        return None, None, None, None
+        return None, None, None, f"Unparsed Scan Size lines: {debug_hits[:4]}"
 
     def _set_xy_calibration(self, x_length, y_length, unit, source, image_shape=None):
         self.current_xy_unit = unit
@@ -2042,6 +1975,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
