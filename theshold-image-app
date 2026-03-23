@@ -1,50 +1,64 @@
 def export_histogram_csv(self):
-    import csv
-    import os
-    from tkinter import filedialog, messagebox
-
-    if self.raw_data is None:
-        messagebox.showwarning("No Data", "No data to export.")
+    if self.preprocessed_image is None:
+        messagebox.showinfo("Info", "No processed histogram data to export.")
         return
+
+    default_name = "histograms.csv"
+    if self.filepath:
+        stem = os.path.splitext(os.path.basename(self.filepath))[0]
+        default_name = f"{stem}_histograms.csv"
 
     path = filedialog.asksaveasfilename(
         defaultextension=".csv",
-        filetypes=[("CSV file", "*.csv")]
+        initialfile=default_name,
+        filetypes=[("CSV", "*.csv")]
     )
     if not path:
         return
 
+    values = self.preprocessed_image.ravel().astype(np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        messagebox.showinfo("Info", "No finite processed values available.")
+        return
+
+    counts, edges = np.histogram(values, bins=256)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    mean_val = float(np.mean(values))
+    std_val = float(np.std(values))
+
     try:
-        with open(path, 'w', newline='', encoding='utf-8') as f:
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
 
-            # ===== RAW HISTOGRAM =====
-            writer.writerow(["[RAW HISTOGRAM]"])
+            writer.writerow(["[RAW_PREPROCESSED_HISTOGRAM]"])
+            writer.writerow(["file", self.filepath if self.filepath else "N/A"])
+            writer.writerow(["data_unit", self.current_data_unit if self.current_data_unit else "N/A"])
+            writer.writerow(["mean", mean_val])
+            writer.writerow(["std", std_val])
+            writer.writerow(["bins", len(centers)])
             writer.writerow(["bin_center", "count"])
 
-            hist, bins = np.histogram(self.raw_data.flatten(), bins=256)
-            centers = (bins[:-1] + bins[1:]) / 2
+            for c, n in zip(centers, counts):
+                writer.writerow([f"{c:.12g}", int(n)])
 
-            for c, h in zip(centers, hist):
-                writer.writerow([c, h])
+            if self.last_hist_threshold_data is not None:
+                writer.writerow([])
+                writer.writerow(["[THRESHOLD_GROUP_HISTOGRAM]"])
+                writer.writerow(["group", "count", "percentage"])
 
-            writer.writerow([])
+                groups = self.last_hist_threshold_data.get('groups', [])
+                tc = self.last_hist_threshold_data.get('counts', [])
+                tp = self.last_hist_threshold_data.get('percentages', [])
 
-            # ===== PREPROCESSED HISTOGRAM =====
-            if self.proc_data is not None:
-                writer.writerow(["[PREPROCESSED HISTOGRAM]"])
-                writer.writerow(["bin_center", "count"])
-
-                hist, bins = np.histogram(self.proc_data.flatten(), bins=256)
-                centers = (bins[:-1] + bins[1:]) / 2
-
-                for c, h in zip(centers, hist):
-                    writer.writerow([c, h])
+                for g, c, p in zip(groups, tc, tp):
+                    writer.writerow([g, int(c), f"{p:.8f}"])
 
         self.status_var.set(f"Exported histogram CSV: {os.path.basename(path)}")
 
     except Exception as e:
-        messagebox.showerror("Export Error", str(e))
+        messagebox.showerror("Export Error", f"Failed to export histogram CSV:\n{e}")
+
 
 
 import os
@@ -22987,38 +23001,4 @@ class ThresholdApp:
         self.top_var = tk.StringVar(value="0")
         self.bottom_var = tk.StringVar(value="0")
         self.left_var = tk.StringVar(value="0")
-        self.right_var = tk.StringVar(value="0")
-
-        for label, var in [
-            ("Top", self.top_var),
-            ("Bottom", self.bottom_var),
-            ("Left", self.left_var),
-            ("Right", self.right_var),
-        ]:
-            row = ttk.Frame(crop_frame)
-            row.pack(fill="x", pady=1)
-            ttk.Label(row, text=label, width=8).pack(side="left")
-            ttk.Entry(row, textvariable=var, width=12).pack(side="left", fill="x", expand=True)
-
-        ttk.Button(crop_frame, text="Apply Crop", command=self.apply_crop).pack(fill="x", pady=3)
-
-        # Display section
-        display_frame = ttk.LabelFrame(left, text="Display", padding=8)
-        display_frame.pack(fill="x", pady=4)
-
-        self.cmap_var = tk.StringVar(value="viridis")
-        self.threshold_cmap_var = tk.StringVar(value="tab20")
-        self.vmin_var = tk.StringVar(value="")
-        self.vmax_var = tk.StringVar(value="")
-
-        row = ttk.Frame(display_frame)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Colormap", width=12).pack(side="left")
-        cmap_box = ttk.Combobox(row, textvariable=self.cmap_var, values=self.cmap_names, state="readonly", width=22)
-        cmap_box.pack(side="left", fill="x", expand=True)
-        cmap_box.bind("<<ComboboxSelected>>", lambda e: self.refresh_display())
-
-        row = ttk.Frame(display_frame)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text="vmin", width=12).pack(side="left")
-        ttk.Entry(
+        self.right_var
