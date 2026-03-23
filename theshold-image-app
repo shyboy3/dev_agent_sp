@@ -910,7 +910,7 @@ class NanoScopeThresholdApp:
             return None, None, None, None
 
         text = raw.decode("latin1", errors="ignore")
-        lines = [m.group(1).strip() for m in re.finditer(r"\Scan Size:\s*([^\r\n]+)", text)]
+        lines = [m.group(1).strip() for m in re.finditer(r"\\Scan Size:\s*([^\r\n]+)", text)]
         if not lines:
             return None, None, None, None
 
@@ -2022,6 +2022,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
