@@ -909,27 +909,28 @@ class NanoScopeThresholdApp:
         except Exception:
             return None, None, None, None
 
-        text = raw.decode("latin1", errors="ignore")
-        # Robustly capture Bruker header lines like:
-        #   \Scan Size: 10000 nm
-        #   \Scan Size : 10 10 ~m
-        # while tolerating spaces and missing leading backslash in decoded text.
-        lines = []
-        for raw_line in text.splitlines():
-            clean_line = raw_line.replace("\x00", "").strip()
-            if not clean_line:
+        text = raw.decode("latin1", errors="ignore").replace(" ", "")
+        candidates = []
+        # line-oriented pass first
+        for raw_line in re.split(r"[
+]+", text):
+            line = raw_line.strip()
+            if not line or "scan size" not in line.lower():
                 continue
-            if "scan size" not in clean_line.lower():
-                continue
-            mline = re.search(r"(?:^|[\\/])\s*Scan Size\s*:\s*(.+)$", clean_line, flags=re.IGNORECASE)
-            if mline:
-                lines.append(mline.group(1).strip())
-                continue
-            # Fallback for decoded headers that lost the leading backslash entirely
-            mline = re.search(r"Scan Size\s*:\s*(.+)$", clean_line, flags=re.IGNORECASE)
-            if mline:
-                lines.append(mline.group(1).strip())
-        if not lines:
+            tail = line
+            if ":" in line:
+                tail = line.split(":", 1)[1].strip()
+            else:
+                m = re.search(r"scan\s*size\s*(.*)$", line, flags=re.IGNORECASE)
+                if m:
+                    tail = m.group(1).strip()
+            if tail:
+                candidates.append(tail)
+        # whole-text fallback in case the header is packed oddly
+        if not candidates:
+            for m in re.finditer(r"scan\s*size\s*:?\s*([-+0-9.eE]+(?:\s+[-+0-9.eE]+)?\s*[A-Za-z~µμ]+)", text, flags=re.IGNORECASE):
+                candidates.append(m.group(1).strip())
+        if not candidates:
             return None, None, None, None
 
         single_pat = re.compile(r"^\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z~µμ]+)\s*$")
@@ -939,8 +940,8 @@ class NanoScopeThresholdApp:
         trusted_other = []
         tilde_um_candidates = []
 
-        for line in lines:
-            clean = line.replace(" ", "").strip()
+        for line in candidates:
+            clean = line.strip()
             m2 = pair_pat.match(clean)
             if m2:
                 x = float(m2.group(1))
@@ -956,43 +957,43 @@ class NanoScopeThresholdApp:
                         trusted_other.append((x * unit_dict[unit_norm], y * unit_dict[unit_norm], "nm", f"Bruker header Scan Size: {clean}"))
                         continue
                     if unit_clean == "~m":
-                        tilde_um_candidates.append((x * 1e3, y * 1e3, "nm", f"Bruker header Scan Size: {clean} [validated ~m→um]", "pair"))
+                        tilde_um_candidates.append((x * 1e3, y * 1e3, "nm", f"Bruker header Scan Size (~m validated): {clean}"))
                         continue
+
             m1 = single_pat.match(clean)
             if m1:
-                x = float(m1.group(1))
+                val = float(m1.group(1))
                 unit_raw = m1.group(2)
                 unit_norm = norm_unit(unit_raw)
                 unit_clean = str(unit_raw).strip().lower().replace("μ", "µ")
-                if x > 0:
+                if val > 0:
+                    x_total_nm, y_total_nm = make_xy_from_x_total(val if unit_norm == "nm" else val * unit_dict.get(unit_norm, 1.0))
                     if unit_norm == "nm":
-                        x_nm, y_nm = make_xy_from_x_total(x)
-                        trusted_nm.append((x_nm, y_nm, "nm", f"Bruker header Scan Size: {clean}"))
+                        trusted_nm.append((x_total_nm, y_total_nm, "nm", f"Bruker header Scan Size: {clean}"))
                         continue
                     if unit_norm in unit_dict:
-                        x_nm, y_nm = make_xy_from_x_total(x * unit_dict[unit_norm])
-                        trusted_other.append((x_nm, y_nm, "nm", f"Bruker header Scan Size: {clean}"))
+                        trusted_other.append((x_total_nm, y_total_nm, "nm", f"Bruker header Scan Size: {clean}"))
                         continue
                     if unit_clean == "~m":
-                        x_nm, y_nm = make_xy_from_x_total(x * 1e3)
-                        tilde_um_candidates.append((x_nm, y_nm, "nm", f"Bruker header Scan Size: {clean} [validated ~m→um]", "single"))
+                        x_total_nm, y_total_nm = make_xy_from_x_total(val * 1e3)
+                        tilde_um_candidates.append((x_total_nm, y_total_nm, "nm", f"Bruker header Scan Size (~m validated): {clean}"))
                         continue
 
         if trusted_nm:
-            nm_choice = trusted_nm[0]
-            for cand in tilde_um_candidates:
-                if compatible_nm(cand[0], nm_choice[0]):
-                    return nm_choice[0], nm_choice[1], nm_choice[2], nm_choice[3] + " | cross-validated with corrupted ~m entry"
-            return nm_choice
+            xnm, ynm, unit, src = trusted_nm[0]
+            for cand in tilde_um_candidates + trusted_other:
+                if compatible_nm(cand[0], xnm) and compatible_nm(cand[1], ynm):
+                    src = cand[3]
+                    break
+            return xnm, ynm, unit, src
 
         if trusted_other:
             return trusted_other[0]
-
         if tilde_um_candidates:
-            return tilde_um_candidates[0][:4]
-
+            return tilde_um_candidates[0]
         return None, None, None, None
-    def _infer_xy_calibration_from_pyspm(self, image_obj, image_shape=None):
+
+def _infer_xy_calibration_from_pyspm(self, image_obj, image_shape=None):
         if image_obj is None:
             return None, None, None, None
 
@@ -1273,12 +1274,13 @@ class NanoScopeThresholdApp:
             raise ValueError(f"AFM channel '{chosen_name}' does not contain pixel data.")
 
         unit, unit_source = self._infer_unit_from_object(image_obj, fallback_channel_name=chosen_name)
+        # For Bruker AFM XY axes, trust validated header scan-size first.
+        # If it cannot be validated, keep pixel axes rather than applying uncertain conversions.
         xlen, ylen, xy_unit, xy_source = self._infer_xy_calibration_from_bruker_header(path, image_shape=np.asarray(pixels).shape)
-        if xlen is None or ylen is None:
-            xlen, ylen, xy_unit, xy_source = self._infer_xy_calibration_from_pyspm(image_obj, image_shape=np.asarray(pixels).shape)
-        if xlen is None or ylen is None:
-            xlen, ylen, xy_unit, xy_source = self._infer_xy_calibration_from_object(image_obj, image_shape=np.asarray(pixels).shape)
-        self._set_xy_calibration(xlen, ylen, xy_unit, xy_source, image_shape=np.asarray(pixels).shape)
+        if xlen is None or ylen is None or not xy_unit:
+            self._set_xy_calibration(None, None, None, None, image_shape=np.asarray(pixels).shape)
+        else:
+            self._set_xy_calibration(xlen, ylen, xy_unit, xy_source, image_shape=np.asarray(pixels).shape)
         self.current_afm_backend = "pySPM"
         self.current_afm_metrics = {}
         self.current_data_unit = unit
@@ -2040,6 +2042,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
