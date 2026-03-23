@@ -910,7 +910,25 @@ class NanoScopeThresholdApp:
             return None, None, None, None
 
         text = raw.decode("latin1", errors="ignore")
-        lines = [m.group(1).strip() for m in re.finditer(r"\\Scan Size:\s*([^\r\n]+)", text)]
+        # Robustly capture Bruker header lines like:
+        #   \Scan Size: 10000 nm
+        #   \Scan Size : 10 10 ~m
+        # while tolerating spaces and missing leading backslash in decoded text.
+        lines = []
+        for raw_line in text.splitlines():
+            clean_line = raw_line.replace("\x00", "").strip()
+            if not clean_line:
+                continue
+            if "scan size" not in clean_line.lower():
+                continue
+            mline = re.search(r"(?:^|[\\/])\s*Scan Size\s*:\s*(.+)$", clean_line, flags=re.IGNORECASE)
+            if mline:
+                lines.append(mline.group(1).strip())
+                continue
+            # Fallback for decoded headers that lost the leading backslash entirely
+            mline = re.search(r"Scan Size\s*:\s*(.+)$", clean_line, flags=re.IGNORECASE)
+            if mline:
+                lines.append(mline.group(1).strip())
         if not lines:
             return None, None, None, None
 
