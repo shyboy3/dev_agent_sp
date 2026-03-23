@@ -1,4 +1,4 @@
-#V17.1
+#V17.2
 import os
 import json
 import re
@@ -1004,6 +1004,8 @@ class NanoScopeThresholdApp:
     def _set_xy_calibration(self, x_length, y_length, unit, source, image_shape=None):
         self.current_xy_unit = unit
         self.current_xy_source = source
+        self.current_x_total = float(x_length) if x_length is not None else None
+        self.current_y_total = float(y_length) if y_length is not None else None
         self.current_x_scale = None
         self.current_y_scale = None
         if image_shape is None:
@@ -1015,8 +1017,37 @@ class NanoScopeThresholdApp:
             if y_length is not None and h > 0:
                 self.current_y_scale = float(y_length) / float(h)
 
+    def _get_display_axis_unit_and_factor(self):
+        unit = self.current_xy_unit
+        x_total = getattr(self, "current_x_total", None)
+        y_total = getattr(self, "current_y_total", None)
+        if not unit or x_total is None or y_total is None:
+            return None, 1.0
+
+        max_total = max(abs(float(x_total)), abs(float(y_total)))
+        if unit == "nm":
+            if max_total >= 1_000_000:
+                return "mm", 1_000_000.0
+            if max_total >= 1_000:
+                return "um", 1_000.0
+            return "nm", 1.0
+        if unit == "um":
+            if max_total >= 1_000:
+                return "mm", 1_000.0
+            return "um", 1.0
+        return unit, 1.0
+
+    def _format_axis_value(self, v):
+        av = abs(float(v))
+        if av >= 100:
+            return f"{v:.0f}"
+        if av >= 10:
+            return f"{v:.1f}".rstrip("0").rstrip(".")
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+
     def _get_axis_unit_text(self):
-        return self.current_xy_unit if self.current_xy_unit else "pixel"
+        disp_unit, _ = self._get_display_axis_unit_and_factor()
+        return disp_unit if disp_unit else "pixel"
 
     def _axis_label(self, axis_name):
         return f"{axis_name} ({self._get_axis_unit_text()})"
@@ -1024,21 +1055,21 @@ class NanoScopeThresholdApp:
     def _apply_spatial_axes(self, ax, image_shape):
         h, w = image_shape[:2]
         unit = self.current_xy_unit
-        xscale = self.current_x_scale
-        yscale = self.current_y_scale
+        x_total = getattr(self, "current_x_total", None)
+        y_total = getattr(self, "current_y_total", None)
 
-        if unit and xscale and yscale:
-            xticks = np.linspace(0, max(0, w - 1), num=min(6, max(2, w)))
-            yticks = np.linspace(0, max(0, h - 1), num=min(6, max(2, h)))
-            ax.set_xticks(xticks)
-            ax.set_yticks(yticks)
-            ax.set_xticklabels([f"{x * xscale:.3g}" for x in xticks])
-            ax.set_yticklabels([f"{y * yscale:.3g}" for y in yticks])
+        xticks = np.linspace(0, max(0, w - 1), num=min(6, max(2, w)))
+        yticks = np.linspace(0, max(0, h - 1), num=min(6, max(2, h)))
+        ax.set_xticks(xticks)
+        ax.set_yticks(yticks)
+
+        if unit and x_total is not None and y_total is not None and w > 1 and h > 1:
+            disp_unit, factor = self._get_display_axis_unit_and_factor()
+            xvals = np.linspace(0.0, float(x_total) / factor, num=len(xticks))
+            yvals = np.linspace(0.0, float(y_total) / factor, num=len(yticks))
+            ax.set_xticklabels([self._format_axis_value(v) for v in xvals])
+            ax.set_yticklabels([self._format_axis_value(v) for v in yvals])
         else:
-            xticks = np.linspace(0, max(0, w - 1), num=min(6, max(2, w)))
-            yticks = np.linspace(0, max(0, h - 1), num=min(6, max(2, h)))
-            ax.set_xticks(xticks)
-            ax.set_yticks(yticks)
             ax.set_xticklabels([f"{int(round(x))}" for x in xticks])
             ax.set_yticklabels([f"{int(round(y))}" for y in yticks])
 
