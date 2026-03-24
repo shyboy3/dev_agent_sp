@@ -1,1 +1,629 @@
-test
+#afm_v18_1_blueprint.json
+{
+  "agent_name": "afm_v18_1_processing_agent",
+  "domain": "AFM",
+  "goal": "processing_only",
+  "ui_framework": "tkinter",
+  "description": "AFM processing agent blueprint aligned to the V18.1 feature set discussed during development.",
+  "interpretation": {
+    "enabled": false
+  },
+  "input_formats": [
+    ".spm",
+    ".000",
+    ".001",
+    ".txt",
+    ".csv",
+    ".npy",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff"
+  ],
+  "modules": [
+    "file_loader.bruker",
+    "file_loader.generic",
+    "ui.file_panel",
+    "ui.scrollable_left_panel",
+    "crop",
+    "flattening.global",
+    "flattening.line_by_line",
+    "flattening.robust",
+    "preprocessing.median",
+    "preprocessing.gaussian",
+    "preprocessing.total_variation",
+    "preprocessing.wavelet",
+    "threshold.multi_otsu",
+    "threshold.kmeans",
+    "threshold.gmm",
+    "threshold.equal_interval",
+    "binary.small_region_replace",
+    "visual.raw_image",
+    "visual.threshold_image",
+    "histogram.raw_processed",
+    "histogram.threshold",
+    "export.preprocessing_txt",
+    "export.histogram_txt",
+    "export.histogram_csv",
+    "export.params_json",
+    "build.pyinstaller"
+  ],
+  "module_params": {
+    "file_loader.bruker": {
+      "channel_selection": true,
+      "header_scan_size_parse": true,
+      "header_scan_size_policy": "validated_nm_only",
+      "fallback_pixel_axis_when_unvalidated": true
+    },
+    "crop": {
+      "show_raw_shape": true,
+      "preserve_across_file_switch": true
+    },
+    "flattening.global": {
+      "orders": [0, 1, 2, 3, 4, 5, 6],
+      "multiple_selection": true,
+      "apply_low_to_high": true,
+      "order_0_rule": "subtract_mean"
+    },
+    "flattening.line_by_line": {
+      "orders": [0, 1, 2, 3, 4, 5, 6],
+      "multiple_selection": true,
+      "apply_low_to_high": true,
+      "order_0_rule": "subtract_mean"
+    },
+    "flattening.robust": {
+      "enabled": true,
+      "method": "mad_outlier_rejection",
+      "default_k": 3.5,
+      "line_by_line_only": true
+    },
+    "preprocessing.median": {
+      "enabled": true,
+      "kernel_size": 3
+    },
+    "preprocessing.gaussian": {
+      "enabled": true,
+      "sigma": 1.0,
+      "preserve_range": true
+    },
+    "preprocessing.total_variation": {
+      "enabled": true,
+      "weight": 0.1,
+      "eps": 0.0002,
+      "max_num_iter": 200
+    },
+    "preprocessing.wavelet": {
+      "enabled": true,
+      "sigma": 0.08,
+      "wavelet": "db2",
+      "mode": "soft",
+      "rescale_sigma": true
+    },
+    "threshold.multi_otsu": {
+      "threshold_count": 2,
+      "suggest_thresholds": true,
+      "manual_override": true
+    },
+    "threshold.kmeans": {
+      "threshold_count": 2,
+      "manual_override": true
+    },
+    "threshold.gmm": {
+      "threshold_count": 2,
+      "manual_override": true
+    },
+    "threshold.equal_interval": {
+      "threshold_count": 2,
+      "manual_override": true
+    },
+    "binary.small_region_replace": {
+      "enabled": true,
+      "p": 10
+    },
+    "visual.raw_image": {
+      "colorbar": true,
+      "independent_colormap": true,
+      "raw_min_max": true,
+      "axis_ticks": true,
+      "axis_unit_display": true,
+      "unit_promotion": [
+        "nm",
+        "um",
+        "mm"
+      ],
+      "disable_scientific_notation": true
+    },
+    "visual.threshold_image": {
+      "colorbar": true,
+      "independent_colormap": true,
+      "axis_ticks": true,
+      "axis_unit_display": true,
+      "unit_promotion": [
+        "nm",
+        "um",
+        "mm"
+      ],
+      "disable_scientific_notation": true,
+      "boundary_overlay": "contour",
+      "boundary_thickness": 0.6
+    },
+    "histogram.raw_processed": {
+      "bins": 256,
+      "show_mean": true,
+      "show_std": true,
+      "show_stats_text": true,
+      "data_unit_if_available": true
+    },
+    "histogram.threshold": {
+      "show_percent": true,
+      "match_threshold_colormap": true
+    },
+    "export.preprocessing_txt": {
+      "enabled": true
+    },
+    "export.histogram_txt": {
+      "enabled": true
+    },
+    "export.histogram_csv": {
+      "enabled": true,
+      "encoding": "utf-8-sig"
+    },
+    "export.params_json": {
+      "enabled": true
+    },
+    "build.pyinstaller": {
+      "mode": "onedir",
+      "windowed": true,
+      "clean": true,
+      "collect_all": [
+        "nanoscope",
+        "pySPM"
+      ]
+    }
+  },
+  "pipeline_order": [
+    "crop",
+    "flattening",
+    "preprocessing",
+    "thresholding",
+    "binary_processing"
+  ],
+  "notes": [
+    "This blueprint targets AFM processing only. No interpretation/RAG layer is enabled.",
+    "Scan Size handling must trust validated nm header values first and fall back to pixel axes when not validated.",
+    "Robust flattening applies only in line-by-line mode.",
+    "This spec is intended as the design source for a builder, not as a direct scientific implementation."
+  ]
+}
+
+
+
+
+#afm_agent_builder.py
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class ModuleDef:
+    key: str
+    stage: str
+    description: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    requires: List[str] = field(default_factory=list)
+    optional: bool = False
+
+
+AFM_MODULE_REGISTRY: Dict[str, ModuleDef] = {
+    "file_loader.bruker": ModuleDef(
+        key="file_loader.bruker",
+        stage="input",
+        description="Load Bruker AFM files (.spm/.000/.001) using nanoscope.files.ImageFile first and pySPM as fallback.",
+        params={"channel_selection": True, "multi_file": True, "header_scan_size_parse": True},
+    ),
+    "file_loader.generic": ModuleDef(
+        key="file_loader.generic",
+        stage="input",
+        description="Load generic TXT/CSV/NPY/image inputs.",
+        params={"supported_extensions": [".txt", ".csv", ".npy", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]},
+    ),
+    "ui.file_panel": ModuleDef(
+        key="ui.file_panel",
+        stage="ui",
+        description="Multi-file list, current active file selection, action buttons below file panel.",
+    ),
+    "ui.scrollable_left_panel": ModuleDef(
+        key="ui.scrollable_left_panel",
+        stage="ui",
+        description="Scrollable Tkinter left control panel.",
+    ),
+    "crop": ModuleDef(
+        key="crop",
+        stage="pipeline",
+        description="X/Y/W/H crop controls with raw image shape display.",
+        params={"preserve_across_file_switch": True},
+    ),
+    "flattening.global": ModuleDef(
+        key="flattening.global",
+        stage="pipeline",
+        description="Global polynomial flattening, order 0-6.",
+        params={"orders": [0, 1, 2, 3, 4, 5, 6], "multiple_selection": True, "order_0_rule": "subtract_mean"},
+    ),
+    "flattening.line_by_line": ModuleDef(
+        key="flattening.line_by_line",
+        stage="pipeline",
+        description="Line-by-line polynomial flattening, order 0-6.",
+        params={"orders": [0, 1, 2, 3, 4, 5, 6], "multiple_selection": True, "order_0_rule": "subtract_mean"},
+    ),
+    "flattening.robust": ModuleDef(
+        key="flattening.robust",
+        stage="pipeline",
+        description="MAD-based outlier rejection for line-by-line flattening.",
+        params={"enabled": True, "method": "mad", "default_k": 3.5},
+        requires=["flattening.line_by_line"],
+        optional=True,
+    ),
+    "preprocessing.median": ModuleDef(
+        key="preprocessing.median",
+        stage="pipeline",
+        description="Median filter preprocessing.",
+        params={"kernel_size": 3},
+        optional=True,
+    ),
+    "preprocessing.gaussian": ModuleDef(
+        key="preprocessing.gaussian",
+        stage="pipeline",
+        description="Gaussian filter preprocessing.",
+        params={"sigma": 1.0},
+        optional=True,
+    ),
+    "preprocessing.total_variation": ModuleDef(
+        key="preprocessing.total_variation",
+        stage="pipeline",
+        description="TV denoising preprocessing.",
+        params={"weight": 0.1},
+        optional=True,
+    ),
+    "preprocessing.wavelet": ModuleDef(
+        key="preprocessing.wavelet",
+        stage="pipeline",
+        description="Wavelet denoising preprocessing.",
+        params={"sigma": 0.08, "wavelet": "db2", "mode": "soft"},
+        optional=True,
+    ),
+    "threshold.otsu": ModuleDef(
+        key="threshold.otsu",
+        stage="pipeline",
+        description="Otsu thresholding.",
+        params={"threshold_count": 1},
+        optional=True,
+    ),
+    "threshold.multi_otsu": ModuleDef(
+        key="threshold.multi_otsu",
+        stage="pipeline",
+        description="Multi-Otsu thresholding.",
+        params={"threshold_count": 2, "manual_override": True, "suggestion": True},
+        optional=True,
+    ),
+    "threshold.kmeans": ModuleDef(
+        key="threshold.kmeans",
+        stage="pipeline",
+        description="K-means thresholding.",
+        params={"threshold_count": 2, "manual_override": True},
+        optional=True,
+    ),
+    "threshold.gmm": ModuleDef(
+        key="threshold.gmm",
+        stage="pipeline",
+        description="Gaussian Mixture thresholding.",
+        params={"threshold_count": 2, "manual_override": True},
+        optional=True,
+    ),
+    "threshold.equal_interval": ModuleDef(
+        key="threshold.equal_interval",
+        stage="pipeline",
+        description="Equal-interval thresholding.",
+        params={"threshold_count": 2, "manual_override": True},
+        optional=True,
+    ),
+    "binary.small_region_replace": ModuleDef(
+        key="binary.small_region_replace",
+        stage="pipeline",
+        description="Replace small threshold regions below P with surrounding label.",
+        params={"p": 10},
+        optional=True,
+    ),
+    "visual.raw_image": ModuleDef(
+        key="visual.raw_image",
+        stage="visualization",
+        description="Raw/flattened/preprocessed image panel with colorbar, axis unit promotion and min/max control.",
+        params={"colorbar": True, "independent_colormap": True, "raw_min_max": True},
+    ),
+    "visual.threshold_image": ModuleDef(
+        key="visual.threshold_image",
+        stage="visualization",
+        description="Threshold image panel with colorbar, boundary contour and axis unit promotion.",
+        params={"colorbar": True, "independent_colormap": True, "boundary_contour": True, "boundary_thickness": 0.6},
+    ),
+    "histogram.raw_processed": ModuleDef(
+        key="histogram.raw_processed",
+        stage="visualization",
+        description="Raw/processed histogram with mean/std lines and statistics text.",
+        params={"bins": 256, "show_mean": True, "show_std": True},
+    ),
+    "histogram.threshold": ModuleDef(
+        key="histogram.threshold",
+        stage="visualization",
+        description="Threshold histogram with group percentages and matching colors.",
+        params={"show_percent": True},
+    ),
+    "export.preprocessing_txt": ModuleDef(
+        key="export.preprocessing_txt",
+        stage="export",
+        description="Export preprocessing summary TXT.",
+    ),
+    "export.histogram_txt": ModuleDef(
+        key="export.histogram_txt",
+        stage="export",
+        description="Export histogram TXT.",
+    ),
+    "export.histogram_csv": ModuleDef(
+        key="export.histogram_csv",
+        stage="export",
+        description="Export histogram CSV for Excel (utf-8-sig).",
+    ),
+    "export.params_json": ModuleDef(
+        key="export.params_json",
+        stage="export",
+        description="Save/load UI parameter presets in JSON.",
+    ),
+    "build.pyinstaller": ModuleDef(
+        key="build.pyinstaller",
+        stage="build",
+        description="PyInstaller onedir packaging with collect-all nanoscope/pySPM.",
+        params={"mode": "onedir", "collect_all": ["nanoscope", "pySPM"]},
+    ),
+}
+
+DEFAULT_STAGE_ORDER = ["input", "ui", "pipeline", "visualization", "export", "build"]
+
+
+class SpecError(Exception):
+    pass
+
+
+def load_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def sanitize_name(name: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_\-]+", "_", name.strip())
+    return clean.strip("_") or "afm_agent"
+
+
+def resolve_modules(spec: Dict[str, Any]) -> List[ModuleDef]:
+    requested = spec.get("modules", [])
+    if not requested:
+        raise SpecError("Spec must include a non-empty 'modules' list.")
+
+    resolved: List[ModuleDef] = []
+    seen = set()
+
+    def add_module(key: str) -> None:
+        if key in seen:
+            return
+        if key not in AFM_MODULE_REGISTRY:
+            raise SpecError(f"Unknown module: {key}")
+        module = AFM_MODULE_REGISTRY[key]
+        for dep in module.requires:
+            add_module(dep)
+        resolved.append(module)
+        seen.add(key)
+
+    for item in requested:
+        add_module(item)
+
+    order = {stage: i for i, stage in enumerate(DEFAULT_STAGE_ORDER)}
+    resolved.sort(key=lambda m: (order.get(m.stage, 999), m.key))
+    return resolved
+
+
+def validate_spec(spec: Dict[str, Any]) -> None:
+    if spec.get("domain") != "AFM":
+        raise SpecError("This builder currently supports only domain='AFM'.")
+    if spec.get("interpretation", {}).get("enabled", False):
+        raise SpecError("AFM builder v1 supports processing-only agents. Set interpretation.enabled = false.")
+    if spec.get("goal") not in {"processing_only", None}:
+        raise SpecError("AFM builder goal must be 'processing_only'.")
+
+
+def merged_params(spec: Dict[str, Any], modules: List[ModuleDef]) -> Dict[str, Dict[str, Any]]:
+    params_override = spec.get("module_params", {})
+    out: Dict[str, Dict[str, Any]] = {}
+    for module in modules:
+        merged = dict(module.params)
+        merged.update(params_override.get(module.key, {}))
+        out[module.key] = merged
+    return out
+
+
+def generate_runtime_stub() -> str:
+    return '''from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+
+@dataclass
+class Context:
+    spec: Dict[str, Any]
+    state: Dict[str, Any]
+
+
+class BaseModule:
+    key = "base"
+
+    def __init__(self, params: Dict[str, Any] | None = None):
+        self.params = params or {}
+
+    def process(self, ctx: Context) -> Context:
+        return ctx
+
+
+class Pipeline:
+    def __init__(self, modules: List[BaseModule]):
+        self.modules = modules
+
+    def run(self, ctx: Context) -> Context:
+        for module in self.modules:
+            ctx = module.process(ctx)
+        return ctx
+'''
+
+
+def generate_generated_agent_py(spec: Dict[str, Any], modules: List[ModuleDef], params: Dict[str, Dict[str, Any]]) -> str:
+    module_lines = []
+    class_defs = []
+    instance_lines = []
+    for module in modules:
+        cls_name = ''.join(part.capitalize() for part in re.split(r'[^A-Za-z0-9]+', module.key)) + 'Module'
+        class_defs.append(f'''\nclass {cls_name}(BaseModule):\n    key = "{module.key}"\n\n    def process(self, ctx: Context) -> Context:\n        ctx.state.setdefault("execution_log", []).append({{"module": self.key, "params": self.params}})\n        return ctx\n''')
+        instance_lines.append(f'        {cls_name}(params["{module.key}"]),')
+
+    module_lines.append("\n".join(class_defs))
+    params_json = json.dumps(params, indent=2)
+    spec_json = json.dumps(spec, indent=2)
+    return f'''from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from runtime_stub import BaseModule, Context, Pipeline
+{''.join(module_lines)}
+
+SPEC = {spec_json}
+PARAMS = {params_json}
+
+
+def build_pipeline() -> Pipeline:
+    params = PARAMS
+    return Pipeline([
+{chr(10).join(instance_lines)}
+    ])
+
+
+def run_agent(input_payload: dict | None = None) -> dict:
+    ctx = Context(spec=SPEC, state={{"input": input_payload or {{}}}})
+    pipeline = build_pipeline()
+    ctx = pipeline.run(ctx)
+    return ctx.state
+
+
+if __name__ == "__main__":
+    result = run_agent({{"note": "scaffold run"}})
+    out = Path("agent_run_output.json")
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(f"Wrote {{out}}")
+'''
+
+
+def generate_readme(spec: Dict[str, Any], modules: List[ModuleDef], params: Dict[str, Dict[str, Any]]) -> str:
+    lines = []
+    lines.append(f"# Generated AFM Agent: {spec['agent_name']}")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append(f"- Domain: {spec.get('domain')}")
+    lines.append(f"- Goal: {spec.get('goal', 'processing_only')}")
+    lines.append(f"- UI: {spec.get('ui_framework', 'tkinter')}")
+    lines.append("")
+    lines.append("## Modules")
+    for module in modules:
+        lines.append(f"- `{module.key}` — {module.description}")
+    lines.append("")
+    lines.append("## Resolved Parameters")
+    for key, val in params.items():
+        lines.append(f"- `{key}`: `{json.dumps(val, ensure_ascii=False)}`")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("This output is a scaffolded AFM processing agent. The runtime pipeline is generated and logged, but scientific module implementations should be connected to your validated AFM processing library or existing V18.1 codebase.")
+    lines.append("Recommended next step: replace the generated scaffold modules with production implementations from your AFM toolkit, then add GUI or batch execution entrypoints as needed.")
+    return "\n".join(lines)
+
+
+def write_builder_report(out_dir: Path, spec: Dict[str, Any], modules: List[ModuleDef], params: Dict[str, Dict[str, Any]]) -> None:
+    report = {
+        "agent_name": spec["agent_name"],
+        "domain": spec["domain"],
+        "goal": spec.get("goal", "processing_only"),
+        "module_count": len(modules),
+        "modules": [asdict(m) for m in modules],
+        "resolved_params": params,
+    }
+    (out_dir / "builder_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def build_agent(spec_path: Path, output_root: Path) -> Path:
+    spec = load_json(spec_path)
+    validate_spec(spec)
+
+    spec.setdefault("goal", "processing_only")
+    spec.setdefault("ui_framework", "tkinter")
+    spec["agent_name"] = sanitize_name(spec.get("agent_name", spec_path.stem))
+
+    modules = resolve_modules(spec)
+    params = merged_params(spec, modules)
+
+    out_dir = output_root / spec["agent_name"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / "resolved_spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    (out_dir / "runtime_stub.py").write_text(generate_runtime_stub(), encoding="utf-8")
+    (out_dir / "generated_agent.py").write_text(generate_generated_agent_py(spec, modules, params), encoding="utf-8")
+    (out_dir / "README_generated.md").write_text(generate_readme(spec, modules, params), encoding="utf-8")
+    write_builder_report(out_dir, spec, modules, params)
+    return out_dir
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AFM processing agent builder")
+    parser.add_argument("--spec", required=True, help="Path to AFM agent JSON spec")
+    parser.add_argument("--out", default="generated_agents", help="Output directory")
+    args = parser.parse_args()
+
+    out_dir = build_agent(Path(args.spec), Path(args.out))
+    print(f"Generated AFM agent scaffold at: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+# workflow
+
+User Prompt
+   ↓
+Planner Agent
+   ↓
+Task Graph 생성
+   ↓
+Code Agent
+   ↓
+Runner / Test Agent
+   ↓
+Patch Agent
+   ↓
+Build Agent
+   ↓
+완성 코드 + 실행파일
+
