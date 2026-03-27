@@ -1,3 +1,41 @@
+    # [기존 코드]
+    # first_n, first_m = None, None
+    # for n_name, m_dict in data.items(): ...
+
+    # 👇 [이렇게 교체해 주세요]
+    first_n, first_m, first_f_global = None, None, None
+    last_n, last_m, last_f = None, None, None
+
+    for n_name, m_dict in data.items():
+        n_id = f"n_{hash(n_name)}"
+        if not first_n: first_n = n_id
+        last_n = n_id  # 계속 덮어쓰면서 마지막 그룹 노드를 기억
+        
+        dot.append(f'  "{n_id}" [label=<{wrap_text(n_name)}>, shape=parallelogram, color="#3b82f6"];')
+        dot.append(f'  "root" -> "{n_id}" [minlen=3];')
+        
+        for m_name, m_data in m_dict.items():
+            m_id = f"m_{hash(n_name + m_name)}"
+            if not first_m: first_m = m_id
+            last_m = m_id  # 계속 덮어쓰면서 마지막 아이템 노드를 기억
+            
+            dot.append(f'  "{m_id}" [label=<{wrap_text(m_name)}>, shape=component, color="#10b981"];')
+            dot.append(f'  "{n_id}" -> "{m_id}" [minlen=3];')
+            
+            f_list = [f.strip() for f in m_data.get("features", "").replace('\n',';').split(';') if f.strip()]
+            
+            if f_list:
+                # 첫 번째 특징 노드와 마지막 특징 노드를 기억
+                if not first_f_global: first_f_global = f"f_{m_id}_0"
+                last_f = f"f_{m_id}_{len(f_list)-1}" 
+                
+                # ... (이 아래로 기존 subgraph "cluster..." 그리는 코드는 그대로 유지) ...
+
+
+
+
+
+
                     tags_str = m_data.get("feature_meta", {}).get(feat, {}).get("tags", "")
                     if tags_str:
                         # 1. 쉼표(,)를 기준으로 태그를 리스트로 분리하고 여백을 제거합니다.
