@@ -1,3 +1,36 @@
+                # ... [이전 코드: 특징 아이콘(note) 생성하는 for문은 그대로 둡니다] ...
+
+                # 💡 [여기부터 수정] 개수에 따른 동적 정렬 로직
+                num_feats = len(feats)
+                
+                if num_feats <= 4:
+                    # [조건 1] 특징이 4개 이하일 때: 1줄(가로) 정렬
+                    for i in range(num_feats - 1):
+                        f_curr = f"f_{m_id}_{i}"
+                        f_next = f"f_{m_id}_{i+1}"
+                        # 옆으로만 나란히 투명 뼈대 연결
+                        dot.append(f'    "{f_curr}" -> "{f_next}" [style=invis, weight=10, minlen=2];')
+                
+                else:
+                    # [조건 2] 특징이 5개 이상일 때: 기존처럼 2줄(2xN) 정렬
+                    for i in range(num_feats):
+                        f1 = f"f_{m_id}_{i}"
+                        # ① 세로 묶기 (위아래로 배치)
+                        if i % 2 == 0 and i + 1 < num_feats:
+                            f2 = f"f_{m_id}_{i+1}"
+                            dot.append(f'    {{ rank=same; "{f1}"; "{f2}"; }}')
+                        # ② 가로 밀어내기 (다음 열로 이동)
+                        if i + 2 < num_feats:
+                            next_f = f"f_{m_id}_{i+2}"
+                            dot.append(f'    "{f1}" -> "{next_f}" [style=invis, weight=10, minlen=2];')
+                
+                dot.append('  }') # 상자 닫는 괄호
+                
+                # ... [이후 코드: m_id -> f_0 으로 선 연결하는 부분은 그대로 둡니다] ...
+
+
+
+
     # --- [도형 모양 판별 로직 확장] ---
     raw_shape = style_dict.get('shape', '').lower()
     
