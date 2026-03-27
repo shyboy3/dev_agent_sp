@@ -1,4 +1,35 @@
-#--- 최종 버전 프롬프트 만든것 ---
+#--- 최종 버전 제미나이가 프롬프트 만든것 ---
+
+# 역할 및 목적
+너는 파이썬 기반의 현미경 데이터 분석 전문가야. Bruker AFM(원자간력 현미경) 파일(.spm 등) 및 일반 이미지를 처리하여, 표면의 높이 데이터를 분석하고 영역별 면적 비율을 계산하는 GUI 애플리케이션을 작성해줘.
+
+# 기술 스택
+- GUI: tkinter (Scrollbar가 포함된 제어 패널 + Matplotlib 캔버스 레이아웃)
+- 데이터 처리: numpy, scipy, scikit-image (skimage), scikit-learn
+- 전문 라이브러리: pySPM, nanoscope (Import 실패 시 예외 처리 포함)
+
+# 핵심 기능 요구사항
+1. 파일 입출력: Multi-file 로드, Bruker 전용 채널 선택(Height Sensor 우선), 파라미터 JSON 저장/불러오기.
+2. 이미지 전처리: 
+   - Crop 기능 (X, Y, W, H 설정).
+   - Flattening: Global 다항식 피팅 및 Line-by-line (Robust fit 포함) 보정.
+   - Denoising: 사용자가 순서를 지정할 수 있는 Median, Gaussian, TV Chambolle, Wavelet 필터 체인.
+3. 임계값(Thresholding) 분석:
+   - 알고리즘: Otsu, Multi-Otsu, K-means, GMM, Equal Interval 지원.
+   - 수동 임계값 입력 및 자동 제안(Suggest) 기능.
+   - Binary Post-processing: 특정 픽셀(P) 이하의 작은 영역을 주변값으로 대체.
+4. 시각화 및 결과:
+   - 4분할 화면: (1)전처리 이미지, (2)임계값 결과(Contour 표시 옵션), (3)통계 히스토그램, (4)그룹별 면적 비율 바차트.
+   - 물리 단위 반영: AFM 메타데이터에서 nm, um 단위를 추출하여 축(Axis)과 컬러바에 표시.
+5. 데이터 내보내기: 처리 요약본(TXT), 히스토그램 데이터(CSV), 분석 이미지(PNG/PDF) 저장.
+
+# 코드 구조
+- `NanoScopeThresholdApp` 클래스 기반으로 작성.
+- 모든 UI 요소는 `_build_ui` 등의 내부 메서드로 분리하여 가독성 확보.
+- 메인 루프 실행 시 'clam' 테마 적용 시도.
+
+
+#--- 최종 버전 GPT가 프롬프트 만든것 ---
 You are a senior Python developer specializing in scientific imaging tools.
 
 Build a complete standalone Python application using Tkinter for analyzing AFM (Atomic Force Microscopy) data, including Bruker .spm / .000 / .001 formats and generic image/text inputs.
@@ -22937,93 +22968,4 @@ class NanoScopeThresholdApp:
         method = self.threshold_method_var.get().strip().lower()
 
         if method == "otsu":
-            return [float(threshold_otsu(data))]
-        if method == "multi-otsu":
-            return [float(x) for x in threshold_multiotsu(data, classes=groups)]
-        if method == "k-means":
-            km = KMeans(n_clusters=groups, random_state=int(self.kmeans_random_state_var.get()), n_init=max(1, int(self.kmeans_n_init_var.get())))
-            km.fit(flat)
-            centers = np.sort(km.cluster_centers_.flatten())
-            return self._centers_to_thresholds(centers)
-        if method == "gmm":
-            gm = GaussianMixture(n_components=groups, covariance_type=self.gmm_covariance_type_var.get(), random_state=int(self.gmm_random_state_var.get()))
-            gm.fit(flat)
-            means = np.sort(gm.means_.flatten())
-            return self._centers_to_thresholds(means)
-        if method == "equal interval":
-            p_low = float(self.equal_interval_percentile_low_var.get())
-            p_high = float(self.equal_interval_percentile_high_var.get())
-            if p_high <= p_low:
-                raise ValueError("Equal Interval: High percentile must be greater than low percentile.")
-            low = float(np.percentile(data, p_low))
-            high = float(np.percentile(data, p_high))
-            return [float(x) for x in np.linspace(low, high, groups + 1)[1:-1]]
-        raise ValueError(f"Unknown threshold method: {self.threshold_method_var.get()}")
-
-    def compute_threshold_labels(self, image):
-        data = image.astype(np.float32)
-        count = max(1, int(self.threshold_count_var.get()))
-        if self.use_manual_thresholds_var.get():
-            thr = self._parse_manual_thresholds()
-            if not thr:
-                raise ValueError("Manual thresholds are enabled, but no values were entered.")
-            labels = np.digitize(data, bins=thr).astype(np.int32)
-            return labels, thr
-
-        thr = self.compute_auto_threshold_values(data)
-        if self.threshold_method_var.get().strip().lower() == "otsu":
-            labels = np.digitize(data, bins=thr).astype(np.int32)
-            return labels, thr
-
-        if len(thr) != count:
-            raise ValueError(f"Threshold count mismatch: expected {count}, got {len(thr)}")
-        labels = np.digitize(data, bins=thr).astype(np.int32)
-        if self.threshold_method_var.get().strip().lower() == "equal interval":
-            groups = len(thr) + 1
-            p_low = float(self.equal_interval_percentile_low_var.get())
-            p_high = float(self.equal_interval_percentile_high_var.get())
-            low = float(np.percentile(data, p_low))
-            high = float(np.percentile(data, p_high))
-            labels[data < low] = 0
-            labels[data >= high] = groups - 1
-        return labels, thr
-
-    def _centers_to_thresholds(self, centers_sorted):
-        centers_sorted = np.asarray(centers_sorted, dtype=np.float32)
-        if centers_sorted.size <= 1:
-            return []
-        mids = 0.5 * (centers_sorted[:-1] + centers_sorted[1:])
-        return [float(x) for x in mids]
-
-    def replace_small_regions_with_neighbors(self, label_img, max_region_size):
-        out = label_img.copy()
-        structure = np.ones((3, 3), dtype=np.uint8)
-        unique_vals = np.unique(out)
-        for val in unique_vals:
-            mask = out == val
-            cc, n_cc = ndi.label(mask, structure=structure)
-            for idx in range(1, n_cc + 1):
-                region_mask = cc == idx
-                area = int(region_mask.sum())
-                if area <= max_region_size:
-                    dilated = ndi.binary_dilation(region_mask, structure=structure)
-                    border = dilated & (~region_mask)
-                    neighbor_vals = out[border]
-                    neighbor_vals = neighbor_vals[neighbor_vals != val]
-                    if neighbor_vals.size == 0:
-                        continue
-                    replacement = mode(neighbor_vals, keepdims=False).mode
-                    out[region_mask] = int(replacement)
-        return out.astype(np.int32)
-
-    def compute_group_percentages(self, label_img):
-        if label_img is None:
-            return []
-        labels = label_img.ravel().astype(np.int32)
-        groups = int(labels.max()) + 1 if labels.size else 0
-        counts = np.array([(labels == i).sum() for i in range(groups)], dtype=np.int64)
-        total = max(1, int(counts.sum()))
-        return [100.0 * c / total for c in counts]
-
-    # Rendering
-    def update_image_pa
+            return 
