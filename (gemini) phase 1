@@ -1,3 +1,24 @@
+    # ... (상자 그리는 코드 끝나는 부분) ...
+
+    # 👇 [여기서부터 '}' 직전까지 이 코드로 덮어써 주세요]
+    
+    # 1. 가로축 맞추기: 헤더들을 각 열의 '첫 번째' 노드와 같은 세로줄에 정렬
+    dot.append('  { rank=same; "H_Class"; "root"; }')
+    if first_n: dot.append(f'  {{ rank=same; "H_Group"; "{first_n}"; }}')
+    if first_m: dot.append(f'  {{ rank=same; "H_Item"; "{first_m}"; }}')
+    if first_f_global: dot.append(f'  {{ rank=same; "H_Feature"; "{first_f_global}"; }}')
+
+    # 2. 세로축 맞추기: 헤더들을 각 열의 '마지막' 노드 밑으로 강제로 밀어내기 (위에서 아래로 찍어 누름)
+    dot.append('  "root" -> "H_Class" [style=invis, weight=10];')
+    if last_n: dot.append(f'  "{last_n}" -> "H_Group" [style=invis, weight=10];')
+    if last_m: dot.append(f'  "{last_m}" -> "H_Item" [style=invis, weight=10];')
+    if last_f: dot.append(f'  "{last_f}" -> "H_Feature" [style=invis, weight=10];')
+
+    dot.append('}')
+    return "\n".join(dot)
+
+
+
     # [기존 코드]
     # first_n, first_m = None, None
     # for n_name, m_dict in data.items(): ...
