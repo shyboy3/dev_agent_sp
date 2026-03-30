@@ -1,3 +1,2275 @@
+#---- 클로드 코드
+
+좋아요! 그러면 단계적으로 진행하고 각 단계마다 결과를 확인하면서 가요.
+작업 순서:
+
+Step 1: core/ - 현재 코드에서 로직만 분리 (UI 의존성 제거)
+Step 2: tools/ - Agent tool 정의
+Step 3: agent/ - Ollama + orchestration 
+Step 4: ui/ - Gradio 채팅 UI
+
+
+Step 1부터 시작할게요. 현재 코드에서 처리 로직만 뽑아서 독립 실행 가능한 형태로 만들어요.​​​​​​​​​​​​​​​​
+
+이제 파일 구조를 만들고 Step 1부터 시작할게요.​​​​​​​​​​​​​​​​
+
+이제 Agent의 핵심인 Tool 정의와 Ollama 연동을 만들게요.​​​​​​​​​​​​​​​​
+
+이제 Gradio UI를 만들게요.​​​​​​​​​​​​​​​​
+
+신택스 에러 없이 모두 통과했어요. 파일들을 전달할게요.​​​​​​​​​​​​​​​​
+
+전체 9개 파일을 완성했어요. 신택스 에러 없이 모두 통과했고요.
+
+실행 방법 (README 참고):
+
+# 1. Ollama 모델 준비
+ollama pull qwen3:32b
+
+# 2. 패키지 설치
+pip install -r requirements.txt
+
+# 3. 실행
+python main.py
+
+
+구조 요약:
+	∙	core/processor.py — 원본 코드에서 UI 제거한 순수 처리 로직 + ProcessingParams (모든 파라미터)
+	∙	core/renderer.py — matplotlib 렌더링 (이미지, 히스토그램, combined)
+	∙	tools/tool_definitions.py — Agent가 쓸 수 있는 12개 tool 스키마
+	∙	tools/executor.py — tool call → 실제 함수 실행 브릿지
+	∙	agent/afm_agent.py — Ollama 연동 + system prompt tool calling + Auto/Debug 모드
+	∙	ui/app.py — Gradio 채팅 UI
+테스트 후 알려주실 부분:
+	∙	Ollama 연결 되는지
+	∙	load_image tool이 파일 로드를 제대로 하는지
+	∙	LLM이 한국어 요청을 tool call로 잘 변환하는지
+결과 타이핑으로 알려주시면 바로 수정해드릴게요!​​​​​​​​​​​​​​​​
+
+“””
+AFM Agent - Main launcher
+Run: python main.py
+“””
+
+import sys
+from pathlib import Path
+
+# Ensure project root is on path
+
+sys.path.insert(0, str(Path(**file**).parent))
+
+from afm_agent.ui.app import demo
+
+if **name** == “**main**”:
+print(”=” * 50)
+print(”  AFM Agent”)
+print(”  http://localhost:7860”)
+print(”=” * 50)
+demo.launch(
+server_name=“0.0.0.0”,
+server_port=7860,
+share=False,
+inbrowser=True,
+)
+
+# AFM Agent - Requirements
+
+# Install: pip install -r requirements.txt
+
+# Web UI
+
+gradio>=4.20.0
+
+# HTTP client for Ollama
+
+requests>=2.31.0
+
+# Image processing (same as original app)
+
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-image>=0.21.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+Pillow>=10.0.0
+
+# AFM file support (optional but recommended)
+
+# pip install pySPM
+
+# pip install nanoscope
+
+# AFM Agent
+
+AI-powered AFM image analysis via natural language conversation.
+Powered by **qwen3:32b** running locally via **Ollama**.
+
+-----
+
+## 설치 및 실행 (Windows 11)
+
+### 1. Ollama 설치 및 모델 다운로드
+
+```bash
+# https://ollama.com 에서 Ollama 설치 후:
+ollama pull qwen3:32b
+```
+
+### 2. Python 패키지 설치
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. 실행
+
+```bash
+python main.py
+```
+
+브라우저가 자동으로 열립니다: http://localhost:7860
+
+-----
+
+## 사용법
+
+### Auto Mode (기본)
+
+- 요청하면 바로 분석 실행
+- 결과가 마음에 안들면 자연어로 수정 요청
+
+### Debug Mode
+
+- Settings 패널에서 전환
+- 실행 전 파라미터 확인 및 수정 가능
+
+### 대화 예시
+
+```
+사용자: 이 SPM 파일 분석해줘 (파일 업로드)
+Agent:  [로드 + 기본 분석 실행] 결과 표시
+
+사용자: Multi-Otsu로 3그룹으로 나눠줘
+Agent:  [재처리] 결과 표시
+
+사용자: colormap을 plasma로 바꾸고 경계선도 빨간색으로 표시해줘
+Agent:  [렌더링 업데이트]
+
+사용자: vmin -10, vmax 50으로 설정해줘
+Agent:  [디스플레이 범위 조정]
+
+사용자: 히스토그램도 같이 보여줘
+Agent:  [이미지 + 히스토그램 combined 표시]
+
+사용자: 통계 보여줘
+Agent:  mean, std, 그룹별 비율 등 출력
+
+사용자: 결과 C:/results/sample.png 로 저장해줘
+Agent:  [파일 저장]
+```
+
+-----
+
+## 파일 구조
+
+```
+afm_agent/
+├── main.py              ← 실행 진입점
+├── requirements.txt
+├── core/
+│   ├── processor.py     ← 이미지 처리 로직 (UI 독립)
+│   └── renderer.py      ← matplotlib 렌더링
+├── tools/
+│   ├── tool_definitions.py  ← Agent tool 스키마
+│   └── executor.py          ← Tool 실행 브릿지
+├── agent/
+│   └── afm_agent.py     ← Ollama 연동 + Orchestration
+└── ui/
+    └── app.py           ← Gradio 웹 UI
+```
+
+-----
+
+## 지원 파일 형식
+
+- Bruker AFM: `.spm`, `.000` ~ `.009`
+- 이미지: `.png`, `.jpg`, `.tif`, `.tiff`, `.bmp`
+- 데이터: `.npy`, `.csv`, `.txt`
+
+-----
+
+## Troubleshooting
+
+**Ollama 연결 안됨**
+
+```bash
+# Ollama 서비스 시작
+ollama serve
+```
+
+**모델 없음**
+
+```bash
+ollama pull qwen3:32b
+# 용량 부족시 더 작은 모델:
+ollama pull qwen3:14b
+```
+
+**AFM 파일 로드 실패**
+
+```bash
+pip install pySPM
+# 또는
+pip install nanoscope
+```
+
+“””
+AFM Image Processor - Core Logic (UI-independent)
+Extracted from NanoScopeThresholdApp v18.1
+“””
+
+import os
+import re
+import numpy as np
+from pathlib import Path
+from scipy import ndimage as ndi
+from scipy.stats import mode
+from skimage import io as skio
+from skimage.filters import threshold_otsu, threshold_multiotsu, gaussian
+from skimage.restoration import denoise_tv_chambolle, denoise_wavelet
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+
+try:
+import pySPM
+HAS_PYSPM = True
+except Exception as e:
+pySPM = None
+HAS_PYSPM = False
+
+try:
+import nanoscope
+from nanoscope.files import ImageFile as NanoscopeImageFile
+HAS_NANOSCOPE = True
+except Exception as e:
+nanoscope = None
+NanoscopeImageFile = None
+HAS_NANOSCOPE = False
+
+# ──────────────────────────────────────────────
+
+# Parameter Dataclass
+
+# ──────────────────────────────────────────────
+
+class ProcessingParams:
+“”“All user-controllable parameters in one place.”””
+
+```
+def __init__(self):
+    # Crop
+    self.crop_enable: bool = False
+    self.crop_x: int = 0
+    self.crop_y: int = 0
+    self.crop_w: int = 256
+    self.crop_h: int = 256
+
+    # Flattening
+    self.flatten_mode: str = "global"          # "global" | "line"
+    self.flatten_orders: list[int] = []         # e.g. [1, 2]
+    self.flatten_robust: bool = False
+    self.flatten_robust_k: float = 3.5
+
+    # Pre-processing order
+    self.pp_order: list[str] = ["median", "gaussian", "tv", "wavelet"]
+
+    # Median
+    self.pp_median_enable: bool = False
+    self.pp_median_size: int = 3
+
+    # Gaussian
+    self.pp_gaussian_enable: bool = False
+    self.pp_gaussian_sigma: float = 1.0
+    self.pp_gaussian_preserve_range: bool = True
+
+    # Total Variation
+    self.pp_tv_enable: bool = False
+    self.pp_tv_weight: float = 0.10
+    self.pp_tv_eps: float = 2e-4
+    self.pp_tv_max_num_iter: int = 200
+
+    # Wavelet
+    self.pp_wavelet_enable: bool = False
+    self.pp_wavelet_sigma: float = 0.08
+    self.pp_wavelet_wavelet: str = "db2"
+    self.pp_wavelet_mode: str = "soft"
+    self.pp_wavelet_rescale_sigma: bool = True
+
+    # Threshold
+    self.threshold_method: str = "Multi-Otsu"   # Otsu|Multi-Otsu|K-means|GMM|Equal Interval
+    self.threshold_count: int = 2
+    self.use_manual_thresholds: bool = False
+    self.manual_thresholds: list[float] = []
+
+    # K-means
+    self.kmeans_random_state: int = 0
+    self.kmeans_n_init: int = 10
+
+    # GMM
+    self.gmm_random_state: int = 0
+    self.gmm_covariance_type: str = "full"
+
+    # Equal Interval
+    self.equal_interval_percentile_low: float = 0.0
+    self.equal_interval_percentile_high: float = 100.0
+
+    # Binary Processing
+    self.bp_enable: bool = False
+    self.bp_min_region_size: int = 10
+
+    # Display
+    self.raw_colormap: str = "viridis"
+    self.threshold_colormap: str = "viridis"
+    self.raw_min_enable: bool = False
+    self.raw_max_enable: bool = False
+    self.raw_vmin: float = 0.0
+    self.raw_vmax: float = 1.0
+    self.show_boundaries: bool = False
+    self.boundary_color: str = "red"
+    self.boundary_thickness: float = 0.8
+
+    # AFM channel
+    self.selected_spm_channel: str = ""
+
+def to_dict(self) -> dict:
+    return self.__dict__.copy()
+
+@classmethod
+def from_dict(cls, d: dict) -> "ProcessingParams":
+    p = cls()
+    for k, v in d.items():
+        if hasattr(p, k):
+            setattr(p, k, v)
+    return p
+
+def summary(self) -> str:
+    """Human-readable parameter summary for debug mode."""
+    lines = []
+    lines.append("📋 **Current Parameters**")
+    lines.append(f"- Crop: {'enabled' if self.crop_enable else 'disabled'}"
+                 + (f" (x={self.crop_x}, y={self.crop_y}, w={self.crop_w}, h={self.crop_h})" if self.crop_enable else ""))
+    lines.append(f"- Flattening: mode={self.flatten_mode}, orders={self.flatten_orders or 'none'}"
+                 + (f", robust=True (k={self.flatten_robust_k})" if self.flatten_robust else ""))
+    pp_active = []
+    if self.pp_median_enable:
+        pp_active.append(f"Median(kernel={self.pp_median_size})")
+    if self.pp_gaussian_enable:
+        pp_active.append(f"Gaussian(sigma={self.pp_gaussian_sigma})")
+    if self.pp_tv_enable:
+        pp_active.append(f"TV(weight={self.pp_tv_weight})")
+    if self.pp_wavelet_enable:
+        pp_active.append(f"Wavelet(sigma={self.pp_wavelet_sigma})")
+    lines.append(f"- PreProcessing: {', '.join(pp_active) if pp_active else 'none'}")
+    lines.append(f"- Threshold: method={self.threshold_method}, count={self.threshold_count}"
+                 + (" [MANUAL]" if self.use_manual_thresholds else ""))
+    if self.use_manual_thresholds and self.manual_thresholds:
+        lines.append(f"  Manual values: {self.manual_thresholds}")
+    lines.append(f"- Binary Processing: {'enabled' if self.bp_enable else 'disabled'}"
+                 + (f" (min_region={self.bp_min_region_size}px)" if self.bp_enable else ""))
+    lines.append(f"- Display: colormap={self.raw_colormap}, vmin={'auto' if not self.raw_min_enable else self.raw_vmin}, vmax={'auto' if not self.raw_max_enable else self.raw_vmax}")
+    lines.append(f"  Boundaries: {'on' if self.show_boundaries else 'off'}"
+                 + (f" ({self.boundary_color}, thickness={self.boundary_thickness})" if self.show_boundaries else ""))
+    return "\n".join(lines)
+```
+
+# ──────────────────────────────────────────────
+
+# Processing Result
+
+# ──────────────────────────────────────────────
+
+class ProcessingResult:
+def **init**(self):
+self.raw_image: np.ndarray | None = None
+self.cropped_image: np.ndarray | None = None
+self.flattened_image: np.ndarray | None = None
+self.preprocessed_image: np.ndarray | None = None
+self.label_image: np.ndarray | None = None
+self.threshold_values: list[float] = []
+self.group_percentages: list[float] = []
+self.source_info: str = “”
+self.data_unit: str | None = None
+self.xy_unit: str | None = None
+self.x_total: float | None = None
+self.y_total: float | None = None
+self.afm_backend: str | None = None
+self.afm_metrics: dict = {}
+self.error: str | None = None
+
+```
+@property
+def success(self) -> bool:
+    return self.error is None and self.label_image is not None
+
+def stats_summary(self) -> str:
+    if self.preprocessed_image is None:
+        return "No data processed yet."
+    vals = self.preprocessed_image[np.isfinite(self.preprocessed_image)]
+    unit = f" {self.data_unit}" if self.data_unit else ""
+    lines = [
+        "📊 **Statistics**",
+        f"- Shape: {self.preprocessed_image.shape[1]} x {self.preprocessed_image.shape[0]} px",
+        f"- Mean: {float(np.mean(vals)):.6g}{unit}",
+        f"- Std:  {float(np.std(vals)):.6g}{unit}",
+        f"- Min:  {float(np.min(vals)):.6g}{unit}",
+        f"- Max:  {float(np.max(vals)):.6g}{unit}",
+    ]
+    if self.xy_unit and self.x_total and self.y_total:
+        lines.append(f"- Scan size: {self.x_total:.4g} x {self.y_total:.4g} {self.xy_unit}")
+    if self.threshold_values:
+        thr_str = ", ".join(f"{t:.6g}{unit}" for t in self.threshold_values)
+        lines.append(f"- Thresholds: {thr_str}")
+    if self.group_percentages:
+        for i, pct in enumerate(self.group_percentages):
+            lines.append(f"  Group {i}: {pct:.2f}%")
+    if self.afm_metrics:
+        for k, v in self.afm_metrics.items():
+            lines.append(f"- AFM {k}: {v:.6g}{unit}" if isinstance(v, (int, float)) else f"- AFM {k}: {v}")
+    return "\n".join(lines)
+```
+
+# ──────────────────────────────────────────────
+
+# AFMProcessor
+
+# ──────────────────────────────────────────────
+
+class AFMProcessor:
+“”“Pure processing logic, no tkinter dependencies.”””
+
+```
+# ── I/O ──────────────────────────────────
+
+def load_image(self, path: str, channel: str = "") -> ProcessingResult:
+    result = ProcessingResult()
+    try:
+        arr, source_info = self._load_array_from_path(path, channel)
+        result.raw_image = self._to_2d_float(arr)
+        result.source_info = source_info or ""
+    except Exception as e:
+        result.error = str(e)
+    return result
+
+def _load_array_from_path(self, path: str, channel: str = ""):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        return np.load(path), None
+    if ext in [".csv", ".txt"]:
+        return np.loadtxt(path, delimiter="," if ext == ".csv" else None), None
+    if self._is_bruker_candidate(path):
+        return self._load_spm_file(path, channel)
+    return skio.imread(path), None
+
+def _is_bruker_candidate(self, path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext == ".spm" or (len(ext) == 4 and ext[1:].isdigit())
+
+def _load_spm_file(self, path: str, channel: str = ""):
+    errors = []
+    if HAS_NANOSCOPE:
+        try:
+            return self._load_bruker_with_nanoscope(path, channel)
+        except Exception as e:
+            errors.append(f"nanoscope: {e}")
+    if HAS_PYSPM:
+        try:
+            return self._load_bruker_with_pyspm(path, channel)
+        except Exception as e:
+            errors.append(f"pySPM: {e}")
+    if not HAS_NANOSCOPE and not HAS_PYSPM:
+        raise ImportError("Loading Bruker AFM files requires nanoscope or pySPM.")
+    raise RuntimeError("Failed to load Bruker AFM file. " + " | ".join(errors))
+
+def get_spm_channels(self, path: str) -> list[str]:
+    if not self._is_bruker_candidate(path):
+        return []
+    names = []
+    if HAS_NANOSCOPE and NanoscopeImageFile is not None:
+        try:
+            with NanoscopeImageFile(path) as f:
+                names = [str(n) for n in getattr(f, "channels_data_types_desc", [])]
+        except Exception:
+            pass
+    if not names and HAS_PYSPM:
+        try:
+            bruker = pySPM.Bruker(path)
+            names = [str(n) for n in bruker.list_channels()]
+        except Exception:
+            pass
+    return names
+
+def choose_default_channel(self, channel_names: list[str]) -> str | None:
+    preferred = [
+        "Height Sensor", "Height", "ZSensor", "Z Sensor", "Topography",
+        "Height Trace", "Topography Trace",
+    ]
+    lowered = {str(n).strip().lower(): n for n in channel_names}
+    for p in preferred:
+        if p.lower() in lowered:
+            return lowered[p.lower()]
+    for n in channel_names:
+        ln = str(n).lower()
+        if "height" in ln or "topography" in ln or "z" in ln:
+            return n
+    return channel_names[0] if channel_names else None
+
+def _load_bruker_with_nanoscope(self, path: str, channel: str = ""):
+    with NanoscopeImageFile(path) as f:
+        channel_names = [str(n) for n in getattr(f, "channels_data_types_desc", [])]
+        if not channel_names:
+            raise ValueError("No channels found.")
+        chosen = channel if channel in channel_names else self.choose_default_channel(channel_names)
+        idx = channel_names.index(str(chosen))
+        ch = f[idx]
+        data, attr = self._extract_2d_from_channel(ch)
+        metrics = {}
+        for key in ["rms", "zrange", "mean", "min", "max"]:
+            try:
+                v = getattr(ch, key)
+                if v is not None:
+                    metrics[key] = float(v)
+            except Exception:
+                pass
+    source = f"Backend: nanoscope | Channel: {chosen} | Attr: {attr}"
+    return np.asarray(data), source
+
+def _load_bruker_with_pyspm(self, path: str, channel: str = ""):
+    bruker = pySPM.Bruker(path)
+    channel_names = self.get_spm_channels(path)
+    chosen = channel if channel in channel_names else self.choose_default_channel(channel_names)
+    if not chosen:
+        raise ValueError("No readable channel found.")
+    image_obj = bruker.get_channel(chosen)
+    if image_obj is None:
+        raise RuntimeError(f"Failed to read channel '{chosen}'")
+    pixels = getattr(image_obj, "pixels", None)
+    if pixels is None:
+        raise ValueError(f"Channel '{chosen}' has no pixel data.")
+    source = f"Backend: pySPM | Channel: {chosen}"
+    return np.asarray(pixels), source
+
+def _extract_2d_from_channel(self, ch):
+    for name in ["data", "image", "pixels", "map", "values", "raw", "height", "z"]:
+        if not hasattr(ch, name):
+            continue
+        try:
+            arr = np.asarray(getattr(ch, name))
+            if arr.ndim == 2 and arr.size > 0 and np.issubdtype(arr.dtype, np.number):
+                return arr, name
+        except Exception:
+            pass
+    for name, obj in getattr(ch, "__dict__", {}).items():
+        try:
+            arr = np.asarray(obj)
+            if arr.ndim == 2 and arr.size > 0 and np.issubdtype(arr.dtype, np.number):
+                return arr, f"__dict__.{name}"
+        except Exception:
+            pass
+    raise ValueError("Cannot find 2D numeric array in channel.")
+
+def _to_2d_float(self, arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        out = arr.astype(np.float32)
+    elif arr.ndim == 3:
+        if arr.shape[2] in [3, 4]:
+            out = np.mean(arr[..., :3].astype(np.float32), axis=2)
+        else:
+            out = np.mean(arr.astype(np.float32), axis=0)
+    else:
+        raise ValueError(f"Unsupported array shape: {arr.shape}")
+    if not np.isfinite(out).all():
+        valid = out[np.isfinite(out)]
+        fill = float(valid.mean()) if valid.size else 0.0
+        out = np.nan_to_num(out, nan=fill, posinf=fill, neginf=fill)
+    return out.astype(np.float32)
+
+# ── Pipeline ──────────────────────────────
+
+def run_pipeline(self, raw_image: np.ndarray, params: ProcessingParams) -> ProcessingResult:
+    result = ProcessingResult()
+    try:
+        result.raw_image = raw_image
+        result.cropped_image = self.crop(raw_image, params)
+        result.flattened_image = self.flatten(result.cropped_image, params)
+        result.preprocessed_image = self.preprocess(result.flattened_image, params)
+        result.label_image, result.threshold_values = self.threshold(result.preprocessed_image, params)
+        if params.bp_enable:
+            result.label_image = self.replace_small_regions(
+                result.label_image, params.bp_min_region_size
+            )
+        result.group_percentages = self.compute_group_percentages(result.label_image)
+    except Exception as e:
+        result.error = str(e)
+    return result
+
+# ── Crop ──────────────────────────────────
+
+def crop(self, image: np.ndarray, params: ProcessingParams) -> np.ndarray:
+    if not params.crop_enable:
+        return image.copy()
+    h, w = image.shape
+    x = max(0, min(params.crop_x, w - 1))
+    y = max(0, min(params.crop_y, h - 1))
+    x2 = min(w, x + max(1, params.crop_w))
+    y2 = min(h, y + max(1, params.crop_h))
+    if x >= x2 or y >= y2:
+        raise ValueError("Invalid crop range")
+    return image[y:y2, x:x2].copy()
+
+# ── Flattening ────────────────────────────
+
+def flatten(self, image: np.ndarray, params: ProcessingParams) -> np.ndarray:
+    out = image.astype(np.float32).copy()
+    if not params.flatten_orders:
+        return out
+    mode = "line" if params.flatten_mode == "line" else "global"
+    for order in sorted(set(params.flatten_orders)):
+        out = self._apply_flatten_order(out, order, mode, params)
+    return out
+
+def _apply_flatten_order(self, image, order, mode, params):
+    img = image.astype(np.float64)
+    if mode == "line":
+        out = np.empty_like(img)
+        for r in range(img.shape[0]):
+            if params.flatten_robust:
+                surface = self._fit_line_robust(img[r, :], order, params.flatten_robust_k)
+            else:
+                surface = self._fit_line(img[r, :], order)
+            out[r, :] = img[r, :] - surface
+        return out.astype(np.float32)
+    surface = self._fit_surface(img, order)
+    return (img - surface).astype(np.float32)
+
+def _fit_surface(self, image, order):
+    if order == 0:
+        return np.full_like(image, float(np.nanmean(image)))
+    y_idx, x_idx = np.indices(image.shape, dtype=np.float64)
+    x, y, z = x_idx.ravel(), y_idx.ravel(), image.ravel()
+    finite = np.isfinite(z)
+    x, y, z = x[finite], y[finite], z[finite]
+    x0, y0 = x.mean(), y.mean()
+    sx = max(np.abs(x - x0).max(), 1.0)
+    sy = max(np.abs(y - y0).max(), 1.0)
+    xn, yn = (x - x0) / sx, (y - y0) / sy
+    terms, powers = [], []
+    for deg in range(order + 1):
+        for i in range(deg + 1):
+            j = deg - i
+            powers.append((i, j))
+            terms.append((xn ** i) * (yn ** j))
+    A = np.vstack(terms).T
+    coeffs, *_ = np.linalg.lstsq(A, z, rcond=None)
+    fy, fx = np.indices(image.shape, dtype=np.float64)
+    fxn, fyn = (fx - x0) / sx, (fy - y0) / sy
+    surface = np.zeros_like(image, dtype=np.float64)
+    for c, (i, j) in zip(coeffs, powers):
+        surface += c * (fxn ** i) * (fyn ** j)
+    return surface
+
+def _fit_line(self, line, order):
+    line = np.asarray(line, dtype=np.float64)
+    if order == 0:
+        return np.full_like(line, float(np.nanmean(line)))
+    finite = np.isfinite(line)
+    if not np.any(finite):
+        return np.full_like(line, np.nan)
+    x = np.arange(line.size, dtype=np.float64)
+    x_v, z_v = x[finite], line[finite]
+    x0, sx = x_v.mean(), max(np.abs(x_v - x_v.mean()).max(), 1.0)
+    coeffs = np.polyfit((x_v - x0) / sx, z_v, deg=min(order, x_v.size - 1))
+    return np.polyval(coeffs, (x - x0) / sx)
+
+def _fit_line_robust(self, line, order, k=3.5):
+    baseline = self._fit_line(line, order)
+    finite = np.isfinite(line) & np.isfinite(baseline)
+    if not np.any(finite):
+        return baseline
+    resid = line[finite] - baseline[finite]
+    med = float(np.median(resid))
+    mad = float(np.median(np.abs(resid - med)))
+    if not np.isfinite(mad) or mad <= 0:
+        return baseline
+    sigma = 1.4826 * mad
+    keep = np.abs(resid - med) <= k * sigma
+    if keep.sum() < max(2, order + 1):
+        return baseline
+    x = np.arange(line.size, dtype=np.float64)
+    x_v = x[finite][keep]
+    z_v = line[finite][keep]
+    x0, sx = x_v.mean(), max(np.abs(x_v - x_v.mean()).max(), 1.0)
+    coeffs = np.polyfit((x_v - x0) / sx, z_v, deg=min(order, x_v.size - 1))
+    return np.polyval(coeffs, (x - x0) / sx)
+
+# ── Pre-Processing ────────────────────────
+
+def preprocess(self, image: np.ndarray, params: ProcessingParams) -> np.ndarray:
+    out = image.astype(np.float32).copy()
+    aliases = {
+        "median": "median", "gaussian": "gaussian",
+        "total variation": "tv", "tv": "tv",
+        "wavelet": "wavelet", "wavelet denoising": "wavelet",
+    }
+    for name in params.pp_order:
+        method = aliases.get(name.lower())
+        if method == "median" and params.pp_median_enable:
+            ksize = params.pp_median_size
+            if ksize % 2 == 0:
+                ksize += 1
+            out = ndi.median_filter(out, size=ksize)
+        elif method == "gaussian" and params.pp_gaussian_enable:
+            out = gaussian(out, sigma=params.pp_gaussian_sigma,
+                           preserve_range=params.pp_gaussian_preserve_range).astype(np.float32)
+        elif method == "tv" and params.pp_tv_enable:
+            out = denoise_tv_chambolle(out, weight=max(1e-8, params.pp_tv_weight),
+                                       eps=max(1e-12, params.pp_tv_eps),
+                                       max_num_iter=max(1, params.pp_tv_max_num_iter)).astype(np.float32)
+        elif method == "wavelet" and params.pp_wavelet_enable:
+            out = denoise_wavelet(out, sigma=params.pp_wavelet_sigma,
+                                  wavelet=params.pp_wavelet_wavelet,
+                                  mode=params.pp_wavelet_mode,
+                                  rescale_sigma=params.pp_wavelet_rescale_sigma,
+                                  channel_axis=None).astype(np.float32)
+    return out
+
+# ── Threshold ─────────────────────────────
+
+def threshold(self, image: np.ndarray, params: ProcessingParams):
+    data = image.astype(np.float32)
+    count = max(1, params.threshold_count)
+    groups = count + 1
+
+    if params.use_manual_thresholds and params.manual_thresholds:
+        thr = sorted(params.manual_thresholds)
+        labels = np.digitize(data, bins=thr).astype(np.int32)
+        return labels, thr
+
+    method = params.threshold_method.strip().lower()
+    if method == "otsu":
+        thr = [float(threshold_otsu(data))]
+    elif method == "multi-otsu":
+        thr = [float(x) for x in threshold_multiotsu(data, classes=groups)]
+    elif method == "k-means":
+        flat = data.reshape(-1, 1)
+        km = KMeans(n_clusters=groups,
+                    random_state=params.kmeans_random_state,
+                    n_init=params.kmeans_n_init)
+        km.fit(flat)
+        centers = np.sort(km.cluster_centers_.flatten())
+        thr = self._centers_to_thresholds(centers)
+    elif method == "gmm":
+        flat = data.reshape(-1, 1)
+        gm = GaussianMixture(n_components=groups,
+                             covariance_type=params.gmm_covariance_type,
+                             random_state=params.gmm_random_state)
+        gm.fit(flat)
+        means = np.sort(gm.means_.flatten())
+        thr = self._centers_to_thresholds(means)
+    elif method == "equal interval":
+        low = float(np.percentile(data, params.equal_interval_percentile_low))
+        high = float(np.percentile(data, params.equal_interval_percentile_high))
+        thr = [float(x) for x in np.linspace(low, high, groups + 1)[1:-1]]
+    else:
+        raise ValueError(f"Unknown threshold method: {params.threshold_method}")
+
+    labels = np.digitize(data, bins=thr).astype(np.int32)
+    return labels, thr
+
+def _centers_to_thresholds(self, centers):
+    centers = np.asarray(centers, dtype=np.float32)
+    if centers.size <= 1:
+        return []
+    return [float(x) for x in 0.5 * (centers[:-1] + centers[1:])]
+
+# ── Binary Processing ─────────────────────
+
+def replace_small_regions(self, label_img: np.ndarray, max_size: int) -> np.ndarray:
+    out = label_img.copy()
+    structure = np.ones((3, 3), dtype=np.uint8)
+    for val in np.unique(out):
+        mask = out == val
+        cc, n_cc = ndi.label(mask, structure=structure)
+        for idx in range(1, n_cc + 1):
+            region = cc == idx
+            if int(region.sum()) <= max_size:
+                dilated = ndi.binary_dilation(region, structure=structure)
+                border = dilated & (~region)
+                neighbors = out[border]
+                neighbors = neighbors[neighbors != val]
+                if neighbors.size == 0:
+                    continue
+                replacement = mode(neighbors, keepdims=False).mode
+                out[region] = int(replacement)
+    return out.astype(np.int32)
+
+# ── Stats ─────────────────────────────────
+
+def compute_group_percentages(self, label_img: np.ndarray) -> list[float]:
+    if label_img is None:
+        return []
+    labels = label_img.ravel().astype(np.int32)
+    groups = int(labels.max()) + 1 if labels.size else 0
+    counts = np.array([(labels == i).sum() for i in range(groups)], dtype=np.int64)
+    total = max(1, int(counts.sum()))
+    return [100.0 * c / total for c in counts]
+
+def suggest_thresholds(self, image: np.ndarray, params: ProcessingParams) -> list[float]:
+    """Run pipeline up to threshold stage and return suggested threshold values."""
+    cropped = self.crop(image, params)
+    flattened = self.flatten(cropped, params)
+    preprocessed = self.preprocess(flattened, params)
+    _, thr = self.threshold(preprocessed, params)
+    return thr
+```
+
+“””
+AFM Renderer - matplotlib figure generation (no tkinter)
+Returns Figure objects or saves to bytes/files.
+“””
+
+import io
+import numpy as np
+import matplotlib
+matplotlib.use(“Agg”)
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib import colormaps
+from matplotlib import colors as mcolors
+
+from .processor import ProcessingParams, ProcessingResult
+
+class AFMRenderer:
+
+```
+def render_raw(
+    self,
+    result: ProcessingResult,
+    params: ProcessingParams,
+    figsize: tuple = (5, 5),
+) -> Figure:
+    img = result.preprocessed_image
+    if img is None:
+        raise ValueError("No preprocessed image available.")
+
+    vmin = float(np.min(img))
+    vmax = float(np.max(img))
+    if params.raw_min_enable:
+        vmin = params.raw_vmin
+    if params.raw_max_enable:
+        vmax = params.raw_vmax
+    if vmax <= vmin:
+        vmax = vmin + 1e-9
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(img, cmap=params.raw_colormap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    ax.set_title("Flattened / Preprocessed")
+    self._apply_axes(ax, img.shape, result)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if result.data_unit:
+        cbar.set_label(result.data_unit)
+    fig.tight_layout()
+    return fig
+
+def render_threshold(
+    self,
+    result: ProcessingResult,
+    params: ProcessingParams,
+    figsize: tuple = (5, 5),
+) -> Figure:
+    lbl = result.label_image
+    if lbl is None:
+        raise ValueError("No threshold result available.")
+
+    groups = int(np.max(lbl)) + 1
+    vmax = max(1, groups - 1)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(lbl, cmap=params.threshold_colormap, vmin=0, vmax=vmax, interpolation="nearest")
+
+    if params.show_boundaries and groups > 1:
+        levels = np.arange(0.5, groups - 0.5 + 1e-9, 1.0)
+        ax.contour(lbl, levels=levels,
+                   colors=params.boundary_color,
+                   linewidths=max(0.1, params.boundary_thickness))
+
+    ax.set_title("Threshold Result")
+    self._apply_axes(ax, lbl.shape, result)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_ticks(np.arange(groups))
+    fig.tight_layout()
+    return fig
+
+def render_raw_histogram(
+    self,
+    result: ProcessingResult,
+    params: ProcessingParams,
+    figsize: tuple = (6, 3),
+) -> Figure:
+    img = result.preprocessed_image
+    if img is None:
+        raise ValueError("No preprocessed image available.")
+
+    values = img.ravel().astype(np.float32)
+    values = values[np.isfinite(values)]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.hist(values, bins=256, color="#4c8cbf", alpha=0.8)
+
+    mean_val = float(np.mean(values))
+    std_val = float(np.std(values))
+    ax.axvline(mean_val, linestyle="-", linewidth=1.4, color="red", label="Mean")
+    ax.axvline(mean_val - std_val, linestyle=":", linewidth=1.2, color="orange", label="Mean ± Std")
+    ax.axvline(mean_val + std_val, linestyle=":", linewidth=1.2, color="orange")
+
+    unit = f" ({result.data_unit})" if result.data_unit else ""
+    for i, t in enumerate(result.threshold_values):
+        ax.axvline(t, linestyle="--", linewidth=1.2, label=f"T{i+1}={t:.4g}")
+
+    stats_text = f"Mean = {mean_val:.4g}{unit}\nStd = {std_val:.4g}{unit}"
+    ax.text(0.98, 0.98, stats_text, transform=ax.transAxes,
+            ha="right", va="top", fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.75))
+
+    ax.set_title("Raw / Preprocessed Histogram")
+    ax.set_xlabel(f"Intensity{unit}")
+    ax.set_ylabel("Count")
+    ax.legend(fontsize=8, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+def render_threshold_histogram(
+    self,
+    result: ProcessingResult,
+    params: ProcessingParams,
+    figsize: tuple = (6, 3),
+) -> Figure:
+    lbl = result.label_image
+    if lbl is None:
+        raise ValueError("No threshold result available.")
+
+    labels = lbl.ravel().astype(np.int32)
+    groups = int(labels.max()) + 1 if labels.size else 0
+    counts = np.array([(labels == i).sum() for i in range(groups)], dtype=np.int64)
+    total = max(1, int(counts.sum()))
+    percentages = [100.0 * c / total for c in counts]
+
+    cmap = colormaps[params.threshold_colormap]
+    norm = mcolors.Normalize(vmin=0, vmax=max(1, groups - 1))
+    colors = [cmap(norm(i)) for i in range(groups)]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    xs = np.arange(groups)
+    bars = ax.bar(xs, counts, width=0.8, color=colors)
+    ymax = counts.max() if counts.size else 1
+    ax.set_ylim(0, ymax * 1.18 + 1)
+    ax.set_xticks(xs)
+    ax.set_title("Threshold Group Histogram")
+    ax.set_xlabel("Group Label")
+    ax.set_ylabel("Count")
+
+    for bar, pct in zip(bars, percentages):
+        ax.text(bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height() + max(1, ymax * 0.02),
+                f"{pct:.1f}%", ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    return fig
+
+def render_combined(
+    self,
+    result: ProcessingResult,
+    params: ProcessingParams,
+    show_raw: bool = True,
+    show_threshold: bool = True,
+    show_raw_hist: bool = False,
+    show_threshold_hist: bool = False,
+) -> Figure:
+    """Render multiple panels in one figure."""
+    panels = []
+    if show_raw and result.preprocessed_image is not None:
+        panels.append("raw")
+    if show_threshold and result.label_image is not None:
+        panels.append("threshold")
+    if show_raw_hist and result.preprocessed_image is not None:
+        panels.append("raw_hist")
+    if show_threshold_hist and result.label_image is not None:
+        panels.append("threshold_hist")
+
+    n = len(panels)
+    if n == 0:
+        raise ValueError("Nothing to render.")
+
+    cols = min(n, 2)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows))
+    if n == 1:
+        axes = [axes]
+    else:
+        axes = list(np.array(axes).flatten())
+
+    for ax, panel in zip(axes, panels):
+        if panel == "raw":
+            self._draw_raw_on_ax(ax, result, params)
+        elif panel == "threshold":
+            self._draw_threshold_on_ax(ax, result, params)
+        elif panel == "raw_hist":
+            self._draw_raw_hist_on_ax(ax, result)
+        elif panel == "threshold_hist":
+            self._draw_threshold_hist_on_ax(ax, result, params)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    fig.tight_layout()
+    return fig
+
+# ── Helpers ──────────────────────────────
+
+def _draw_raw_on_ax(self, ax, result, params):
+    img = result.preprocessed_image
+    vmin = float(np.min(img))
+    vmax = float(np.max(img))
+    if params.raw_min_enable:
+        vmin = params.raw_vmin
+    if params.raw_max_enable:
+        vmax = params.raw_vmax
+    if vmax <= vmin:
+        vmax = vmin + 1e-9
+    im = ax.imshow(img, cmap=params.raw_colormap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    ax.set_title("Flattened / Preprocessed")
+    self._apply_axes(ax, img.shape, result)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if result.data_unit:
+        cbar.set_label(result.data_unit)
+
+def _draw_threshold_on_ax(self, ax, result, params):
+    lbl = result.label_image
+    groups = int(np.max(lbl)) + 1
+    vmax = max(1, groups - 1)
+    im = ax.imshow(lbl, cmap=params.threshold_colormap, vmin=0, vmax=vmax, interpolation="nearest")
+    if params.show_boundaries and groups > 1:
+        levels = np.arange(0.5, groups - 0.5 + 1e-9, 1.0)
+        ax.contour(lbl, levels=levels,
+                   colors=params.boundary_color,
+                   linewidths=max(0.1, params.boundary_thickness))
+    ax.set_title("Threshold Result")
+    self._apply_axes(ax, lbl.shape, result)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_ticks(np.arange(groups))
+
+def _draw_raw_hist_on_ax(self, ax, result):
+    values = result.preprocessed_image.ravel().astype(np.float32)
+    values = values[np.isfinite(values)]
+    ax.hist(values, bins=256, color="#4c8cbf", alpha=0.8)
+    mean_val = float(np.mean(values))
+    std_val = float(np.std(values))
+    ax.axvline(mean_val, linestyle="-", linewidth=1.4, color="red", label="Mean")
+    ax.axvline(mean_val - std_val, linestyle=":", linewidth=1.2, color="orange")
+    ax.axvline(mean_val + std_val, linestyle=":", linewidth=1.2, color="orange")
+    for i, t in enumerate(result.threshold_values):
+        ax.axvline(t, linestyle="--", linewidth=1.0, label=f"T{i+1}")
+    unit = f" ({result.data_unit})" if result.data_unit else ""
+    ax.set_title("Intensity Histogram")
+    ax.set_xlabel(f"Intensity{unit}")
+    ax.set_ylabel("Count")
+    ax.legend(fontsize=7)
+
+def _draw_threshold_hist_on_ax(self, ax, result, params):
+    labels = result.label_image.ravel().astype(np.int32)
+    groups = int(labels.max()) + 1 if labels.size else 0
+    counts = np.array([(labels == i).sum() for i in range(groups)], dtype=np.int64)
+    total = max(1, int(counts.sum()))
+    cmap = colormaps[params.threshold_colormap]
+    norm = mcolors.Normalize(vmin=0, vmax=max(1, groups - 1))
+    colors = [cmap(norm(i)) for i in range(groups)]
+    xs = np.arange(groups)
+    bars = ax.bar(xs, counts, width=0.8, color=colors)
+    ymax = counts.max() if counts.size else 1
+    ax.set_ylim(0, ymax * 1.18 + 1)
+    ax.set_xticks(xs)
+    ax.set_title("Group Histogram")
+    ax.set_xlabel("Group Label")
+    ax.set_ylabel("Count")
+    for bar, c in zip(bars, counts):
+        pct = 100.0 * c / total
+        ax.text(bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height() + max(1, ymax * 0.02),
+                f"{pct:.1f}%", ha="center", va="bottom", fontsize=8)
+
+def _apply_axes(self, ax, shape, result: ProcessingResult):
+    h, w = shape[:2]
+    xticks = np.linspace(0, max(0, w - 1), num=min(6, max(2, w)))
+    yticks = np.linspace(0, max(0, h - 1), num=min(6, max(2, h)))
+    ax.set_xticks(xticks)
+    ax.set_yticks(yticks)
+
+    unit = result.xy_unit
+    x_total = result.x_total
+    y_total = result.y_total
+
+    if unit and x_total and y_total and w > 1 and h > 1:
+        # Auto-scale display unit
+        max_total = max(abs(x_total), abs(y_total))
+        if unit == "nm" and max_total >= 1000:
+            disp_unit, factor = "um", 1000.0
+        else:
+            disp_unit, factor = unit, 1.0
+        xvals = np.linspace(0, x_total / factor, num=len(xticks))
+        yvals = np.linspace(0, y_total / factor, num=len(yticks))
+        ax.set_xticklabels([f"{v:.3g}" for v in xvals])
+        ax.set_yticklabels([f"{v:.3g}" for v in yvals])
+        ax.set_xlabel(f"X ({disp_unit})")
+        ax.set_ylabel(f"Y ({disp_unit})")
+    else:
+        ax.set_xticklabels([f"{int(round(x))}" for x in xticks])
+        ax.set_yticklabels([f"{int(round(y))}" for y in yticks])
+        ax.set_xlabel("X (pixel)")
+        ax.set_ylabel("Y (pixel)")
+
+def fig_to_pil(self, fig: Figure):
+    """Convert matplotlib Figure to PIL Image for Gradio."""
+    from PIL import Image
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    buf.seek(0)
+    plt.close(fig)
+    return Image.open(buf).copy()
+```
+
+“””
+AFM Agent Tools
+All tools the LLM can call, with JSON schema for system-prompt-based tool calling.
+“””
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+# ──────────────────────────────────────────────
+
+# Tool Result
+
+# ──────────────────────────────────────────────
+
+@dataclass
+class ToolResult:
+success: bool
+message: str
+data: Any = None          # numpy arrays, figures, etc.
+render_type: str = “text” # “text” | “image” | “images” | “stats”
+
+# ──────────────────────────────────────────────
+
+# Tool Schemas (for system prompt)
+
+# ──────────────────────────────────────────────
+
+TOOL_SCHEMAS = [
+{
+“name”: “load_image”,
+“description”: “Load an AFM image file. Supported: .spm, .000-.009, .png, .tif, .npy, .csv, .txt”,
+“parameters”: {
+“file_path”: “string - absolute or relative path to the image file”,
+“channel”: “string (optional) - AFM channel name e.g. ‘Height Sensor’. Auto-selected if omitted.”,
+}
+},
+{
+“name”: “list_channels”,
+“description”: “List available AFM channels in a Bruker SPM file.”,
+“parameters”: {
+“file_path”: “string - path to SPM file”,
+}
+},
+{
+“name”: “process_image”,
+“description”: (
+“Run the full processing pipeline: crop → flatten → preprocess → threshold → binary processing. “
+“Only specify parameters you want to change. Unspecified parameters keep their current values.”
+),
+“parameters”: {
+# Crop
+“crop_enable”: “boolean (optional)”,
+“crop_x”: “integer (optional) - crop start X pixel”,
+“crop_y”: “integer (optional) - crop start Y pixel”,
+“crop_w”: “integer (optional) - crop width in pixels”,
+“crop_h”: “integer (optional) - crop height in pixels”,
+# Flattening
+“flatten_mode”: “string (optional) - ‘global’ or ‘line’”,
+“flatten_orders”: “list[int] (optional) - polynomial orders e.g. [1, 2]. Empty list disables flattening.”,
+“flatten_robust”: “boolean (optional) - use robust line fitting”,
+“flatten_robust_k”: “float (optional) - robust fitting k factor, default 3.5”,
+# Pre-processing
+“pp_order”: “list[str] (optional) - processing order e.g. [‘median’,‘gaussian’,‘tv’,‘wavelet’]”,
+“pp_median_enable”: “boolean (optional)”,
+“pp_median_size”: “integer (optional) - kernel size, default 3”,
+“pp_gaussian_enable”: “boolean (optional)”,
+“pp_gaussian_sigma”: “float (optional) - default 1.0”,
+“pp_gaussian_preserve_range”: “boolean (optional) - default true”,
+“pp_tv_enable”: “boolean (optional)”,
+“pp_tv_weight”: “float (optional) - default 0.1”,
+“pp_tv_eps”: “float (optional) - default 0.0002”,
+“pp_tv_max_num_iter”: “integer (optional) - default 200”,
+“pp_wavelet_enable”: “boolean (optional)”,
+“pp_wavelet_sigma”: “float (optional) - default 0.08”,
+“pp_wavelet_wavelet”: “string (optional) - e.g. ‘db2’, ‘haar’”,
+“pp_wavelet_mode”: “string (optional) - ‘soft’ or ‘hard’”,
+“pp_wavelet_rescale_sigma”: “boolean (optional) - default true”,
+# Threshold
+“threshold_method”: “string (optional) - ‘Otsu’|‘Multi-Otsu’|‘K-means’|‘GMM’|‘Equal Interval’”,
+“threshold_count”: “integer (optional) - number of thresholds (groups = count+1)”,
+“use_manual_thresholds”: “boolean (optional)”,
+“manual_thresholds”: “list[float] (optional) - e.g. [0.12, 0.35]”,
+“kmeans_random_state”: “integer (optional) - default 0”,
+“kmeans_n_init”: “integer (optional) - default 10”,
+“gmm_random_state”: “integer (optional) - default 0”,
+“gmm_covariance_type”: “string (optional) - ‘full’|‘tied’|‘diag’|‘spherical’”,
+“equal_interval_percentile_low”: “float (optional) - default 0.0”,
+“equal_interval_percentile_high”: “float (optional) - default 100.0”,
+# Binary processing
+“bp_enable”: “boolean (optional)”,
+“bp_min_region_size”: “integer (optional) - replace regions <= this size”,
+}
+},
+{
+“name”: “show_image”,
+“description”: “Display the processed image(s). Can show raw/preprocessed image, threshold result, and/or histograms.”,
+“parameters”: {
+“show_raw”: “boolean (optional) - show flattened/preprocessed image, default true”,
+“show_threshold”: “boolean (optional) - show threshold label image, default true”,
+“show_raw_hist”: “boolean (optional) - show intensity histogram, default false”,
+“show_threshold_hist”: “boolean (optional) - show group bar chart, default false”,
+# Display params
+“raw_colormap”: “string (optional) - colormap for raw image: ‘viridis’|‘gray’|‘plasma’|‘inferno’|‘magma’|‘turbo’|‘jet’”,
+“threshold_colormap”: “string (optional) - colormap for threshold image”,
+“raw_min_enable”: “boolean (optional) - use manual vmin”,
+“raw_max_enable”: “boolean (optional) - use manual vmax”,
+“raw_vmin”: “float (optional) - manual display minimum value”,
+“raw_vmax”: “float (optional) - manual display maximum value”,
+“show_boundaries”: “boolean (optional) - overlay group boundaries”,
+“boundary_color”: “string (optional) - ‘red’|‘yellow’|‘cyan’|‘white’|‘black’”,
+“boundary_thickness”: “float (optional) - contour line thickness, default 0.8”,
+}
+},
+{
+“name”: “get_statistics”,
+“description”: “Get statistical summary of the current processed image: mean, std, min, max, group percentages, scan size, thresholds.”,
+“parameters”: {}
+},
+{
+“name”: “suggest_thresholds”,
+“description”: “Compute and return suggested threshold values using the current method without applying them.”,
+“parameters”: {
+“threshold_method”: “string (optional) - override current method for suggestion”,
+“threshold_count”: “integer (optional) - override current count”,
+}
+},
+{
+“name”: “get_parameters”,
+“description”: “Show the current parameter state. Use in debug mode or when user asks to see/check parameters.”,
+“parameters”: {}
+},
+{
+“name”: “save_result”,
+“description”: “Save the current result image or histogram to a file.”,
+“parameters”: {
+“save_type”: “string - ‘raw_image’|‘threshold_image’|‘raw_histogram’|‘threshold_histogram’|‘all’”,
+“output_path”: “string - output file path (png or pdf)”,
+}
+},
+{
+“name”: “save_parameters”,
+“description”: “Save current parameters to a JSON file for later reuse.”,
+“parameters”: {
+“output_path”: “string - output .json file path”,
+}
+},
+{
+“name”: “load_parameters”,
+“description”: “Load parameters from a previously saved JSON file.”,
+“parameters”: {
+“file_path”: “string - path to .json parameter file”,
+}
+},
+{
+“name”: “export_summary”,
+“description”: “Export a full processing summary (parameters + statistics) as a text file.”,
+“parameters”: {
+“output_path”: “string - output .txt file path”,
+}
+},
+{
+“name”: “export_histogram_csv”,
+“description”: “Export histogram data to CSV.”,
+“parameters”: {
+“output_path”: “string - output .csv file path”,
+}
+},
+]
+
+def get_tool_schema_text() -> str:
+“”“Return tool schemas formatted for the system prompt.”””
+lines = []
+for tool in TOOL_SCHEMAS:
+lines.append(f”### {tool[‘name’]}”)
+lines.append(f”Description: {tool[‘description’]}”)
+if tool[“parameters”]:
+lines.append(“Parameters:”)
+for k, v in tool[“parameters”].items():
+lines.append(f”  - {k}: {v}”)
+lines.append(””)
+return “\n”.join(lines)
+
+def get_tool_names() -> list[str]:
+return [t[“name”] for t in TOOL_SCHEMAS]
+
+“””
+Tool Executor
+Receives parsed tool calls from the agent and executes them using AFMProcessor + AFMRenderer.
+“””
+
+import json
+import os
+import csv
+import numpy as np
+from pathlib import Path
+
+from ..core.processor import AFMProcessor, ProcessingParams, ProcessingResult
+from ..core.renderer import AFMRenderer
+from .tool_definitions import ToolResult
+
+class ToolExecutor:
+
+```
+def __init__(self):
+    self.processor = AFMProcessor()
+    self.renderer = AFMRenderer()
+    self.params = ProcessingParams()
+    self.result = ProcessingResult()
+    self.current_file_path: str | None = None
+
+# ──────────────────────────────────────────
+# Dispatch
+# ──────────────────────────────────────────
+
+def execute(self, tool_name: str, arguments: dict) -> ToolResult:
+    handlers = {
+        "load_image": self._load_image,
+        "list_channels": self._list_channels,
+        "process_image": self._process_image,
+        "show_image": self._show_image,
+        "get_statistics": self._get_statistics,
+        "suggest_thresholds": self._suggest_thresholds,
+        "get_parameters": self._get_parameters,
+        "save_result": self._save_result,
+        "save_parameters": self._save_parameters,
+        "load_parameters": self._load_parameters,
+        "export_summary": self._export_summary,
+        "export_histogram_csv": self._export_histogram_csv,
+    }
+    handler = handlers.get(tool_name)
+    if handler is None:
+        return ToolResult(success=False, message=f"Unknown tool: {tool_name}")
+    try:
+        return handler(arguments)
+    except Exception as e:
+        return ToolResult(success=False, message=f"Tool '{tool_name}' failed: {e}")
+
+# ──────────────────────────────────────────
+# Tool Handlers
+# ──────────────────────────────────────────
+
+def _load_image(self, args: dict) -> ToolResult:
+    path = args.get("file_path", "")
+    if not path:
+        return ToolResult(success=False, message="file_path is required.")
+    if not os.path.exists(path):
+        return ToolResult(success=False, message=f"File not found: {path}")
+
+    channel = args.get("channel", "")
+    self.current_file_path = path
+
+    # Get available channels first for SPM files
+    channels = self.processor.get_spm_channels(path)
+    if channels and not channel:
+        channel = self.processor.choose_default_channel(channels) or ""
+        if channel:
+            self.params.selected_spm_channel = channel
+
+    load_result = self.processor.load_image(path, channel)
+    if load_result.error:
+        return ToolResult(success=False, message=f"Load failed: {load_result.error}")
+
+    self.result.raw_image = load_result.raw_image
+    self.result.source_info = load_result.source_info
+
+    h, w = load_result.raw_image.shape
+    msg = f"✅ Loaded: {os.path.basename(path)} | Size: {w} x {h} px"
+    if channel:
+        msg += f" | Channel: {channel}"
+    if channels:
+        msg += f"\nAvailable channels: {', '.join(channels)}"
+    if load_result.source_info:
+        msg += f"\nSource: {load_result.source_info}"
+    return ToolResult(success=True, message=msg)
+
+def _list_channels(self, args: dict) -> ToolResult:
+    path = args.get("file_path", self.current_file_path or "")
+    if not path:
+        return ToolResult(success=False, message="file_path is required.")
+    channels = self.processor.get_spm_channels(path)
+    if not channels:
+        return ToolResult(success=True, message="No AFM channels found (may not be a SPM file).")
+    return ToolResult(success=True, message=f"Channels in {os.path.basename(path)}:\n" +
+                      "\n".join(f"  {i}: {name}" for i, name in enumerate(channels)))
+
+def _process_image(self, args: dict) -> ToolResult:
+    if self.result.raw_image is None:
+        return ToolResult(success=False, message="No image loaded. Use load_image first.")
+
+    # Apply provided args to params
+    self._update_params(args)
+
+    pipeline_result = self.processor.run_pipeline(self.result.raw_image, self.params)
+    if pipeline_result.error:
+        return ToolResult(success=False, message=f"Processing failed: {pipeline_result.error}")
+
+    # Preserve metadata from load
+    pipeline_result.raw_image = self.result.raw_image
+    pipeline_result.source_info = self.result.source_info
+    pipeline_result.data_unit = self.result.data_unit
+    pipeline_result.xy_unit = self.result.xy_unit
+    pipeline_result.x_total = self.result.x_total
+    pipeline_result.y_total = self.result.y_total
+    pipeline_result.afm_backend = self.result.afm_backend
+    pipeline_result.afm_metrics = self.result.afm_metrics
+    self.result = pipeline_result
+
+    groups = int(np.max(self.result.label_image)) + 1
+    thr_str = ", ".join(f"{t:.6g}" for t in self.result.threshold_values)
+    msg = (f"✅ Processing complete\n"
+           f"- Method: {self.params.threshold_method}\n"
+           f"- Groups: {groups}\n"
+           f"- Thresholds: {thr_str}\n"
+           f"- Group percentages: " +
+           ", ".join(f"G{i}={p:.1f}%" for i, p in enumerate(self.result.group_percentages)))
+    return ToolResult(success=True, message=msg)
+
+def _show_image(self, args: dict) -> ToolResult:
+    if self.result.preprocessed_image is None and self.result.label_image is None:
+        return ToolResult(success=False, message="No processed result. Run process_image first.")
+
+    # Update display params only
+    display_keys = [
+        "raw_colormap", "threshold_colormap",
+        "raw_min_enable", "raw_max_enable", "raw_vmin", "raw_vmax",
+        "show_boundaries", "boundary_color", "boundary_thickness",
+    ]
+    for k in display_keys:
+        if k in args:
+            setattr(self.params, k, args[k])
+
+    show_raw = args.get("show_raw", True)
+    show_threshold = args.get("show_threshold", True)
+    show_raw_hist = args.get("show_raw_hist", False)
+    show_threshold_hist = args.get("show_threshold_hist", False)
+
+    try:
+        fig = self.renderer.render_combined(
+            self.result, self.params,
+            show_raw=show_raw,
+            show_threshold=show_threshold,
+            show_raw_hist=show_raw_hist,
+            show_threshold_hist=show_threshold_hist,
+        )
+        pil_image = self.renderer.fig_to_pil(fig)
+        return ToolResult(success=True, message="", data=pil_image, render_type="image")
+    except Exception as e:
+        return ToolResult(success=False, message=f"Render failed: {e}")
+
+def _get_statistics(self, args: dict) -> ToolResult:
+    if self.result.preprocessed_image is None:
+        return ToolResult(success=False, message="No processed data available.")
+    return ToolResult(success=True, message=self.result.stats_summary(), render_type="stats")
+
+def _suggest_thresholds(self, args: dict) -> ToolResult:
+    if self.result.raw_image is None:
+        return ToolResult(success=False, message="No image loaded.")
+    # Temporarily override if args provided
+    tmp_params = ProcessingParams.from_dict(self.params.to_dict())
+    if "threshold_method" in args:
+        tmp_params.threshold_method = args["threshold_method"]
+    if "threshold_count" in args:
+        tmp_params.threshold_count = int(args["threshold_count"])
+
+    thr = self.processor.suggest_thresholds(self.result.raw_image, tmp_params)
+    thr_str = ", ".join(f"{t:.6g}" for t in thr)
+    return ToolResult(
+        success=True,
+        message=f"💡 Suggested thresholds ({tmp_params.threshold_method}): {thr_str}\n"
+                f"To apply manually: use process_image with use_manual_thresholds=true, manual_thresholds=[{thr_str}]"
+    )
+
+def _get_parameters(self, args: dict) -> ToolResult:
+    return ToolResult(success=True, message=self.params.summary(), render_type="stats")
+
+def _save_result(self, args: dict) -> ToolResult:
+    save_type = args.get("save_type", "all")
+    output_path = args.get("output_path", "")
+    if not output_path:
+        return ToolResult(success=False, message="output_path is required.")
+
+    saved = []
+    base, ext = os.path.splitext(output_path)
+    if not ext:
+        ext = ".png"
+
+    def save_fig(fig, path):
+        fig.savefig(path, bbox_inches="tight", dpi=150)
+        import matplotlib.pyplot as plt
+        plt.close(fig)
+
+    if save_type in ("raw_image", "all") and self.result.preprocessed_image is not None:
+        p = f"{base}_raw{ext}" if save_type == "all" else output_path
+        save_fig(self.renderer.render_raw(self.result, self.params), p)
+        saved.append(p)
+
+    if save_type in ("threshold_image", "all") and self.result.label_image is not None:
+        p = f"{base}_threshold{ext}" if save_type == "all" else output_path
+        save_fig(self.renderer.render_threshold(self.result, self.params), p)
+        saved.append(p)
+
+    if save_type in ("raw_histogram", "all") and self.result.preprocessed_image is not None:
+        p = f"{base}_raw_hist{ext}" if save_type == "all" else output_path
+        save_fig(self.renderer.render_raw_histogram(self.result, self.params), p)
+        saved.append(p)
+
+    if save_type in ("threshold_histogram", "all") and self.result.label_image is not None:
+        p = f"{base}_thr_hist{ext}" if save_type == "all" else output_path
+        save_fig(self.renderer.render_threshold_histogram(self.result, self.params), p)
+        saved.append(p)
+
+    if not saved:
+        return ToolResult(success=False, message="Nothing to save (no processed result).")
+    return ToolResult(success=True, message="✅ Saved:\n" + "\n".join(f"  {p}" for p in saved))
+
+def _save_parameters(self, args: dict) -> ToolResult:
+    path = args.get("output_path", "")
+    if not path:
+        return ToolResult(success=False, message="output_path is required.")
+    payload = {"app": "AFM Agent", "version": 1, "parameters": self.params.to_dict()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return ToolResult(success=True, message=f"✅ Parameters saved to {path}")
+
+def _load_parameters(self, args: dict) -> ToolResult:
+    path = args.get("file_path", "")
+    if not path or not os.path.exists(path):
+        return ToolResult(success=False, message=f"File not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    state = payload.get("parameters", payload)
+    self.params = ProcessingParams.from_dict(state)
+    return ToolResult(success=True, message=f"✅ Parameters loaded from {path}\n{self.params.summary()}")
+
+def _export_summary(self, args: dict) -> ToolResult:
+    path = args.get("output_path", "")
+    if not path:
+        return ToolResult(success=False, message="output_path is required.")
+    lines = ["AFM Agent - Processing Summary", "=" * 48]
+    lines.append(f"File: {self.current_file_path or 'N/A'}")
+    lines.append(f"Source: {self.result.source_info or 'N/A'}")
+    lines.append("")
+    lines.append(self.params.summary().replace("**", "").replace("📋 ", ""))
+    lines.append("")
+    lines.append(self.result.stats_summary().replace("**", "").replace("📊 ", ""))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return ToolResult(success=True, message=f"✅ Summary exported to {path}")
+
+def _export_histogram_csv(self, args: dict) -> ToolResult:
+    path = args.get("output_path", "")
+    if not path:
+        return ToolResult(success=False, message="output_path is required.")
+    if self.result.preprocessed_image is None:
+        return ToolResult(success=False, message="No processed data.")
+
+    values = self.result.preprocessed_image.ravel().astype(np.float64)
+    values = values[np.isfinite(values)]
+    counts, edges = np.histogram(values, bins=256)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["[RAW_HISTOGRAM]"])
+        writer.writerow(["bin_center", "count"])
+        for c, n in zip(centers, counts):
+            writer.writerow([f"{c:.12g}", int(n)])
+        if self.result.group_percentages:
+            writer.writerow([])
+            writer.writerow(["[GROUP_HISTOGRAM]"])
+            writer.writerow(["group", "count", "percentage"])
+            labels = self.result.label_image.ravel().astype(np.int32)
+            groups = int(labels.max()) + 1
+            grp_counts = [(labels == i).sum() for i in range(groups)]
+            for i, (c, p) in enumerate(zip(grp_counts, self.result.group_percentages)):
+                writer.writerow([i, int(c), f"{p:.8f}"])
+    return ToolResult(success=True, message=f"✅ Histogram CSV exported to {path}")
+
+# ──────────────────────────────────────────
+# Param Update Helper
+# ──────────────────────────────────────────
+
+def _update_params(self, args: dict):
+    """Apply tool call arguments to self.params, type-safe."""
+    int_keys = [
+        "crop_x", "crop_y", "crop_w", "crop_h",
+        "pp_median_size", "pp_tv_max_num_iter",
+        "threshold_count", "kmeans_random_state", "kmeans_n_init",
+        "gmm_random_state", "bp_min_region_size",
+    ]
+    float_keys = [
+        "flatten_robust_k", "pp_gaussian_sigma", "pp_tv_weight",
+        "pp_tv_eps", "pp_wavelet_sigma",
+        "equal_interval_percentile_low", "equal_interval_percentile_high",
+        "raw_vmin", "raw_vmax", "boundary_thickness",
+    ]
+    bool_keys = [
+        "crop_enable", "flatten_robust",
+        "pp_median_enable", "pp_gaussian_enable", "pp_gaussian_preserve_range",
+        "pp_tv_enable", "pp_wavelet_enable", "pp_wavelet_rescale_sigma",
+        "use_manual_thresholds", "bp_enable",
+        "raw_min_enable", "raw_max_enable", "show_boundaries",
+    ]
+    str_keys = [
+        "flatten_mode", "pp_wavelet_wavelet", "pp_wavelet_mode",
+        "threshold_method", "gmm_covariance_type",
+        "raw_colormap", "threshold_colormap", "boundary_color",
+        "selected_spm_channel",
+    ]
+
+    for k in int_keys:
+        if k in args:
+            setattr(self.params, k, int(args[k]))
+    for k in float_keys:
+        if k in args:
+            setattr(self.params, k, float(args[k]))
+    for k in bool_keys:
+        if k in args:
+            v = args[k]
+            setattr(self.params, k, bool(v) if not isinstance(v, bool) else v)
+    for k in str_keys:
+        if k in args:
+            setattr(self.params, k, str(args[k]))
+
+    if "flatten_orders" in args:
+        self.params.flatten_orders = [int(x) for x in args["flatten_orders"]]
+    if "pp_order" in args:
+        self.params.pp_order = [str(x).lower() for x in args["pp_order"]]
+    if "manual_thresholds" in args:
+        self.params.manual_thresholds = [float(x) for x in args["manual_thresholds"]]
+```
+
+“””
+AFM Agent - Ollama-based LLM orchestration
+Uses system-prompt tool calling to avoid Ollama qwen3 tool API bugs.
+“””
+
+import json
+import re
+from typing import Generator
+
+import requests
+
+from ..tools.tool_definitions import get_tool_schema_text, get_tool_names
+from ..tools.executor import ToolExecutor, ToolResult
+
+# ──────────────────────────────────────────────
+
+# System Prompt
+
+# ──────────────────────────────────────────────
+
+SYSTEM_PROMPT_TEMPLATE = “”“You are an expert AFM (Atomic Force Microscopy) image analysis assistant.
+You help scientists analyze AFM images through natural conversation.
+
+You have access to the following tools to process and visualize AFM data:
+
+{tool_schemas}
+
+## How to call tools
+
+When you need to use a tool, output a JSON block in this exact format:
+
+```tool_call
+{{
+  "tool": "<tool_name>",
+  "arguments": {{
+    "<param_name>": <value>
+  }}
+}}
+```
+
+You can call multiple tools in sequence by outputting multiple ```tool_call blocks.
+After each tool call, you will receive the result and can then call more tools or respond to the user.
+
+## Important rules
+
+1. **Explicit parameters**: If the user specifies a parameter value, always use that exact value.
+1. **Implicit parameters**: If the user does not mention a parameter, infer the best value from context:
+- “noisy image” → enable gaussian or TV denoising
+- “height AFM image” → use flattening order [1] or [2]
+- “3 groups” → threshold_count=2 (groups = count+1)
+- “phase image” → usually no flattening needed
+- “surface roughness” → statistics focused response
+1. **Always process before showing**: Call process_image before show_image if not yet processed.
+1. **Be concise**: Give brief explanations of what you did and why.
+1. **Debug mode**: When in debug mode, always call get_parameters before executing process_image, and summarize parameters to the user before proceeding.
+
+## Current mode: {mode}
+
+{debug_instructions}
+“””
+
+DEBUG_INSTRUCTIONS = “”“Since you are in **Debug Mode**:
+
+- Before running process_image, first show the user what parameters will be used.
+- Ask for confirmation if any parameter choices are uncertain.
+- After processing, show the parameters that were actually used.
+  “””
+
+AUTO_INSTRUCTIONS = “”“Since you are in **Auto Mode**:
+
+- Execute immediately without asking for confirmation.
+- Briefly mention the key parameters you chose and why.
+- If the user seems unhappy with results, suggest switching to Debug Mode.
+  “””
+
+def build_system_prompt(mode: str = “auto”) -> str:
+tool_schemas = get_tool_schema_text()
+debug_instructions = DEBUG_INSTRUCTIONS if mode == “debug” else AUTO_INSTRUCTIONS
+return SYSTEM_PROMPT_TEMPLATE.format(
+tool_schemas=tool_schemas,
+mode=mode.upper(),
+debug_instructions=debug_instructions,
+)
+
+# ──────────────────────────────────────────────
+
+# Ollama Client
+
+# ──────────────────────────────────────────────
+
+class OllamaClient:
+def **init**(self, base_url: str = “http://localhost:11434”, model: str = “qwen3:32b”):
+self.base_url = base_url.rstrip(”/”)
+self.model = model
+
+```
+def chat(self, messages: list[dict], stream: bool = False) -> dict | Generator:
+    url = f"{self.base_url}/api/chat"
+    payload = {
+        "model": self.model,
+        "messages": messages,
+        "stream": stream,
+        "options": {
+            "temperature": 0.3,   # low for consistent tool calling
+            "top_p": 0.9,
+            "num_ctx": 8192,
+        }
+    }
+    response = requests.post(url, json=payload, timeout=300, stream=stream)
+    response.raise_for_status()
+
+    if stream:
+        return self._stream_response(response)
+    return response.json()
+
+def _stream_response(self, response) -> Generator:
+    for line in response.iter_lines():
+        if line:
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+def is_available(self) -> bool:
+    try:
+        r = requests.get(f"{self.base_url}/api/tags", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def list_models(self) -> list[str]:
+    try:
+        r = requests.get(f"{self.base_url}/api/tags", timeout=5)
+        data = r.json()
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+```
+
+# ──────────────────────────────────────────────
+
+# Tool Call Parser
+
+# ──────────────────────────────────────────────
+
+def parse_tool_calls(text: str) -> list[dict]:
+“”“Extract all tool_call JSON blocks from LLM response text.”””
+pattern = r”`tool_call\s*\n(.*?)\n`”
+matches = re.findall(pattern, text, re.DOTALL)
+calls = []
+for match in matches:
+try:
+obj = json.loads(match.strip())
+if “tool” in obj and “arguments” in obj:
+calls.append(obj)
+except json.JSONDecodeError:
+# Try lenient parse
+try:
+# Remove trailing commas
+cleaned = re.sub(r”,\s*([}]])”, r”\1”, match.strip())
+obj = json.loads(cleaned)
+if “tool” in obj and “arguments” in obj:
+calls.append(obj)
+except Exception:
+pass
+return calls
+
+def strip_tool_calls(text: str) -> str:
+“”“Remove tool_call blocks from text for display.”””
+return re.sub(r”`tool_call\s*\n.*?\n`”, “”, text, flags=re.DOTALL).strip()
+
+# ──────────────────────────────────────────────
+
+# Agent
+
+# ──────────────────────────────────────────────
+
+class AFMAgent:
+
+```
+def __init__(
+    self,
+    ollama_url: str = "http://localhost:11434",
+    model: str = "qwen3:32b",
+    mode: str = "auto",         # "auto" | "debug"
+):
+    self.ollama = OllamaClient(base_url=ollama_url, model=model)
+    self.executor = ToolExecutor()
+    self.mode = mode
+    self.conversation: list[dict] = []
+    self._reset_system_prompt()
+
+def _reset_system_prompt(self):
+    self._system_prompt = build_system_prompt(self.mode)
+
+def set_mode(self, mode: str):
+    self.mode = mode
+    self._reset_system_prompt()
+
+def clear_history(self):
+    self.conversation = []
+
+# ── Main chat entry point ─────────────────
+
+def chat(self, user_message: str) -> Generator[dict, None, None]:
+    """
+    Generator that yields event dicts:
+      {"type": "thinking", "text": "..."}        - LLM is thinking
+      {"type": "text", "text": "..."}            - LLM text response
+      {"type": "tool_call", "tool": "...", "args": {...}}
+      {"type": "tool_result", "success": bool, "message": "...", "data": ...}
+      {"type": "image", "data": <PIL Image>}
+      {"type": "done"}
+    """
+    self.conversation.append({"role": "user", "content": user_message})
+
+    messages = [{"role": "system", "content": self._system_prompt}] + self.conversation
+
+    # Get LLM response (non-streaming for reliability with tool parsing)
+    try:
+        yield {"type": "thinking", "text": "🤔 Analyzing request..."}
+        response = self.ollama.chat(messages, stream=False)
+        assistant_content = response.get("message", {}).get("content", "")
+    except requests.exceptions.ConnectionError:
+        yield {"type": "text", "text": "❌ Cannot connect to Ollama. Please ensure Ollama is running at the configured URL."}
+        yield {"type": "done"}
+        return
+    except Exception as e:
+        yield {"type": "text", "text": f"❌ LLM error: {e}"}
+        yield {"type": "done"}
+        return
+
+    # Parse tool calls
+    tool_calls = parse_tool_calls(assistant_content)
+    display_text = strip_tool_calls(assistant_content)
+
+    # Emit display text if any
+    if display_text:
+        yield {"type": "text", "text": display_text}
+
+    # Execute tool calls
+    tool_results_for_context = []
+    for call in tool_calls:
+        tool_name = call["tool"]
+        arguments = call.get("arguments", {})
+
+        yield {"type": "tool_call", "tool": tool_name, "args": arguments}
+
+        tool_result: ToolResult = self.executor.execute(tool_name, arguments)
+
+        yield {
+            "type": "tool_result",
+            "success": tool_result.success,
+            "message": tool_result.message,
+            "render_type": tool_result.render_type,
+        }
+
+        if tool_result.render_type == "image" and tool_result.data is not None:
+            yield {"type": "image", "data": tool_result.data}
+
+        tool_results_for_context.append(
+            f"[Tool: {tool_name}] {'SUCCESS' if tool_result.success else 'FAILED'}: {tool_result.message[:300]}"
+        )
+
+    # If tools were called, feed results back to LLM for a follow-up response
+    if tool_calls:
+        self.conversation.append({"role": "assistant", "content": assistant_content})
+        tool_context = "\n".join(tool_results_for_context)
+        self.conversation.append({
+            "role": "user",
+            "content": f"[Tool results]\n{tool_context}\n\nPlease provide a brief summary of what was done."
+        })
+
+        messages2 = [{"role": "system", "content": self._system_prompt}] + self.conversation
+        try:
+            response2 = self.ollama.chat(messages2, stream=False)
+            followup = response2.get("message", {}).get("content", "")
+            followup_clean = strip_tool_calls(followup)
+            if followup_clean.strip():
+                yield {"type": "text", "text": followup_clean}
+            self.conversation.append({"role": "assistant", "content": followup})
+            # Remove the injected tool context message (keep history clean)
+            self.conversation.pop(-2)
+        except Exception as e:
+            yield {"type": "text", "text": f"(Follow-up failed: {e})"}
+    else:
+        self.conversation.append({"role": "assistant", "content": assistant_content})
+
+    yield {"type": "done"}
+```
+
+“””
+AFM Agent - Gradio Web UI
+“””
+
+import gradio as gr
+from pathlib import Path
+import sys
+import os
+
+# Allow running from project root
+
+sys.path.insert(0, str(Path(**file**).parent.parent.parent))
+
+from afm_agent.agent.afm_agent import AFMAgent, OllamaClient
+
+# ──────────────────────────────────────────────
+
+# Agent singleton (shared across requests)
+
+# ──────────────────────────────────────────────
+
+agent = AFMAgent(
+ollama_url=“http://localhost:11434”,
+model=“qwen3:32b”,
+mode=“auto”,
+)
+
+# ──────────────────────────────────────────────
+
+# Chat handler
+
+# ──────────────────────────────────────────────
+
+def chat(
+user_message: str,
+history: list,          # list of {“role”: …, “content”: …}
+mode: str,
+ollama_url: str,
+model_name: str,
+):
+if not user_message.strip():
+yield history, None, “”
+return
+
+```
+# Sync agent settings
+agent.ollama.base_url = ollama_url.rstrip("/")
+agent.ollama.model = model_name
+if agent.mode != mode.lower():
+    agent.set_mode(mode.lower())
+
+# Add user message to history
+history = history + [{"role": "user", "content": user_message}]
+yield history, None, "⏳ Processing..."
+
+# Collect response
+assistant_texts = []
+current_image = None
+status_msg = ""
+
+for event in agent.chat(user_message):
+    etype = event.get("type")
+
+    if etype == "thinking":
+        status_msg = event["text"]
+        yield history, current_image, status_msg
+
+    elif etype == "text":
+        text = event["text"].strip()
+        if text:
+            assistant_texts.append(text)
+            # Update last assistant message or add new
+            combined = "\n\n".join(assistant_texts)
+            if history and history[-1]["role"] == "assistant":
+                history = history[:-1] + [{"role": "assistant", "content": combined}]
+            else:
+                history = history + [{"role": "assistant", "content": combined}]
+            yield history, current_image, status_msg
+
+    elif etype == "tool_call":
+        tool = event["tool"]
+        args_preview = str(event["args"])[:120]
+        status_msg = f"🔧 Calling: `{tool}` {args_preview}..."
+        yield history, current_image, status_msg
+
+    elif etype == "tool_result":
+        success = event["success"]
+        msg = event["message"]
+        icon = "✅" if success else "❌"
+        status_msg = f"{icon} {msg[:200]}"
+        yield history, current_image, status_msg
+
+    elif etype == "image":
+        current_image = event["data"]
+        yield history, current_image, "🖼️ Image updated"
+
+    elif etype == "done":
+        status_msg = "✅ Done"
+        yield history, current_image, status_msg
+```
+
+def clear_chat():
+agent.clear_history()
+return [], None, “History cleared”
+
+def check_ollama(url: str, model: str) -> str:
+client = OllamaClient(base_url=url, model=model)
+if not client.is_available():
+return f”❌ Cannot connect to Ollama at {url}”
+models = client.list_models()
+if model in models:
+return f”✅ Connected | Model ‘{model}’ available”
+elif models:
+return f”⚠️ Connected but ‘{model}’ not found. Available: {’, ’.join(models[:5])}”
+else:
+return f”⚠️ Connected but no models found. Run: ollama pull {model}”
+
+# ──────────────────────────────────────────────
+
+# UI Layout
+
+# ──────────────────────────────────────────────
+
+EXAMPLE_MESSAGES = [
+“이 AFM 이미지를 분석해줘”,
+“노이즈가 많은데 denoising 해줘”,
+“Multi-Otsu로 3그룹으로 나눠줘”,
+“colormap을 plasma로 바꿔줘”,
+“vmin을 -5, vmax를 30으로 설정해줘”,
+“경계선을 빨간색으로 표시해줘”,
+“히스토그램도 같이 보여줘”,
+“통계 보여줘”,
+“파라미터 보여줘”,
+“결과 저장해줘”,
+]
+
+CSS = “””
+.gradio-container { max-width: 1400px !important; }
+.status-bar { font-size: 0.85em; color: #666; padding: 4px 8px;
+background: #f5f5f5; border-radius: 4px; min-height: 28px; }
+.mode-badge { font-weight: bold; }
+footer { display: none !important; }
+“””
+
+with gr.Blocks(
+title=“AFM Agent”,
+theme=gr.themes.Soft(primary_hue=“blue”, neutral_hue=“slate”),
+css=CSS,
+) as demo:
+
+```
+gr.Markdown("""
+# 🔬 AFM Agent
+**AI-powered AFM image analysis** — Load an image and describe what you want to analyze.
+""")
+
+with gr.Row():
+    # ── Left: Chat ──────────────────────────
+    with gr.Column(scale=3):
+        chatbot = gr.Chatbot(
+            label="Conversation",
+            height=520,
+            type="messages",
+            show_copy_button=True,
+            avatar_images=(None, "🔬"),
+            placeholder="Load an image and start analyzing! You can type in Korean or English.",
+        )
+
+        with gr.Row():
+            msg_box = gr.Textbox(
+                placeholder="예) '이 SPM 파일 분석해줘' or 'show histogram with plasma colormap'",
+                lines=2,
+                max_lines=4,
+                label="Message",
+                scale=5,
+                show_label=False,
+            )
+            send_btn = gr.Button("Send ▶", variant="primary", scale=1, min_width=80)
+
+        status_bar = gr.Textbox(
+            value="Ready",
+            label="Status",
+            interactive=False,
+            lines=1,
+            elem_classes=["status-bar"],
+        )
+
+        with gr.Row():
+            clear_btn = gr.Button("🗑️ Clear History", variant="secondary", size="sm")
+
+        gr.Markdown("**Quick commands:**")
+        with gr.Row():
+            for i in range(0, len(EXAMPLE_MESSAGES), 5):
+                with gr.Column(scale=1):
+                    for ex in EXAMPLE_MESSAGES[i:i+5]:
+                        gr.Button(ex, size="sm").click(
+                            fn=lambda m=ex: m,
+                            outputs=msg_box,
+                        )
+
+    # ── Right: Image + Settings ─────────────
+    with gr.Column(scale=2):
+        image_out = gr.Image(
+            label="Analysis Result",
+            type="pil",
+            height=420,
+            show_download_button=True,
+        )
+
+        with gr.Accordion("⚙️ Settings", open=False):
+            mode_radio = gr.Radio(
+                choices=["Auto", "Debug"],
+                value="Auto",
+                label="🚀 Mode",
+                info="Auto: execute immediately | Debug: show parameters first",
+            )
+            ollama_url_box = gr.Textbox(
+                value="http://localhost:11434",
+                label="Ollama URL",
+            )
+            model_box = gr.Textbox(
+                value="qwen3:32b",
+                label="Model",
+            )
+            check_btn = gr.Button("🔌 Check Connection", size="sm")
+            connection_status = gr.Textbox(
+                value="",
+                label="",
+                interactive=False,
+                lines=1,
+            )
+
+        with gr.Accordion("📂 File Upload Shortcut", open=True):
+            file_upload = gr.File(
+                label="Upload image file",
+                file_types=[".spm", ".000", ".001", ".002", ".003",
+                            ".png", ".jpg", ".tif", ".tiff", ".npy", ".csv"],
+            )
+            gr.Markdown(
+                "<small>After uploading, the file path will be sent to the agent automatically.</small>"
+            )
+
+# ── Event bindings ──────────────────────────
+
+def submit(msg, history, mode, url, model):
+    yield from chat(msg, history, mode, url, model)
+
+def handle_upload(file_obj, history, mode, url, model):
+    if file_obj is None:
+        return history, None, "No file selected"
+    path = file_obj.name
+    auto_msg = f"이 파일을 로드하고 분석해줘: {path}"
+    yield from chat(auto_msg, history, mode, url, model)
+
+msg_box.submit(
+    fn=submit,
+    inputs=[msg_box, chatbot, mode_radio, ollama_url_box, model_box],
+    outputs=[chatbot, image_out, status_bar],
+).then(fn=lambda: "", outputs=msg_box)
+
+send_btn.click(
+    fn=submit,
+    inputs=[msg_box, chatbot, mode_radio, ollama_url_box, model_box],
+    outputs=[chatbot, image_out, status_bar],
+).then(fn=lambda: "", outputs=msg_box)
+
+clear_btn.click(
+    fn=clear_chat,
+    outputs=[chatbot, image_out, status_bar],
+)
+
+check_btn.click(
+    fn=check_ollama,
+    inputs=[ollama_url_box, model_box],
+    outputs=connection_status,
+)
+
+file_upload.upload(
+    fn=handle_upload,
+    inputs=[file_upload, chatbot, mode_radio, ollama_url_box, model_box],
+    outputs=[chatbot, image_out, status_bar],
+)
+```
+
+# ──────────────────────────────────────────────
+
+# Entry point
+
+# ──────────────────────────────────────────────
+
+if **name** == “**main**”:
+demo.launch(
+server_name=“0.0.0.0”,
+server_port=7860,
+share=False,
+inbrowser=True,
+)
+
+
+
 #--- 최종 버전 제미나이가 프롬프트 만든것 ---
 
 # 역할 및 목적
@@ -22929,43 +25201,4 @@ class NanoScopeThresholdApp:
                 sigma = max(0.0, float(self.pp_gaussian_sigma_var.get()))
                 out = gaussian(out, sigma=sigma, preserve_range=self.pp_gaussian_preserve_range_var.get()).astype(np.float32)
             elif method == "tv" and self.pp_tv_var.get():
-                weight = max(1e-8, float(self.pp_tv_weight_var.get()))
-                eps = max(1e-12, float(self.pp_tv_eps_var.get()))
-                n_iter = max(1, int(self.pp_tv_max_num_iter_var.get()))
-                out = denoise_tv_chambolle(out, weight=weight, eps=eps, max_num_iter=n_iter).astype(np.float32)
-            elif method == "wavelet" and self.pp_wavelet_var.get():
-                sigma = max(0.0, float(self.pp_wavelet_sigma_var.get()))
-                wavelet_name = self.pp_wavelet_wavelet_var.get().strip() or "db2"
-                mode_name = self.pp_wavelet_mode_var.get().strip() or "soft"
-                out = denoise_wavelet(out, sigma=sigma, wavelet=wavelet_name, mode=mode_name, rescale_sigma=self.pp_wavelet_rescale_sigma_var.get(), channel_axis=None).astype(np.float32)
-        return out
-
-    def _parse_manual_thresholds(self):
-        text = self.manual_thresholds_var.get().strip()
-        if not text:
-            return []
-        parts = [p.strip() for p in text.replace(';', ',').split(',') if p.strip()]
-        return sorted(float(p) for p in parts)
-
-    def suggest_thresholds(self):
-        if self.raw_image is None:
-            messagebox.showinfo("Info", "Load an image first.")
-            return
-        try:
-            img = self.get_cropped_image()
-            img = self.apply_preprocessing(img)
-            thr = self.compute_auto_threshold_values(img)
-            self.manual_thresholds_var.set(", ".join(f"{x:.6g}" for x in thr))
-            self.status_var.set("Suggested thresholds updated in manual input field")
-        except Exception as e:
-            messagebox.showerror("Suggestion Error", str(e))
-
-    def compute_auto_threshold_values(self, image):
-        data = image.astype(np.float32)
-        flat = data.reshape(-1, 1)
-        count = max(1, int(self.threshold_count_var.get()))
-        groups = count + 1
-        method = self.threshold_method_var.get().strip().lower()
-
-        if method == "otsu":
-            return 
+                weight = max(1e-8, f
